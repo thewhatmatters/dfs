@@ -19,14 +19,19 @@ import csv
 import json
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
 from nfl.http import HttpAuthError, HttpError, http_text
+from nfl.names import match_key
+from nfl.players import Player
+from nfl.projections import week1_score
 from nfl.teams import UnmappedTeam, lookup_odds
+
+CATCHER_POS = frozenset({"WR", "TE"})
 
 WR_URL = "https://www.lineups.com/nfl/targets/wide-receiver/"
 TE_URL = "https://www.lineups.com/nfl/targets/tight-end/"
@@ -271,6 +276,233 @@ def rows_from_payload(
                 )
             )
     return out
+
+
+def load_targets_csv(path: Path) -> list[TargetWeekRow]:
+    """Parse `targets.csv` written by `write_targets_csv` / `--refresh`."""
+    p = Path(path)
+    if not p.is_file():
+        raise TargetsError("TARGETS_CSV", f"missing targets CSV {p}")
+    with p.open(encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+        if not reader.fieldnames:
+            raise TargetsError("TARGETS_CSV", f"empty targets CSV {p}")
+        required = {"player", "team", "position", "week", "targets", "target_share"}
+        missing = required - set(reader.fieldnames)
+        if missing:
+            raise TargetsError(
+                "TARGETS_CSV",
+                f"{p} missing columns {sorted(missing)}",
+            )
+        out: list[TargetWeekRow] = []
+        for row in reader:
+            name = (row.get("player") or "").strip()
+            team = (row.get("team") or "").strip().upper()
+            pos = (row.get("position") or "").strip().upper()
+            if not name or not team or not pos:
+                continue
+            try:
+                week = int(row.get("week") or 0)
+            except (TypeError, ValueError):
+                continue
+            if week < 1:
+                continue
+            try:
+                targets = int(float(row.get("targets") or 0))
+            except (TypeError, ValueError):
+                targets = 0
+            try:
+                share = float(row.get("target_share") or 0)
+            except (TypeError, ValueError):
+                share = 0.0
+            try:
+                avg = float(row.get("targets_avg") or 0)
+            except (TypeError, ValueError):
+                avg = 0.0
+            try:
+                total = int(float(row.get("targets_total") or 0))
+            except (TypeError, ValueError):
+                total = 0
+            out.append(
+                TargetWeekRow(
+                    player=name,
+                    team=team,
+                    position=pos,
+                    week=week,
+                    targets=targets,
+                    target_share=share,
+                    targets_avg=avg,
+                    targets_total=total,
+                    source=(row.get("source") or SOURCE).strip() or SOURCE,
+                    asof=(row.get("asof") or "").strip(),
+                )
+            )
+    if not out:
+        raise TargetsError("TARGETS_CSV", f"no player-week rows in {p}")
+    return out
+
+
+def latest_week(rows: list[TargetWeekRow]) -> int | None:
+    weeks = [r.week for r in rows if r.week >= 1]
+    return max(weeks) if weeks else None
+
+
+def rows_for_week(rows: list[TargetWeekRow], week: int) -> list[TargetWeekRow]:
+    return [r for r in rows if r.week == week]
+
+
+def _row_key(row: TargetWeekRow) -> tuple[str, str]:
+    return (row.team.upper(), match_key(row.player))
+
+
+def _player_key(pl: Player) -> tuple[str, str]:
+    return ((pl.team or "").upper(), match_key(pl.name))
+
+
+def targets_index(
+    rows: list[TargetWeekRow],
+) -> dict[tuple[str, str], TargetWeekRow]:
+    """(team, match_key) → row. First row wins."""
+    out: dict[tuple[str, str], TargetWeekRow] = {}
+    for r in rows:
+        key = _row_key(r)
+        prev = out.get(key)
+        if prev is None:
+            out[key] = r
+    return out
+
+
+def attach_targets(
+    players: list[Player],
+    rows: list[TargetWeekRow],
+    *,
+    week: int | None = None,
+) -> tuple[list[Player], dict[str, Any]]:
+    """Join WR/TE (and TE-eligible) pool players to one Lineups week.
+
+    Name join is `match_key` (Jr/Sr/II stripped). No invented aliases.
+    Missing week / no hit → usage factor 1.0 (current path).
+    """
+    chosen = week if week is not None else latest_week(rows)
+    week_rows = rows_for_week(rows, chosen) if chosen is not None else []
+    idx = targets_index(week_rows)
+    used: set[tuple[str, str]] = set()
+    out: list[Player] = []
+    unmatched_slate: list[dict[str, str]] = []
+    joined = 0
+    for pl in players:
+        pos = (pl.position or "").upper()
+        if pos not in CATCHER_POS:
+            out.append(pl)
+            continue
+        key = _player_key(pl)
+        hit = idx.get(key)
+        if hit is None:
+            unmatched_slate.append(
+                {"player": pl.name, "team": pl.team, "position": pl.position}
+            )
+            obj = week1_score(
+                pl.implied_total or 0.0,
+                depth_rank=pl.depth_rank,
+                position=pl.position,
+                prop_fd=pl.prop_fd,
+                implied_opp=pl.implied_opp,
+                target_share=None,
+            )
+            out.append(
+                replace(
+                    pl,
+                    target_share=None,
+                    targets=None,
+                    targets_week=chosen,
+                    targets_status="unmatched",
+                    objective=obj,
+                )
+            )
+            continue
+        used.add(key)
+        joined += 1
+        obj = week1_score(
+            pl.implied_total or 0.0,
+            depth_rank=pl.depth_rank,
+            position=pl.position,
+            prop_fd=pl.prop_fd,
+            implied_opp=pl.implied_opp,
+            target_share=hit.target_share,
+        )
+        out.append(
+            replace(
+                pl,
+                target_share=hit.target_share,
+                targets=hit.targets,
+                targets_week=chosen,
+                targets_status="joined",
+                objective=obj,
+            )
+        )
+    slate_teams = {(p.team or "").upper() for p in players}
+    unmatched_lineups: list[dict[str, Any]] = []
+    seen_lu: set[tuple[str, str]] = set()
+    for r in week_rows:
+        key = _row_key(r)
+        if key in used or key in seen_lu:
+            continue
+        if r.team.upper() not in slate_teams:
+            continue
+        seen_lu.add(key)
+        unmatched_lineups.append(
+            {
+                "player": r.player,
+                "team": r.team,
+                "position": r.position,
+                "week": r.week,
+            }
+        )
+    slate_catchers = sum(
+        1 for p in players if (p.position or "").upper() in CATCHER_POS
+    )
+    stats: dict[str, Any] = {
+        "week": chosen,
+        "joined": joined,
+        "slate_wr_te": slate_catchers,
+        "week_rows": len(week_rows),
+        "unmatched_lineups": unmatched_lineups,
+        "unmatched_slate_wr_te": unmatched_slate,
+        "skipped": False,
+    }
+    return out, stats
+
+
+def print_targets_gaps(stats: dict[str, Any]) -> None:
+    """Stderr join summary + both unmatched lists."""
+    if stats.get("skipped"):
+        print("targets skipped", file=sys.stderr)
+        return
+    week = stats.get("week")
+    week_s = "—" if week is None else str(week)
+    unmatched_lu = list(stats.get("unmatched_lineups") or [])
+    unmatched_sl = list(stats.get("unmatched_slate_wr_te") or [])
+    print(
+        f"targets week {week_s}  joined {stats.get('joined', 0)} / "
+        f"{stats.get('slate_wr_te', 0)} slate WR/TE  "
+        f"unmatched_lineups {len(unmatched_lu)}  "
+        f"unmatched_slate_wr_te {len(unmatched_sl)}",
+        file=sys.stderr,
+    )
+    if unmatched_lu:
+        print(f"unmatched Lineups ({len(unmatched_lu)}):", file=sys.stderr)
+        for row in unmatched_lu:
+            print(
+                f"  {row.get('player')} ({row.get('team')} {row.get('position')})",
+                file=sys.stderr,
+            )
+    if unmatched_sl:
+        print(f"unmatched slate WR/TE ({len(unmatched_sl)}):", file=sys.stderr)
+        for row in unmatched_sl:
+            print(
+                f"  {row.get('player')} ({row.get('team')} {row.get('position')})",
+                file=sys.stderr,
+            )
 
 
 def write_targets_csv(rows: list[TargetWeekRow], path: Path) -> None:

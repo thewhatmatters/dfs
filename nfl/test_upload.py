@@ -53,6 +53,7 @@ def _pl(**kw) -> Player:
             position=fields["position"],
             prop_fd=fields.get("prop_fd"),
             implied_opp=fields.get("implied_opp"),
+            target_share=fields.get("target_share"),
         )
     allowed = Player.__dataclass_fields__
     return Player(**{k: v for k, v in fields.items() if k in allowed})

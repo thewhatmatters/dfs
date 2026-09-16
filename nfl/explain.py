@@ -1,11 +1,11 @@
-"""Per-player lineup notes: implied×depth, optional prop tilt, DST, stack fade."""
+"""Per-player lineup notes: implied×depth, usage tilt, optional prop tilt, DST, stack fade."""
 
 from __future__ import annotations
 
 from collections.abc import Sequence
 
 from nfl.players import Player
-from nfl.projections import POS_FD_SHARE, depth_prior
+from nfl.projections import POS_FD_SHARE, depth_prior, usage_factor
 from nfl.rules import (
     STACK_COEF,
     dst_pa_key,
@@ -99,10 +99,20 @@ def explain_player(player: Player, *, slot_key: str | None = None) -> dict:
     share = POS_FD_SHARE.get((player.position or "WR").upper(), 0.18)
     implied = player.implied_total
     imp_s = "—" if implied is None else _g(implied)
+    usage = usage_factor(
+        player.target_share, player.position, player.depth_rank
+    )
+    usage_s = ""
+    if player.target_share is not None:
+        usage_s = (
+            f" × usage {usage:g} (tgt {_g(player.target_share)})"
+        )
+    elif player.targets_status == "unmatched":
+        usage_s = " × usage 1.0 (Lineups name unmatched)"
     note = (
         f"no player props{why} — implied {imp_s} × "
         f"{_prior_label(player.depth_rank)} ({depth_prior(player.depth_rank):g}) × "
-        f"{player.position} {share:.2f} share."
+        f"{player.position} {share:.2f} share{usage_s}."
     )
     return {
         "note": note,

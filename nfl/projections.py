@@ -1,8 +1,10 @@
 """Week-1 player scores and slate projection board.
 
-Default: implied team total × depth prior × position share.
+Default: implied team total × depth prior × position share × usage factor.
 A volume prop is a clamped ±20% tilt on that base — not a second currency.
-DEF: implied_opp PA bucket + 3.0 sack/TO prior. No FPPG.
+WR/TE Lineups target_share is a second ±20% usage tilt vs a depth-conditional
+expected share — not a replacement for Vegas implied totals. DEF: implied_opp
+PA bucket + 3.0 sack/TO prior. No FPPG.
 `--board` prints the point estimate; optional sim percentiles ride along.
 """
 
@@ -21,6 +23,18 @@ POS_FD_SHARE = {"QB": 0.50, "RB": 0.28, "WR": 0.18, "TE": 0.12}
 POS_ORDER = ("QB", "RB", "WR", "TE", "D")
 PROP_FACTOR_LO = 0.80
 PROP_FACTOR_HI = 1.20
+USAGE_FACTOR_LO = 0.80
+USAGE_FACTOR_HI = 1.20
+# Depth-conditional expected target share. Unlisted uses the pos default.
+EXPECTED_TARGET_SHARE = {
+    ("WR", 1): 0.24,
+    ("WR", 2): 0.16,
+    ("WR", 3): 0.10,
+    ("TE", 1): 0.18,
+    ("TE", 2): 0.10,
+    ("TE", 3): 0.06,
+}
+UNLISTED_TARGET_SHARE = {"WR": 0.08, "TE": 0.06}
 
 
 def depth_prior(rank: int | None) -> float:
@@ -36,14 +50,55 @@ def prop_factor(base: float, prop_fd: float | None) -> float:
     return max(PROP_FACTOR_LO, min(PROP_FACTOR_HI, float(prop_fd) / base))
 
 
+def expected_target_share(
+    position: str = "WR",
+    depth_rank: int | None = None,
+) -> float:
+    """Role-typical target share for a WR/TE. 0 for other positions."""
+    pos = (position or "").upper()
+    if pos not in UNLISTED_TARGET_SHARE:
+        return 0.0
+    if depth_rank is None:
+        return UNLISTED_TARGET_SHARE[pos]
+    return EXPECTED_TARGET_SHARE.get(
+        (pos, int(depth_rank)), UNLISTED_TARGET_SHARE[pos]
+    )
+
+
+def usage_factor(
+    target_share: float | None,
+    position: str = "WR",
+    depth_rank: int | None = None,
+) -> float:
+    """WR/TE Lineups share vs expected, clamped ±20%. Missing join → 1.0."""
+    if target_share is None:
+        return 1.0
+    pos = (position or "").upper()
+    if pos not in UNLISTED_TARGET_SHARE:
+        return 1.0
+    expected = expected_target_share(pos, depth_rank)
+    if expected <= 0:
+        return 1.0
+    return max(
+        USAGE_FACTOR_LO,
+        min(USAGE_FACTOR_HI, float(target_share) / expected),
+    )
+
+
 def implied_core(
     implied_total: float,
     depth_rank: int | None = None,
     position: str = "WR",
+    target_share: float | None = None,
 ) -> float:
-    """Implied × depth × share. No prop tilt. Not DST."""
+    """Implied × depth × share × usage. No prop tilt. Not DST."""
     share = POS_FD_SHARE.get((position or "WR").upper(), 0.18)
-    return float(implied_total) * depth_prior(depth_rank) * share
+    return (
+        float(implied_total)
+        * depth_prior(depth_rank)
+        * share
+        * usage_factor(target_share, position, depth_rank)
+    )
 
 
 def week1_score(
@@ -52,15 +107,22 @@ def week1_score(
     position: str = "WR",
     prop_fd: float | None = None,
     implied_opp: float | None = None,
+    target_share: float | None = None,
 ) -> float:
     """Implied core × optional prop tilt. One currency.
 
     DEF uses opponent implied total as expected points allowed.
+    WR/TE `target_share` is a usage tilt on the role prior, not a new objective.
     """
     pos = (position or "WR").upper()
     if pos in {"D", "DEF"}:
         return dst_projection(implied_opp if implied_opp is not None else 0.0)
-    base = implied_core(implied_total, depth_rank=depth_rank, position=position)
+    base = implied_core(
+        implied_total,
+        depth_rank=depth_rank,
+        position=position,
+        target_share=target_share,
+    )
     return base * prop_factor(base, prop_fd)
 
 
@@ -72,6 +134,7 @@ def score_player(pl: Player, depth_rank: int | None = None) -> float:
         position=pl.position,
         prop_fd=pl.prop_fd,
         implied_opp=pl.implied_opp,
+        target_share=pl.target_share,
     )
 
 
@@ -107,6 +170,7 @@ def attach_team_lines(
                     position=patched.position,
                     prop_fd=patched.prop_fd,
                     implied_opp=opp_implied,
+                    target_share=patched.target_share,
                 ),
             )
         )

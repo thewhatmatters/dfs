@@ -51,6 +51,7 @@ def _pl(**kw) -> Player:
             position=fields["position"],
             prop_fd=fields.get("prop_fd"),
             implied_opp=fields.get("implied_opp"),
+            target_share=fields.get("target_share"),
         )
     allowed = Player.__dataclass_fields__
     return Player(**{k: v for k, v in fields.items() if k in allowed})
@@ -120,6 +121,13 @@ class FlagsTest(unittest.TestCase):
         self.assertEqual(off.bring_back, 0)
         self.assertEqual(off.max_per_team, 3)
         self.assertEqual(off.stack_qb, "on")
+        self.assertFalse(off.skip_targets)
+        self.assertIsNone(off.targets_week)
+        skipped = parse_args(["--csv", "x.csv", "--skip-targets", "--targets-week", "1"])
+        self.assertTrue(skipped.skip_targets)
+        self.assertEqual(skipped.targets_week, 1)
+        with self.assertRaises(SystemExit):
+            parse_args(["--csv", "x.csv", "--targets-week", "0"])
         self.assertIsNone(off.upload)
         custom = parse_args(
             [

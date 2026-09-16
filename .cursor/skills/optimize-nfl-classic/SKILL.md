@@ -16,8 +16,8 @@ Solve the highest-projection legal FanDuel NFL classic lineup for a slate CSV.
 ## What it does
 
 Loads contest rules from this repo, filters the FanDuel export, joins Vegas
-lines + OurLads depth + ESPN injuries + Odds props (cached), and runs the PuLP ILP
-(greedy if PuLP is missing). Default objective is **week1_score** (implied×depth×share, volume props a
+lines + OurLads depth + Lineups WR/TE targets + ESPN injuries + Odds props (cached), and runs the PuLP ILP
+(greedy if PuLP is missing). Default objective is **week1_score** (implied×depth×share×usage, volume props a
 ±20% tilt — not an override). No FPPG. No stdin interview. No question card.
 
 ## How to run
@@ -54,6 +54,9 @@ Repo-root `scripts/optimize.py` is the **NCAAF** shim — do not use it here.
 | `--depth-source=ourlads\|espn` | default **ourlads**; `espn` is optional fallback (often 403) |
 | `--skip-injuries` | skip ESPN injury join |
 | `--refresh-injuries` | refetch ESPN injuries |
+| `--skip-targets` | skip Lineups WR/TE target join (usage factor 1.0) |
+| `--targets-csv=PATH` | Lineups `targets.csv` (default `nfl/data/targets.csv`) |
+| `--targets-week=N` | join that week (default: latest week in the CSV) |
 | `--skip-props` | skip Odds API player props |
 | `--refresh-props` | refetch props (burns credits) — do not unless asked |
 | `--exclude-questionable` | drop CSV Q; IR/NA already dropped |
@@ -61,7 +64,7 @@ Repo-root `scripts/optimize.py` is the **NCAAF** shim — do not use it here.
 | `--min-salary=N` | house spend floor (default 58000; 0 disables) |
 | `--board` | print pool projections on stderr; JSON `board` |
 | `--board=all` | same board, full pool |
-| `--sim` | Game Monte Carlo (Vegas total+spread; teammates share the world; default 10000; `--sim=0` off). Lineup Fl/Cl = joint 9 p10/p90. Not a PBP copula / not SaberSim. Mean ILP stays implied×depth×share with ±20% prop tilt |
+| `--sim` | Game Monte Carlo (Vegas total+spread; teammates share the world; default 10000; `--sim=0` off). Lineup Fl/Cl = joint 9 p10/p90. Not a PBP copula / not SaberSim. Mean ILP stays implied×depth×share×usage with ±20% prop tilt |
 | `--sim-seed=1` | RNG seed for `--sim` |
 | `--objective=mean\|floor\|ceiling` | ILP score. **Default `mean`** = week1_score. `floor` = sim p10. `ceiling` = sim p90 |
 | `--n-lineups=N` | unique 9s (default 1; max 150). Only if the user named a count |
