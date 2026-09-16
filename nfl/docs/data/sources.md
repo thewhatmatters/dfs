@@ -18,7 +18,7 @@ Skill pointer: `.cursor/skills/optimize-nfl-classic/references/sources.md`.
 | `LINES_JSON` | replay `--lines-json` missing/bad | `nfl/lines.py` | — | **stop** | — |
 | `LINES_JOIN` | FanDuel abbrev ↔ Odds name | `nfl/teams.py` | — | **stop** | add a `TEAMS` row |
 | `LINES_ATTACH` | no pool left after implied totals | `nfl/projections.py` | — | **stop** | — |
-| `INJ_ESPN` | ESPN injury dump | `nfl/injuries.py` | none (public ESPN) | **stop** | `--skip-injuries` |
+| `INJ_ESPN` | ESPN injury dump (`site.web.api`; `site.api` often 403) | `nfl/injuries.py` | none (public ESPN) | **stop** | `--skip-injuries` |
 | `DEPTH_ESPN` | ESPN depth charts, slate teams only | `nfl/depth.py` | none (public ESPN) | **stop** | `--skip-depth` (unlisted prior) |
 | `DEPTH_JOIN` | ESPN team/name map | `nfl/depth.py`, `nfl/teams.py` | — | **stop** if unmapped team; unmatched **names** print on the board, not fatal | — |
 | `PROPS_ODDS_KEY` | no Odds key for player props | `nfl/props.py` | `ODDS_API_KEY` | **degrade** — skip overlay, keep implied×depth | `--skip-props` |

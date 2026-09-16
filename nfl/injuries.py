@@ -2,6 +2,8 @@
 
 Ignore Active blurbs. Name join + Jr. strip. Unmatched names stay in the pool.
 Cache: nfl/data/espn-injuries/.
+
+Use site.web.api — site.api is often HTTP 403 from datacenter/residential egress.
 """
 
 from __future__ import annotations
@@ -16,7 +18,7 @@ from nfl.names import match_key
 from nfl.players import Player
 from nfl.teams import lookup_odds
 
-ESPN_INJURIES = "https://site.api.espn.com/apis/site/v2/sports/football/nfl/injuries"
+ESPN_INJURIES = "https://site.web.api.espn.com/apis/site/v2/sports/football/nfl/injuries"
 CACHE_DIR = Path(__file__).resolve().parent / "data" / "espn-injuries"
 DROP_STATUSES = frozenset(
     {"out", "doubtful", "injured reserve", "ir", "suspension", "suspended"}
