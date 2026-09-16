@@ -4,7 +4,7 @@
 I/O: flags in → picker tables on stderr. JSON on stdout for --agent / --json
 / non-TTY; --out always writes the file. Exit 0 on a feasible lineup, 2 if
 infeasible, 1 on usage/IO errors.
-Default objective is week1_score (implied×depth×share, ±20% prop tilt). No FPPG.
+Default objective is week1_score (implied×depth×share×usage, ±20% prop tilt). No FPPG.
 """
 
 from __future__ import annotations
@@ -76,12 +76,20 @@ from nfl.sim import (  # noqa: E402
     simulate_games,
 )
 from nfl.solver import Infeasible, Lineup, solve_many  # noqa: E402
+from nfl.targets import (  # noqa: E402
+    DEFAULT_OUT as DEFAULT_TARGETS_CSV,
+    TargetsError,
+    attach_targets,
+    load_targets_csv,
+    print_targets_gaps,
+)
 from nfl.teams import UnmappedTeam  # noqa: E402
 from nfl.upload import export_lineups  # noqa: E402
 
 VEGAS_LABEL = (
     "Odds API player-prop FD points when volume lines join; else implied "
-    "team total × depth × position share (DEF: opp implied PA bucket + 3.0)"
+    "team total × depth × position share × Lineups usage tilt "
+    "(DEF: opp implied PA bucket + 3.0)"
 )
 
 
@@ -111,6 +119,13 @@ def _max_per_team(value: str) -> int:
     n = int(value)
     if n < 1 or n > FANDUEL_MAX_PER_TEAM:
         raise argparse.ArgumentTypeError(f"must be 1..{FANDUEL_MAX_PER_TEAM}")
+    return n
+
+
+def _positive_week(value: str) -> int:
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
     return n
 
 
@@ -175,6 +190,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--refresh-injuries",
         action="store_true",
         help="bypass ESPN injury cache",
+    )
+    ap.add_argument(
+        "--skip-targets",
+        action="store_true",
+        help="do not join Lineups WR/TE targets (usage factor stays 1.0)",
+    )
+    ap.add_argument(
+        "--targets-csv",
+        type=Path,
+        default=DEFAULT_TARGETS_CSV,
+        help=f"Lineups targets CSV (default: {DEFAULT_TARGETS_CSV})",
+    )
+    ap.add_argument(
+        "--targets-week",
+        type=_positive_week,
+        default=None,
+        metavar="N",
+        help="targets.csv week to join (default: latest week in the CSV)",
     )
     ap.add_argument(
         "--skip-props",
@@ -379,6 +412,26 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
 
+    tstats: dict = {"skipped": True}
+    if args.skip_targets:
+        print("targets skipped", file=sys.stderr)
+    else:
+        tpath = Path(args.targets_csv).expanduser()
+        try:
+            trows = load_targets_csv(tpath)
+        except TargetsError as e:
+            emit(e.choke, str(e))
+            tstats = {
+                "skipped": True,
+                "csv": str(tpath),
+                "choke": e.choke,
+                "error": str(e),
+            }
+        else:
+            pool, tstats = attach_targets(pool, trows, week=args.targets_week)
+            tstats["csv"] = str(tpath)
+            print_targets_gaps(tstats)
+
     if not args.skip_props:
         try:
             by_pid, pstats = ingest_slate_props(
@@ -431,12 +484,16 @@ def main(argv: list[str] | None = None) -> int:
             "slate_day": slate_day.isoformat(),
         },
         "games": games_payload,
+        "targets": tstats,
         "flags": {
             "exclude_questionable": args.exclude_questionable,
             "keep_out": args.keep_out,
             "greedy": args.greedy,
             "skip_depth": args.skip_depth,
             "depth_source": args.depth_source,
+            "skip_targets": args.skip_targets,
+            "targets_csv": str(args.targets_csv),
+            "targets_week": args.targets_week,
             "skip_props": args.skip_props,
             "skip_injuries": args.skip_injuries,
             "min_salary": args.min_salary,

@@ -7,7 +7,7 @@ Teammates and bring-backs share it. Different games are independent.
 
 Not a play-by-play copula and not SaberSim.
 
-`--board` stays the point estimate (implied×depth×share, ±20% prop tilt).
+`--board` stays the point estimate (implied×depth×share×usage, ±20% prop tilt).
 Default ILP (`mean`) stays `week1_score` — not sim p50. `floor` /
 `ceiling` replace `Player.objective` with that player's sim p10 / p90.
 Lineup Fl/Cl are the joint 9 (sum in the same world), not the sum of
@@ -21,7 +21,7 @@ import random
 from dataclasses import dataclass, replace
 
 from nfl.players import Player
-from nfl.projections import POS_FD_SHARE, depth_prior, prop_factor
+from nfl.projections import POS_FD_SHARE, depth_prior, prop_factor, usage_factor
 from nfl.rules import DST_SACK_TO_PRIOR, FANDUEL_NFL, dst_pa_points, dst_projection
 
 DEFAULT_DRAWS = 10_000
@@ -145,13 +145,18 @@ def volume_point(player: Player) -> float | None:
 
 
 def model_point(player: Player) -> float:
-    """Implied × depth × share. DEF: PA bucket + sack/TO prior. No prop tilt."""
+    """Implied × depth × share × usage. DEF: PA bucket + sack/TO prior. No prop tilt."""
     pos = (player.position or "WR").upper()
     if pos in {"D", "DEF"}:
         return dst_projection(float(player.implied_opp or 0.0))
     implied = float(player.implied_total or 0.0)
     share = POS_FD_SHARE.get(pos, 0.18)
-    return implied * depth_prior(player.depth_rank) * share
+    return (
+        implied
+        * depth_prior(player.depth_rank)
+        * share
+        * usage_factor(player.target_share, player.position, player.depth_rank)
+    )
 
 
 def simulate_player(
@@ -394,7 +399,12 @@ def _score_world(player: Player, team_pts: float, opp_pts: float) -> float:
     if _is_dst(player):
         return dst_pa_points(opp_pts) + DST_SACK_TO_PRIOR
     share = POS_FD_SHARE.get((player.position or "WR").upper(), 0.18)
-    pts = float(team_pts) * depth_prior(player.depth_rank) * share
+    pts = (
+        float(team_pts)
+        * depth_prior(player.depth_rank)
+        * share
+        * usage_factor(player.target_share, player.position, player.depth_rank)
+    )
     if has_volume_props(player):
         pts *= prop_factor(model_point(player), player.prop_fd)
         implied = float(player.implied_total or 0.0)
@@ -415,7 +425,12 @@ def _one_draw(rng: random.Random, player: Player, props: bool) -> float:
     sigma = TEAM_SIGMA_FRAC * abs(implied)
     team_pts = _gauss_floor(rng, implied, sigma, TEAM_POINTS_FLOOR)
     share = POS_FD_SHARE.get((player.position or "WR").upper(), 0.18)
-    pts = team_pts * depth_prior(player.depth_rank) * share
+    pts = (
+        team_pts
+        * depth_prior(player.depth_rank)
+        * share
+        * usage_factor(player.target_share, player.position, player.depth_rank)
+    )
     if props:
         pts *= prop_factor(model_point(player), player.prop_fd)
     return pts

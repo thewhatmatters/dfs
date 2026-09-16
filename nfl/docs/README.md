@@ -4,4 +4,4 @@ Canonical FanDuel NFL classic rules: [`sites/fanduel-nfl.md`](sites/fanduel-nfl.
 
 Optimizer: `python3 -m nfl.optimize` (contest 133104). Do not import `ncaaf`. Do not copy `ncaaf/docs/`. “Let’s optimize” stays NCAAF.
 
-Choke catalog: [`data/sources.md`](data/sources.md). Upload CSVs: `nfl/export/`. Hindsight LineStar perfect: [`../data/perfect/`](../data/perfect/) (week-1 12-gamer `133104.json`; not 133647).
+Choke catalog: [`data/sources.md`](data/sources.md). Lineups WR/TE usage tilt: [`data/targets.md`](data/targets.md). Upload CSVs: `nfl/export/`. Hindsight LineStar perfect: [`../data/perfect/`](../data/perfect/) (week-1 12-gamer `133104.json`; not 133647).

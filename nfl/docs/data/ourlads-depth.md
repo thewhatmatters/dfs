@@ -40,9 +40,12 @@ Week-1 ILP still does **not** maximize FPPG:
 
 ```
 objective = implied_team_total × depth_prior(rank) × position share
+            × usage_factor (±20% Lineups target_share tilt; WR/TE)
             × prop_factor (±20% tilt when a volume line joins)
 prior: rank1=1.00  rank2=0.40  rank3=0.15  unlisted=0.05
 ```
+
+Usage tilt: [`targets.md`](targets.md). `--skip-targets` leaves the factor at 1.0.
 
 ## Commands
 

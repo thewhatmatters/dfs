@@ -20,6 +20,8 @@ python3 -m nfl.optimize \
 
 JSON on stdout; picker (QB, RB, RB, WR, WR, WR, TE, FLEX, DEF) on stderr. Needs `ODDS_API_KEY` (hard `LINES_KEY` if missing). Cached OurLads depth (`python3 -m nfl.depth --csv …`), ESPN injuries, and Odds props; do not `--refresh-props` unless the cache is empty. `--depth-source=espn` is an optional fallback (often 403).
 
-Week-1 objective: implied team total × OurLads depth prior × position share. Volume player props (including 100/300 bonuses when the *line* is ≥ threshold) are a **±20% tilt** on that base — not a second currency. `--skip-props` leaves the factor at 1.0. DEF uses opponent implied total as PA plus a +3.0 sack/TO prior. `--sim` is a structural game draw (Vegas total+spread; teammates share the world), not independent per-player noise.
+Week-1 objective: implied team total × OurLads depth prior × position share × Lineups WR/TE **usage tilt** (`target_share` vs a depth-conditional expected share, clamped ±20%). Volume player props (including 100/300 bonuses when the *line* is ≥ threshold) are a **±20% tilt** on that base — not a second currency. `--skip-targets` / `--skip-props` leave the matching factor at 1.0. DEF uses opponent implied total as PA plus a +3.0 sack/TO prior. `--sim` is a structural game draw (Vegas total+spread; teammates share the world), not independent per-player noise.
+
+Targets: [`docs/data/targets.md`](docs/data/targets.md). `python3 -m nfl.targets --refresh` → `nfl/data/targets.csv`. Name-join gaps print on stderr and JSON `targets`.
 
 Depth grant: [`docs/data/ourlads-authorization.md`](docs/data/ourlads-authorization.md).
