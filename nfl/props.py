@@ -322,6 +322,7 @@ def attach_props(
                 depth_rank=pl.depth_rank,
                 position=pl.position,
                 implied_opp=pl.implied_opp,
+                target_share=pl.target_share,
             )
             out.append(replace(pl, objective=obj, prop_status=status))
             continue
@@ -343,6 +344,7 @@ def attach_props(
             position=pl.position,
             prop_fd=use_fd,
             implied_opp=pl.implied_opp,
+            target_share=pl.target_share,
         )
         out.append(
             replace(

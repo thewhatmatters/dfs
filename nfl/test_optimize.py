@@ -57,6 +57,7 @@ def _pl(**kw) -> Player:
             position=fields["position"],
             prop_fd=fields.get("prop_fd"),
             implied_opp=fields.get("implied_opp"),
+            target_share=fields.get("target_share"),
         )
     allowed = Player.__dataclass_fields__
     return Player(**{k: v for k, v in fields.items() if k in allowed})
@@ -82,6 +83,20 @@ class Week1ScoreTest(unittest.TestCase):
         self.assertAlmostEqual(mid, 22.5, places=6)
         self.assertLess(mid, core * PROP_FACTOR_HI)
         self.assertGreater(mid, core * PROP_FACTOR_LO)
+
+    def test_target_share_is_usage_tilt_not_override(self):
+        from nfl.projections import USAGE_FACTOR_HI, USAGE_FACTOR_LO
+
+        base = week1_score(30.0, 1, "WR")
+        self.assertAlmostEqual(base, 30.0 * 1.0 * 0.18)
+        even = week1_score(30.0, 1, "WR", target_share=0.24)
+        self.assertAlmostEqual(even, base)
+        hi = week1_score(30.0, 1, "WR", target_share=0.48)
+        lo = week1_score(30.0, 1, "WR", target_share=0.01)
+        self.assertAlmostEqual(hi, base * USAGE_FACTOR_HI, places=6)
+        self.assertAlmostEqual(lo, base * USAGE_FACTOR_LO, places=6)
+        qb = week1_score(30.0, 1, "QB", target_share=0.50)
+        self.assertAlmostEqual(qb, 30.0 * 1.0 * 0.50)
 
     def test_props_note_says_tilt(self):
         pl = _pl(

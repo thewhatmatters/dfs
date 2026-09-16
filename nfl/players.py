@@ -36,6 +36,10 @@ class Player:
     prop_receptions: float | None = None
     prop_book: str | None = None
     prop_status: str | None = None
+    target_share: float | None = None
+    targets: int | None = None
+    targets_week: int | None = None
+    targets_status: str | None = None
     ownership: float | None = None
     weather: str | None = None
 

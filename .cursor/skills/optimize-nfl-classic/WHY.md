@@ -61,6 +61,12 @@ NFL path is flags-only.
   yardage bonuses on yards scaled by team_pts/implied; DST PA = opponent
   points in that world. Lineup Fl/Cl = joint 9 p10/p90. ILP ceiling stays
   p90. Not SaberSim / not a PBP copula. Do not fake cash-150.
+- 2026-09-16: **Lineups WR/TE `target_share` is a usage tilt, not a
+  second currency.** Same clamp as props: `usage_factor =
+  clamp(target_share / expected(pos, depth), 0.80, 1.20)`. Vegas implied
+  totals stay the environment. `--skip-targets` = factor 1.0. Join is
+  `match_key` only (Jr. strip); unmatched Lineups + unmatched slate WR/TE
+  print on stderr and JSON `targets`. Do not invent aliases.
 
 ## 4. Known limitations / environment caveats
 
