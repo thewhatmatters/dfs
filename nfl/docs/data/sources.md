@@ -19,8 +19,9 @@ Skill pointer: `.cursor/skills/optimize-nfl-classic/references/sources.md`.
 | `LINES_JOIN` | FanDuel abbrev ↔ Odds name | `nfl/teams.py` | — | **stop** | add a `TEAMS` row |
 | `LINES_ATTACH` | no pool left after implied totals | `nfl/projections.py` | — | **stop** | — |
 | `INJ_ESPN` | ESPN injury dump (`site.web.api`; `site.api` often 403) | `nfl/injuries.py` | none (public ESPN) | **stop** | `--skip-injuries` |
-| `DEPTH_ESPN` | ESPN depth charts, slate teams only | `nfl/depth.py` | none (public ESPN) | **stop** | `--skip-depth` (unlisted prior) |
-| `DEPTH_JOIN` | ESPN team/name map | `nfl/depth.py`, `nfl/teams.py` | — | **stop** if unmapped team; unmatched **names** print on the board, not fatal | — |
+| `DEPTH_OURLADS` | OurLads NFL HTML, slate teams only | `nfl/ourlads.py` | grant: [`ourlads-authorization.md`](ourlads-authorization.md) | **stop** | `--skip-depth` (unlisted prior) |
+| `DEPTH_ESPN` | ESPN depth charts (optional `--depth-source=espn`) | `nfl/depth.py` | none (public ESPN; often 403) | **stop** | `--skip-depth` or default OurLads |
+| `DEPTH_JOIN` | OurLads/ESPN team/name map | `nfl/ourlads.py`, `nfl/depth.py`, `nfl/teams.py` | — | **stop** if unmapped team; unmatched **names** print on the board, not fatal | `NAME_OVERRIDES`; JAC→JAX, ARI→ARZ; WAS is WAS not WSH |
 | `PROPS_ODDS_KEY` | no Odds key for player props | `nfl/props.py` | `ODDS_API_KEY` | **degrade** — skip overlay, keep implied×depth | `--skip-props` |
 | `PROPS_ODDS` | events / per-game prop HTTP | `nfl/props.py` | cache `nfl/data/odds-props/` | **stop** | `--skip-props` |
 | `PROPS_JOIN` | book name unmatched | `nfl/props.py` | — | **not a stop** — `prop_status=unmatched` on the note | — |
@@ -45,7 +46,10 @@ Do not scrape FanDuel. Do not `--refresh-props` unless asked (burns Odds credits
 ## Stop vs degrade (quick)
 
 - **Must have to score the slate:** CSV, lines key + fetch + join.
-- **May skip:** ESPN injuries (`--skip-injuries`), ESPN depth (`--skip-depth`), props (`--skip-props` or missing Odds key).
+- **May skip:** ESPN injuries (`--skip-injuries`), OurLads depth (`--skip-depth`), props (`--skip-props` or missing Odds key).
+- **Optional depth fallback:** `--depth-source=espn` (`DEPTH_ESPN`; often 403).
+
+Depth: [`ourlads-depth.md`](ourlads-depth.md).
 - **May degrade:** PuLP → greedy (label the lineup).
 
 Props are a **±20% tilt** on the implied score when a volume line joins.

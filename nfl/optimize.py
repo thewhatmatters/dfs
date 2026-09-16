@@ -153,12 +153,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument(
         "--skip-depth",
         action="store_true",
-        help="do not fetch/join ESPN depth (role prior stays unlisted)",
+        help="do not fetch/join OurLads depth (role prior stays unlisted)",
     )
     ap.add_argument(
         "--refresh-depth",
         action="store_true",
-        help="bypass ESPN depth cache",
+        help="bypass OurLads HTML cache (slate teams only)",
+    )
+    ap.add_argument(
+        "--depth-source",
+        choices=("ourlads", "espn"),
+        default="ourlads",
+        help="depth provider (default ourlads; espn is optional fallback)",
     )
     ap.add_argument(
         "--skip-injuries",
@@ -355,7 +361,9 @@ def main(argv: list[str] | None = None) -> int:
         slate_teams = {p.team for p in pool} | {p.opponent for p in pool if p.opponent}
         try:
             depth_rows = ingest_slate_depth(
-                slate_teams, refresh=args.refresh_depth
+                slate_teams,
+                refresh=args.refresh_depth,
+                source=args.depth_source,
             )
         except (DepthError, UnmappedTeam) as e:
             emit(depth_id(e), str(e))
@@ -428,6 +436,7 @@ def main(argv: list[str] | None = None) -> int:
             "keep_out": args.keep_out,
             "greedy": args.greedy,
             "skip_depth": args.skip_depth,
+            "depth_source": args.depth_source,
             "skip_props": args.skip_props,
             "skip_injuries": args.skip_injuries,
             "min_salary": args.min_salary,

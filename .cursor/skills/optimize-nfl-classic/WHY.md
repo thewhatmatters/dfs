@@ -50,6 +50,11 @@ NFL path is flags-only.
   when QB + teammate WR/TE are both selected (product binaries). Printed
   Proj stays week1_score. Not a game copula; do not fake correlated p90
   to clear cash 150.
+- 2026-09-16: **NFL depth default is OurLads** (`nfl/ourlads.py` →
+  `nfl/data/depth.csv`). Randy: roommate created OurLads; NFL scrape is
+  authorized the same way as NCAA. Grant:
+  `nfl/docs/data/ourlads-authorization.md`. ESPN `--depth-source=espn` is
+  optional (often 403). Do not change the Tucker NCAA grant file.
 - 2026-09-14: **`--sim` is a structural game draw** (not independent per
   player). One Vegas total+spread world per game (`TOTAL_SIGMA_FRAC=0.12`,
   `SPREAD_SIGMA=10`). Skill pts = team_pts × depth × share × prop_factor;

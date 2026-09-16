@@ -1,25 +1,36 @@
-"""ESPN NFL depth charts for slate teams only.
+"""Join OurLads (default) or ESPN NFL depth to FanDuel Nickname+Team.
 
-Rank = list order (1 = starter). WR rows are X/Y/Z — multiple rank-1s OK.
-Unlisted skill prior is applied later (0.05). Cache: nfl/data/espn-depth/.
+Default path is authorized OurLads HTML → nfl/data/depth.csv.
+`--depth-source=espn` is an optional fallback (ESPN site.api often 403).
+
+Rank 1 is a role prior (starter at that alignment), not 100% snaps.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
-from dataclasses import dataclass, replace
+import sys
+from dataclasses import replace
 from datetime import date
 from pathlib import Path
 
 from nfl.http import HttpError, http_json
 from nfl.names import match_key
-from nfl.players import Player
+from nfl.ourlads import (
+    DEPTH_CSV,
+    DepthError,
+    DepthRow,
+    ingest_slate_depth as ingest_ourlads_depth,
+    match_key as ourlads_match_key,
+)
+from nfl.players import Player, load_fanduel_csv
 from nfl.teams import TeamRef, require_mapped
 
 ESPN_DEPTH = (
     "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{id}/depthcharts"
 )
-CACHE_DIR = Path(__file__).resolve().parent / "data" / "espn-depth"
+ESPN_CACHE_DIR = Path(__file__).resolve().parent / "data" / "espn-depth"
 
 # Offense alignment keys → FanDuel position. wr1/wr2/wr3 are X/Y/Z.
 SKILL_POS = {
@@ -40,22 +51,21 @@ SKILL_POS = {
     "slot": "WR",
 }
 
+# (fd_team, ourlads match_key) → FanDuel Nickname. Add when normalize misses.
+NAME_OVERRIDES: dict[tuple[str, str], str] = {}
 
-class DepthError(Exception):
-    """Fatal ESPN depth ingest."""
+
+class EspnDepthError(DepthError):
+    """Fatal ESPN depth ingest (optional --depth-source=espn)."""
 
 
-@dataclass(frozen=True)
-class DepthRow:
-    team: str
-    pos: str
-    rank: int
-    name: str
-    alignment: str
+def _override_lookup(team: str, ourlads_norm: str) -> str | None:
+    nick = NAME_OVERRIDES.get((team, ourlads_norm))
+    return nick.strip() if nick else None
 
 
 def _day_dir() -> Path:
-    d = CACHE_DIR / date.today().isoformat()
+    d = ESPN_CACHE_DIR / date.today().isoformat()
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -68,9 +78,9 @@ def fetch_team_depth(espn_id: str, *, refresh: bool = False) -> dict:
     try:
         payload, _hdrs = http_json(url)
     except HttpError as e:
-        raise DepthError(f"ESPN depth team {espn_id}: {e}") from e
+        raise EspnDepthError(f"ESPN depth team {espn_id}: {e}") from e
     if not isinstance(payload, dict):
-        raise DepthError(f"ESPN depth team {espn_id} did not return an object")
+        raise EspnDepthError(f"ESPN depth team {espn_id} did not return an object")
     path.write_text(json.dumps(payload), encoding="utf-8")
     return payload
 
@@ -97,6 +107,8 @@ def parse_team_depth(payload: dict, team: TeamRef) -> list[DepthRow]:
         return []
     rows: list[DepthRow] = []
     positions = offense.get("positions") or {}
+    fetched_at = date.today().isoformat()
+    src = ESPN_DEPTH.format(id=team.espn_id)
     for key, block in positions.items():
         pos = SKILL_POS.get(str(key).lower())
         if pos is None or not isinstance(block, dict):
@@ -106,24 +118,24 @@ def parse_team_depth(payload: dict, team: TeamRef) -> list[DepthRow]:
             if not isinstance(ath, dict):
                 continue
             nested = ath.get("athlete") if isinstance(ath.get("athlete"), dict) else None
-            src = nested or ath
-            name = str(src.get("displayName") or src.get("fullName") or "").strip()
+            src_ath = nested or ath
+            name = str(src_ath.get("displayName") or src_ath.get("fullName") or "").strip()
             if not name:
                 continue
-            rank = i + 1
             rows.append(
                 DepthRow(
                     team=team.fd,
                     pos=pos,
-                    rank=rank,
+                    rank=i + 1,
                     name=name,
-                    alignment=str(key).lower(),
+                    source_url=src,
+                    fetched_at=fetched_at,
                 )
             )
     return rows
 
 
-def ingest_slate_depth(
+def ingest_espn_slate_depth(
     slate_teams: set[str],
     *,
     refresh: bool = False,
@@ -137,14 +149,38 @@ def ingest_slate_depth(
     return rows
 
 
-def depth_index(rows: list[DepthRow]) -> dict[tuple[str, str], int]:
-    """(team, match_key) → best (min) rank across alignments."""
-    out: dict[tuple[str, str], int] = {}
+def ingest_slate_depth(
+    slate_teams: set[str],
+    *,
+    refresh: bool = False,
+    source: str = "ourlads",
+    out_csv: Path | None = None,
+) -> list[DepthRow]:
+    """Default OurLads. `source=espn` is the documented optional fallback."""
+    src = (source or "ourlads").strip().lower()
+    if src == "espn":
+        return ingest_espn_slate_depth(slate_teams, refresh=refresh)
+    if src != "ourlads":
+        raise DepthError(f"unknown --depth-source {source!r} (ourlads|espn)")
+    return ingest_ourlads_depth(slate_teams, refresh=refresh, out_csv=out_csv)
+
+
+def depth_index(
+    rows: list[DepthRow],
+) -> dict[tuple[str, str], tuple[int, DepthRow]]:
+    """(team, match_key) → (best rank, row). Rank is min across WR alignments."""
+    out: dict[tuple[str, str], tuple[int, DepthRow]] = {}
     for r in rows:
-        key = (r.team, match_key(r.name))
+        key = (r.team, ourlads_match_key(r.name))
         prev = out.get(key)
-        if prev is None or r.rank < prev:
-            out[key] = r.rank
+        if prev is None or r.rank < prev[0]:
+            out[key] = (r.rank, r)
+        nick = _override_lookup(r.team, key[1])
+        if nick:
+            okey = (r.team, match_key(nick))
+            prev = out.get(okey)
+            if prev is None or r.rank < prev[0]:
+                out[okey] = (r.rank, r)
     return out
 
 
@@ -160,7 +196,8 @@ def attach_depth_ranks(
         if pl.position == "D":
             out.append(pl)
             continue
-        rank = idx.get((pl.team, match_key(pl.name)))
+        hit = idx.get((pl.team, match_key(pl.name)))
+        rank = hit[0] if hit else None
         if rank is not None:
             matched += 1
         obj = pl.objective
@@ -174,3 +211,95 @@ def attach_depth_ranks(
         "unmatched_players": sum(1 for p in players if p.position != "D") - matched,
     }
     return out, stats
+
+
+def unmatched_depth_names(
+    players: list[Player],
+    rows: list[DepthRow],
+) -> list[DepthRow]:
+    fd_keys = {(p.team, match_key(p.name)) for p in players}
+    leftover: list[DepthRow] = []
+    seen: set[tuple[str, str]] = set()
+    for r in rows:
+        key = (r.team, ourlads_match_key(r.name))
+        nick = _override_lookup(r.team, key[1])
+        aliases = {key}
+        if nick:
+            aliases.add((r.team, match_key(nick)))
+        if aliases & fd_keys:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        leftover.append(r)
+    return leftover
+
+
+def print_depth_board(rows: list[DepthRow], players: list[Player] | None = None) -> None:
+    fd_keys = {(p.team, match_key(p.name)) for p in players} if players else None
+    by_team: dict[str, list[DepthRow]] = {}
+    for r in rows:
+        by_team.setdefault(r.team, []).append(r)
+    for team in sorted(by_team):
+        print(f"{team}", file=sys.stderr)
+        for r in sorted(by_team[team], key=lambda x: (x.pos, x.rank, x.name)):
+            mark = ""
+            if fd_keys is not None:
+                key = (r.team, ourlads_match_key(r.name))
+                nick = _override_lookup(r.team, key[1])
+                ok = key in fd_keys or (
+                    nick is not None and (r.team, match_key(nick)) in fd_keys
+                )
+                mark = "  join" if ok else "  NOJOIN"
+            print(
+                f"  {r.pos:<3} {r.rank}  {r.name}{mark}",
+                file=sys.stderr,
+            )
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--csv", required=True, help="FanDuel players-list CSV")
+    ap.add_argument("--out", default=str(DEPTH_CSV), help="depth.csv path")
+    ap.add_argument("--refresh", action="store_true", help="bypass OurLads HTML cache")
+    ap.add_argument(
+        "--depth-source",
+        choices=("ourlads", "espn"),
+        default="ourlads",
+        help="ourlads (default) or espn fallback",
+    )
+    ap.add_argument("--agent", action="store_true")
+    args = ap.parse_args(argv)
+
+    csv_path = Path(args.csv).expanduser()
+    try:
+        players = load_fanduel_csv(csv_path)
+    except (OSError, ValueError) as e:
+        print(f"load failed: {e}", file=sys.stderr)
+        return 1
+    teams = {p.team for p in players} | {p.opponent for p in players if p.opponent}
+    try:
+        rows = ingest_slate_depth(
+            teams,
+            refresh=args.refresh,
+            source=args.depth_source,
+            out_csv=Path(args.out).expanduser(),
+        )
+    except Exception as e:
+        print(f"depth ingest failed: {e}", file=sys.stderr)
+        return 1
+    print(
+        f"depth {len(rows)} rows  teams {len(teams)}  wrote {args.out}  "
+        f"source {args.depth_source}",
+        file=sys.stderr,
+    )
+    print_depth_board(rows, players)
+    leftover = unmatched_depth_names(players, rows)
+    print(f"unmatched depth names: {len(leftover)}", file=sys.stderr)
+    for r in leftover:
+        print(f"  {r.team} {r.pos}{r.rank} {r.name}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
