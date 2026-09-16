@@ -1,0 +1,29 @@
+{
+  "contest": "133970",
+  "source": "LineStar FanDuel perfect lineup (user screenshot 2026-09-07, Sun Main 3 games). Not the DraftKings 8-slot $50k card.",
+  "salary": 57900,
+  "fd_points": 178.12,
+  "players": [
+    {"slot": "QB", "name": "Lincoln Kienholz", "team": "LOU", "salary": 9600, "fd": 33.18},
+    {"slot": "RB", "name": "Aneyas Williams", "team": "ND", "salary": 8800, "fd": 22.6},
+    {"slot": "RB", "name": "Nolan James Jr.", "team": "ND", "salary": 6900, "fd": 16.6},
+    {"slot": "WR", "name": "Deuce Alexander", "team": "MISS", "salary": 8400, "fd": 30.4},
+    {"slot": "WR", "name": "Tre Richardson", "team": "LOU", "salary": 7900, "fd": 25.3},
+    {"slot": "WR", "name": "Malachi Coleman", "team": "WIS", "salary": 4700, "fd": 15.6},
+    {"slot": "Super FLEX", "name": "Trinidad Chambliss", "team": "MISS", "salary": 11600, "fd": 34.44}
+  ],
+  "baseline_lock": {
+    "note": "romeomikedelta entered (cashed 477/3968, $9→$16, min cash 121.66)",
+    "salary": 59300,
+    "fd_points": 128.66,
+    "players": [
+      {"slot": "QB", "name": "Demond Williams Jr.", "team": "WASH"},
+      {"slot": "RB", "name": "Kewan Lacy", "team": "MISS"},
+      {"slot": "RB", "name": "Aneyas Williams", "team": "ND"},
+      {"slot": "WR", "name": "Lawayne McCoy", "team": "LOU"},
+      {"slot": "WR", "name": "Micah Gilbert", "team": "ND"},
+      {"slot": "WR", "name": "TreyShun Hurry", "team": "LOU"},
+      {"slot": "Super FLEX", "name": "Trinidad Chambliss", "team": "MISS"}
+    ]
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "contest": "134050",
+  "source": "LineStar FanDuel perfect lineup (user screenshot 2026-09-13, Sat Main 14 games). Not the DraftKings 8-slot $50k card.",
+  "salary": 58600,
+  "fd_points": 257.88,
+  "players": [
+    {"slot": "QB", "name": "Drew Mestemaker", "team": "OKST", "salary": 8500, "fd": 35.58},
+    {"slot": "RB", "name": "Fame Ijeboi", "team": "PUR", "salary": 7200, "fd": 36.6},
+    {"slot": "RB", "name": "Nate Sheppard", "team": "DUKE", "salary": 10600, "fd": 39.3},
+    {"slot": "WR", "name": "Reed Harris", "team": "ASU", "salary": 6700, "fd": 35.4},
+    {"slot": "WR", "name": "Collin Dixon", "team": "ILL", "salary": 8600, "fd": 40.1},
+    {"slot": "WR", "name": "Jesse Legree", "team": "ORST", "salary": 6900, "fd": 40},
+    {"slot": "Super FLEX", "name": "Gio Lopez", "team": "WAKE", "salary": 10100, "fd": 30.9}
+  ],
+  "baseline_lock": {
+    "note": "romeomikedelta entered = pulp-cbc mean 7 (cashed 416/4761, $30, min cash unknown)",
+    "salary": 59600,
+    "fd_points": 128.62,
+    "players": [
+      {"slot": "QB", "name": "Jaron-Keawe Sagapolutele", "team": "CAL"},
+      {"slot": "RB", "name": "Nate Sheppard", "team": "DUKE"},
+      {"slot": "RB", "name": "Dierre Hill Jr.", "team": "ORE"},
+      {"slot": "WR", "name": "Collin Dixon", "team": "ILL"},
+      {"slot": "WR", "name": "Ian Strong", "team": "CAL"},
+      {"slot": "WR", "name": "Jordan Allen", "team": "GT"},
+      {"slot": "Super FLEX", "name": "Dante Moore", "team": "ORE"}
+    ]
+  }
+}

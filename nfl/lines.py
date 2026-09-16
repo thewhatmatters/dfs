@@ -1,0 +1,467 @@
+"""Ingest NFL spread/total from The Odds API and derive implied team totals.
+
+Sport dump is the whole season (~272 games). Filter `commence_time` to this
+slate's weekend (CSV date / 2026-09-13 kickoffs), then join by Odds full name.
+JAC↔JAX, WAS↔WSH. FanDuel book else median of US books.
+
+implied_home = (total - home_spread) / 2
+implied_away = (total + home_spread) / 2
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import statistics
+import urllib.parse
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+from nfl import env as envmod
+from nfl.http import HttpAuthError, HttpError, http_json
+from nfl.teams import lookup_odds, require_fd, require_mapped
+
+ODDS_URL = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds"
+CACHE_DIR = Path(__file__).resolve().parent / "data" / "odds-lines"
+CHICAGO = ZoneInfo("America/Chicago")
+
+LINES_KEY_MISSING = """No betting-lines API key.
+
+Week-1 default objective is Vegas implied team totals (spread + total),
+not CSV FPPG. Refusing to silently use FPPG.
+
+Install:
+  https://the-odds-api.com/
+  export ODDS_API_KEY='your-key'
+  # or: printf 'ODDS_API_KEY=your-key\\n' >> .env && chmod 600 .env
+
+Then re-run: python3 -m nfl.optimize --csv ...
+"""
+
+
+class LinesError(Exception):
+    """Fatal lines ingest."""
+
+
+class LinesKeyMissing(LinesError):
+    gate = "LINES_KEY"
+
+
+class LinesAuthError(LinesError):
+    gate = "LINES_AUTH"
+
+
+@dataclass(frozen=True)
+class TeamLine:
+    game: str
+    home_fd: str
+    away_fd: str
+    home_spread: float
+    total: float
+    implied_home: float
+    implied_away: float
+    home_moneyline: float | None
+    away_moneyline: float | None
+    provider: str
+    source: str
+    commence_time: str | None = None
+
+    def implied_for(self, fd: str) -> float:
+        if fd == self.home_fd:
+            return self.implied_home
+        if fd == self.away_fd:
+            return self.implied_away
+        raise LinesError(f"{fd} not in {self.game}")
+
+    def spread_for(self, fd: str) -> float:
+        if fd == self.home_fd:
+            return self.home_spread
+        if fd == self.away_fd:
+            return -self.home_spread
+        raise LinesError(f"{fd} not in {self.game}")
+
+    def moneyline_for(self, fd: str) -> float | None:
+        if fd == self.home_fd:
+            return self.home_moneyline
+        if fd == self.away_fd:
+            return self.away_moneyline
+        raise LinesError(f"{fd} not in {self.game}")
+
+    def to_dict(self) -> dict:
+        return {
+            "game": self.game,
+            "away": self.away_fd,
+            "home": self.home_fd,
+            "spread_home": self.home_spread,
+            "spread_away": -self.home_spread,
+            "total": self.total,
+            "implied_home": round(self.implied_home, 4),
+            "implied_away": round(self.implied_away, 4),
+            "moneyline_home": self.home_moneyline,
+            "moneyline_away": self.away_moneyline,
+            "provider": self.provider,
+            "source": self.source,
+            "commence_time": self.commence_time,
+        }
+
+
+def implied_totals(total: float, home_spread: float) -> tuple[float, float]:
+    """Return (implied_home, implied_away). home_spread negative ⇒ home favorite."""
+    home = (total - home_spread) / 2.0
+    away = (total + home_spread) / 2.0
+    return home, away
+
+
+def parse_fanduel_game(game: str) -> tuple[str, str]:
+    """FanDuel `Game` column: AWAY@HOME. Returns (away_fd, home_fd)."""
+    raw = (game or "").strip().upper()
+    if "@" not in raw:
+        raise LinesError(f"FanDuel Game {game!r} is not AWAY@HOME")
+    away, home = raw.split("@", 1)
+    away, home = away.strip(), home.strip()
+    if not away or not home:
+        raise LinesError(f"FanDuel Game {game!r} is not AWAY@HOME")
+    return away, home
+
+
+def slate_from_players(players) -> list[tuple[str, str, str]]:
+    """Unique (game, away_fd, home_fd) from a FanDuel pool."""
+    seen: dict[str, tuple[str, str, str]] = {}
+    for pl in players:
+        game = pl.game.strip()
+        if game in seen:
+            continue
+        away, home = parse_fanduel_game(game)
+        if pl.team == home and pl.opponent == away:
+            pass
+        elif pl.team == away and pl.opponent == home:
+            pass
+        else:
+            raise LinesError(
+                f"{pl.name} team={pl.team} opp={pl.opponent} does not match Game {game}"
+            )
+        seen[game] = (game, away, home)
+    return [seen[k] for k in sorted(seen)]
+
+
+def infer_slate_date(csv_path: Path | None = None) -> date:
+    """FanDuel filename `NFL-YYYY CDT-MM CDT-DD` else 2026-09-13."""
+    if csv_path is not None:
+        m = re.search(
+            r"NFL-(\d{4})\s*CDT-(\d{2})\s*CDT-(\d{2})",
+            csv_path.name,
+            re.I,
+        )
+        if m:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    return date(2026, 9, 13)
+
+
+def slate_window(slate_day: date) -> tuple[datetime, datetime]:
+    """Chicago midnight on slate day through 06:00 the next morning (SNF)."""
+    start = datetime(slate_day.year, slate_day.month, slate_day.day, tzinfo=CHICAGO)
+    end = start + timedelta(days=1, hours=6)
+    return start, end
+
+
+def parse_commence(raw: str) -> datetime | None:
+    s = (raw or "").strip()
+    if not s:
+        return None
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def in_window(commence: str, start: datetime, end: datetime) -> bool:
+    dt = parse_commence(commence)
+    if dt is None:
+        return False
+    return start <= dt < end
+
+
+def filter_commence(
+    payload: list[dict], start: datetime, end: datetime
+) -> list[dict]:
+    return [row for row in payload if in_window(str(row.get("commence_time") or ""), start, end)]
+
+
+def _num(val: Any) -> float | None:
+    if val is None or val == "":
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _team_line(
+    *,
+    game: str,
+    home_fd: str,
+    away_fd: str,
+    home_spread: float,
+    total: float,
+    home_ml: float | None,
+    away_ml: float | None,
+    provider: str,
+    source: str,
+    commence_time: str | None = None,
+) -> TeamLine:
+    implied_home, implied_away = implied_totals(total, home_spread)
+    return TeamLine(
+        game=game,
+        home_fd=home_fd,
+        away_fd=away_fd,
+        home_spread=home_spread,
+        total=total,
+        implied_home=implied_home,
+        implied_away=implied_away,
+        home_moneyline=home_ml,
+        away_moneyline=away_ml,
+        provider=provider,
+        source=source,
+        commence_time=commence_time,
+    )
+
+
+def _odds_market(book: dict, key: str) -> dict | None:
+    for m in book.get("markets") or []:
+        if m.get("key") == key:
+            return m
+    return None
+
+
+def _odds_point(market: dict | None, name: str) -> float | None:
+    if not market:
+        return None
+    want = name.casefold()
+    for outcome in market.get("outcomes") or []:
+        if str(outcome.get("name") or "").casefold() == want:
+            return _num(outcome.get("point"))
+    return None
+
+
+def _odds_price(market: dict | None, name: str) -> float | None:
+    if not market:
+        return None
+    want = name.casefold()
+    for outcome in market.get("outcomes") or []:
+        if str(outcome.get("name") or "").casefold() == want:
+            return _num(outcome.get("price"))
+    return None
+
+
+def parse_odds_games(
+    payload: list[dict],
+    slate: list[tuple[str, str, str]],
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> dict[str, TeamLine]:
+    rows = payload
+    if start is not None and end is not None:
+        rows = filter_commence(payload, start, end)
+    index: dict[tuple[str, str], dict] = {}
+    for row in rows:
+        home_ref = lookup_odds(str(row.get("home_team") or ""))
+        away_ref = lookup_odds(str(row.get("away_team") or ""))
+        if home_ref is None or away_ref is None:
+            continue
+        index[(away_ref.fd, home_ref.fd)] = row
+
+    out: dict[str, TeamLine] = {}
+    missing: list[str] = []
+    for game, away_fd, home_fd in slate:
+        row = index.get((away_fd, home_fd))
+        if row is None:
+            missing.append(game)
+            continue
+        home_ref = require_fd(home_fd)
+        away_ref = require_fd(away_fd)
+        books = list(row.get("bookmakers") or [])
+        preferred = [b for b in books if b.get("key") in {"fanduel", "draftkings", "betmgm"}]
+        books_ord = preferred + [b for b in books if b not in preferred]
+        home_spreads: list[float] = []
+        totals: list[float] = []
+        home_mls: list[float] = []
+        away_mls: list[float] = []
+        provider = "median"
+        for book in books_ord:
+            spreads = _odds_market(book, "spreads")
+            tot = _odds_market(book, "totals")
+            h2h = _odds_market(book, "h2h")
+            hs = None
+            for odds_name in home_ref.odds:
+                hs = _odds_point(spreads, odds_name)
+                if hs is not None:
+                    break
+            over = _odds_point(tot, "Over")
+            if hs is not None:
+                home_spreads.append(hs)
+            if over is not None:
+                totals.append(over)
+            for odds_name in home_ref.odds:
+                ml = _odds_price(h2h, odds_name)
+                if ml is not None:
+                    home_mls.append(ml)
+                    break
+            for odds_name in away_ref.odds:
+                ml = _odds_price(h2h, odds_name)
+                if ml is not None:
+                    away_mls.append(ml)
+                    break
+            if book.get("key") == "fanduel" and hs is not None and over is not None:
+                provider = "fanduel"
+                home_spreads = [hs]
+                totals = [over]
+                break
+        if not home_spreads or not totals:
+            missing.append(game)
+            continue
+        out[home_fd] = _team_line(
+            game=game,
+            home_fd=home_fd,
+            away_fd=away_fd,
+            home_spread=float(statistics.median(home_spreads)),
+            total=float(statistics.median(totals)),
+            home_ml=statistics.median(home_mls) if home_mls else None,
+            away_ml=statistics.median(away_mls) if away_mls else None,
+            provider=provider,
+            source="odds-api",
+            commence_time=str(row.get("commence_time") or "") or None,
+        )
+        out[away_fd] = out[home_fd]
+    if missing:
+        raise LinesError("no Odds API line for slate game(s): " + ", ".join(missing))
+    return {fd: out[fd] for fd in {h for _, _, h in slate} | {a for _, a, _ in slate}}
+
+
+def parse_simple_games(
+    payload: list[dict],
+    slate: list[tuple[str, str, str]],
+) -> dict[str, TeamLine]:
+    """Replay JSON: [{away, home, spread, total, ...}] with FanDuel abbrevs."""
+    index: dict[tuple[str, str], dict] = {}
+    for row in payload:
+        away = str(row.get("away") or "").strip().upper()
+        home = str(row.get("home") or "").strip().upper()
+        if not away or not home:
+            continue
+        index[(away, home)] = row
+    out: dict[str, TeamLine] = {}
+    missing: list[str] = []
+    for game, away_fd, home_fd in slate:
+        row = index.get((away_fd, home_fd))
+        if row is None:
+            missing.append(game)
+            continue
+        spread = _num(row.get("spread"))
+        total = _num(row.get("total") if "total" in row else row.get("overUnder"))
+        if spread is None or total is None:
+            missing.append(game)
+            continue
+        out[home_fd] = _team_line(
+            game=game,
+            home_fd=home_fd,
+            away_fd=away_fd,
+            home_spread=spread,
+            total=total,
+            home_ml=_num(row.get("home_moneyline") or row.get("homeMoneyline")),
+            away_ml=_num(row.get("away_moneyline") or row.get("awayMoneyline")),
+            provider=str(row.get("provider") or "file"),
+            source="lines-json",
+        )
+        out[away_fd] = out[home_fd]
+    if missing:
+        raise LinesError("no file line for slate game(s): " + ", ".join(missing))
+    return {fd: out[fd] for fd in {h for _, _, h in slate} | {a for _, a, _ in slate}}
+
+
+def load_lines_json(
+    path: Path,
+    slate: list[tuple[str, str, str]],
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> dict[str, TeamLine]:
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(raw, dict) and "games" in raw:
+        raw = raw["games"]
+    if not isinstance(raw, list) or not raw:
+        raise LinesError(f"{path} is not a JSON array of games")
+    first = raw[0]
+    if "bookmakers" in first and "home_team" in first:
+        return parse_odds_games(raw, slate, start=start, end=end)
+    return parse_simple_games(raw, slate)
+
+
+def _odds_key() -> str:
+    k = envmod.get("ODDS_API_KEY") or envmod.get("THE_ODDS_API_KEY")
+    if not k:
+        raise LinesKeyMissing(LINES_KEY_MISSING)
+    return k
+
+
+def fetch_odds(*, refresh: bool = False) -> list[dict]:
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path = CACHE_DIR / f"{date.today().isoformat()}.json"
+    if path.is_file() and path.stat().st_size > 2 and not refresh:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(raw, list):
+            return raw
+    key = _odds_key()
+    params = {
+        "apiKey": key,
+        "regions": "us",
+        "markets": "h2h,spreads,totals",
+        "oddsFormat": "american",
+    }
+    url = ODDS_URL + "?" + urllib.parse.urlencode(params)
+    try:
+        payload, _hdrs = http_json(url)
+    except HttpAuthError as e:
+        raise LinesAuthError(str(e)) from e
+    except HttpError as e:
+        raise LinesError(f"Odds API {e}") from e
+    if not isinstance(payload, list):
+        raise LinesError("Odds API did not return an array")
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return payload
+
+
+def ingest_slate_lines(
+    players,
+    *,
+    lines_json: Path | None = None,
+    slate_day: date | None = None,
+    refresh: bool = False,
+) -> dict[str, TeamLine]:
+    """Return TeamLine keyed by FanDuel abbrev for every slate team."""
+    slate = slate_from_players(players)
+    fd_teams = {a for _, a, _ in slate} | {h for _, _, h in slate}
+    require_mapped(fd_teams)
+    day = slate_day or date(2026, 9, 13)
+    start, end = slate_window(day)
+
+    if lines_json is not None:
+        return load_lines_json(lines_json, slate, start=start, end=end)
+
+    payload = fetch_odds(refresh=refresh)
+    return parse_odds_games(payload, slate, start=start, end=end)
+
+
+def unique_games(by_team: dict[str, TeamLine]) -> list[TeamLine]:
+    seen: dict[str, TeamLine] = {}
+    for line in by_team.values():
+        seen.setdefault(line.game, line)
+    return [seen[k] for k in sorted(seen)]

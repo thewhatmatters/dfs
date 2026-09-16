@@ -1,0 +1,32 @@
+{
+  "contest": "133104",
+  "source": "LineStar FanDuel perfect lineup (user screenshot 2026-09-14, Main 12 games). Not DraftKings. Contest 133104 is the week-1 12-gamer (original players-list). Do not use 133647 as the contest id — that CSV is a Sunday late 4-gamer (ARI@LAC, GB@MIN, MIA@LV, WAS@PHI) after 1pm kickoffs.",
+  "salary": 59600,
+  "fd_points": 276.46,
+  "players": [
+    {"slot": "QB", "name": "Josh Allen", "team": "BUF", "salary": 8900, "fd": 38.66},
+    {"slot": "RB", "name": "Derrick Henry", "team": "BAL", "salary": 8300, "fd": 37.8},
+    {"slot": "RB", "name": "D'Andre Swift", "team": "CHI", "salary": 6600, "fd": 34.9},
+    {"slot": "WR", "name": "Jalen Coker", "team": "CAR", "salary": 5400, "fd": 32.8},
+    {"slot": "WR", "name": "Christian Watson", "team": "GB", "salary": 6400, "fd": 32.7},
+    {"slot": "WR", "name": "Justin Jefferson", "team": "MIN", "salary": 8100, "fd": 27.2},
+    {"slot": "TE", "name": "Dallas Goedert", "team": "PHI", "salary": 5300, "fd": 21.7},
+    {"slot": "FLEX", "name": "Ashton Jeanty", "team": "LV", "salary": 7000, "fd": 32.7},
+    {"slot": "DEF", "name": "Cincinnati Bengals", "team": "CIN", "salary": 3600, "fd": 18}
+  ],
+  "baseline_lock": {
+    "note": "Friday house-3 mean 9 shown to Randy (not the Sunday 4-gamer re-solve)",
+    "salary": 59500,
+    "players": [
+      {"slot": "QB", "name": "Justin Herbert", "team": "LAC"},
+      {"slot": "RB", "name": "Jahmyr Gibbs", "team": "DET"},
+      {"slot": "RB", "name": "D'Andre Swift", "team": "CHI"},
+      {"slot": "WR", "name": "Quentin Johnston", "team": "LAC"},
+      {"slot": "WR", "name": "Tee Higgins", "team": "CIN"},
+      {"slot": "WR", "name": "Ladd McConkey", "team": "LAC"},
+      {"slot": "TE", "name": "Sam LaPorta", "team": "DET"},
+      {"slot": "FLEX", "name": "Chase Brown", "team": "CIN"},
+      {"slot": "DEF", "name": "Tennessee Titans", "team": "TEN"}
+    ]
+  }
+}

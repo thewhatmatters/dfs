@@ -1,0 +1,27 @@
+---
+description: Dispatch implementation to Grok CLI; do not spend Cursor turns writing code in this repo.
+alwaysApply: true
+---
+
+# Grok CLI is the worker
+
+This repo’s implementation agent is **Grok CLI**, not the in-session Cursor model. Cursor’s job is pack a prompt, run the dispatcher, and report. Do not edit `ncaaf/`, `nfl/`, `docs/`, or skills in-session except to fix the dispatcher itself.
+
+## Do this
+
+1. Write the user request plus any file paths into `results/grok-prompt.md` (gitignored).
+2. Shell (permissions `all` — Grok needs `~/.grok/auth.json` and network):
+
+```bash
+bash scripts/dispatch-grok.sh results/grok-prompt.md
+```
+
+3. Summarize Grok’s stdout. If the CLI is missing or unauthenticated, stop and say so (`grok login`); do not fall back to implementing here.
+
+## Do not
+
+- Implement features, refactors, or lineup-logic changes with Cursor tools.
+- Pass `-m` / `--model` or set `GROK_MODEL` (the dispatcher refuses both; reported ids are not launch ids).
+- Use Claude/Codex CLIs for this repo.
+
+Trivial answers that need no repo edits (e.g. “what’s the salary cap?”) may be answered from `ncaaf/docs/sites/fanduel-ncaaf.md` without dispatching.

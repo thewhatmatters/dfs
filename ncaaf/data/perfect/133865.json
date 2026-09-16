@@ -1,0 +1,29 @@
+{
+  "contest": "133865",
+  "source": "LineStar perfect lineup (user screenshot 2026-09-06)",
+  "salary": 59600,
+  "fd_points": 230.58,
+  "players": [
+    {"slot": "QB", "name": "JC French IV", "team": "CIN", "salary": 9600, "fd": 30.28},
+    {"slot": "RB", "name": "Nate Sheppard", "team": "DUKE", "salary": 9900, "fd": 36.1},
+    {"slot": "RB", "name": "Jaylin Carter", "team": "MEM", "salary": 7600, "fd": 44.6},
+    {"slot": "WR", "name": "Jeremiah Smith", "team": "OSU", "salary": 11000, "fd": 31.6},
+    {"slot": "WR", "name": "Gavin Freeman", "team": "BAY", "salary": 6000, "fd": 27.4},
+    {"slot": "WR", "name": "Koby Howard", "team": "PSU", "salary": 5200, "fd": 25.1},
+    {"slot": "Super FLEX", "name": "Sam Leavitt", "team": "LSU", "salary": 10300, "fd": 35.5}
+  ],
+  "baseline_lock": {
+    "note": "romeomikedelta entered (pre WR-sit, pre RB1/RB2 split, floor $57k)",
+    "salary": 59900,
+    "fd_points": 114.62,
+    "players": [
+      {"slot": "QB", "name": "Marcel Reed", "team": "TXAM"},
+      {"slot": "RB", "name": "Hollywood Smothers", "team": "TEX"},
+      {"slot": "RB", "name": "Manny Covey", "team": "MEM"},
+      {"slot": "WR", "name": "Jeremiah Smith", "team": "OSU"},
+      {"slot": "WR", "name": "Emmett Mosley V", "team": "TEX"},
+      {"slot": "WR", "name": "Rico Scott", "team": "BAMA"},
+      {"slot": "Super FLEX", "name": "Arch Manning", "team": "TEX"}
+    ]
+  }
+}
