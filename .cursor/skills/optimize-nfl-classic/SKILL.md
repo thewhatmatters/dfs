@@ -16,7 +16,7 @@ Solve the highest-projection legal FanDuel NFL classic lineup for a slate CSV.
 ## What it does
 
 Loads contest rules from this repo, filters the FanDuel export, joins Vegas
-lines + ESPN injuries/depth + Odds props (cached), and runs the PuLP ILP
+lines + OurLads depth + ESPN injuries + Odds props (cached), and runs the PuLP ILP
 (greedy if PuLP is missing). Default objective is **week1_score** (implied×depth×share, volume props a
 ±20% tilt — not an override). No FPPG. No stdin interview. No question card.
 
@@ -26,7 +26,7 @@ Triggers: “optimize NFL”, “Let’s optimize NFL”, “FanDuel NFL classic
 `/optimize-nfl-classic` (optional `--csv=PATH`). **Not** bare “Let’s optimize”
 (that is NCAAF). Do not ask “NCAAF or NFL?” on the bare phrase.
 
-Crunch first (preflight, cached lines/depth/injuries/props). **Do not**
+Crunch first (preflight, cached lines/OurLads depth/injuries/props). **Do not**
 `--refresh-props` unless asked. **Do not** call `AskUserQuestion` /
 `GrokBuild:ask_user_question` / `ask_user_question`. Do not search MCP.
 Do not scrape FanDuel. Do not import `ncaaf`. Do not pass `-m`.
@@ -49,8 +49,9 @@ Repo-root `scripts/optimize.py` is the **NCAAF** shim — do not use it here.
 | `--csv=PATH` | FanDuel players-list CSV (required) |
 | `--out=PATH` | write JSON artifact |
 | `--lines-json=PATH` | replay Odds / simple-games JSON |
-| `--skip-depth` | skip ESPN depth join (unlisted prior) |
-| `--refresh-depth` | refetch ESPN depth (slate teams only) |
+| `--skip-depth` | skip OurLads depth join (unlisted prior) |
+| `--refresh-depth` | refetch OurLads HTML (slate teams only) |
+| `--depth-source=ourlads\|espn` | default **ourlads**; `espn` is optional fallback (often 403) |
 | `--skip-injuries` | skip ESPN injury join |
 | `--refresh-injuries` | refetch ESPN injuries |
 | `--skip-props` | skip Odds API player props |

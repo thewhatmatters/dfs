@@ -14,7 +14,7 @@ Salary-cap daily fantasy. First sport/site: **NCAA football, FanDuel classic**. 
 - Do **not** invent contest rules from NFL FanDuel. CFB has **no yardage bonuses**, **no DST/K slots**, TE is **WR-eligible**, SuperFLEX is the 7th slot, OT only **first two periods**.
 - Cap is **$60,000**. **Spend floor $58,000** (house rule; `--min-salary=0` to disable). **SuperFLEX is a second QB** by default (`--superflex=any` for FanDuel’s full QB/RB/WR/TE slot). Min **3 teams**, max **4** from one team.
 - **Week-1 objective is Vegas implied team totals** (spread + total via CFBD `/lines` or The Odds API), not CSV `FPPG`. Join + formula: [`ncaaf/docs/data/vegas-implied-totals.md`](ncaaf/docs/data/vegas-implied-totals.md). FPPG is prior-season / empty — `--use-fppg` opt-in only, labeled as such. Missing `CFBD_API_KEY` / `ODDS_API_KEY` is a hard gate; do not silently keep FPPG.
-- **OurLads:** scrape is **authorized** for this repo — see [`ncaaf/docs/data/ourlads-authorization.md`](ncaaf/docs/data/ourlads-authorization.md). Polite, slate-only, cached. Do not stealth-crawl. Do not scrape FanDuel. Depth rank is not the week-1 ILP objective.
+- **OurLads:** scrape is **authorized** for this repo — NCAA grant [`ncaaf/docs/data/ourlads-authorization.md`](ncaaf/docs/data/ourlads-authorization.md); NFL grant [`nfl/docs/data/ourlads-authorization.md`](nfl/docs/data/ourlads-authorization.md) (Randy: roommate created OurLads; NFL depth same as NCAA). Polite, slate-only, cached. Do not stealth-crawl. Do not scrape FanDuel. Depth rank is not the week-1 ILP objective.
 - **Chokes:** ingest failures print `choke <ID>:` — NCAAF catalog [`ncaaf/docs/data/sources.md`](ncaaf/docs/data/sources.md); NFL catalog [`nfl/docs/data/sources.md`](nfl/docs/data/sources.md).
 
 ## Commands
@@ -27,6 +27,7 @@ python3 -m ncaaf.optimize --csv ncaaf/data/<export>.csv --agent --out results/li
 python3 -m ncaaf.optimize --csv ncaaf/data/<export>.csv --use-fppg   # prior season, not this slate
 python3 -m ncaaf.depth --csv ncaaf/data/<export>.csv                 # OurLads slate depth → ncaaf/data/depth.csv
 python3 -m nfl.optimize --csv "nfl/data/<players-list>.csv"          # FanDuel NFL classic
+python3 -m nfl.depth --csv "nfl/data/<players-list>.csv"             # OurLads NFL depth → nfl/data/depth.csv
 # NFL uploads: nfl/export/ when --n-lineups>1. Cached props; do not --refresh-props unless asked.
 # Player props: ODDS_API_KEY, cached, ~70 credits/slate (see ncaaf/docs/data/player-props.md)
 # After week 1: CFBD pass/rush mix — ncaaf/docs/data/play-distribution.md (not live until 2026 boxes)
@@ -58,7 +59,7 @@ NFL (`/optimize-nfl-classic`): no interview / question card. Newest `nfl/data/Fa
 ## Do not
 
 - Scrape FanDuel or automate entries.
-- Stealth-crawl OurLads or scrape all FBS every run (grant is polite + slate-only).
+- Stealth-crawl OurLads or scrape all FBS / all 32 NFL teams every run (grant is polite + slate-only).
 - Treat empty-FPPG players as sleepers without `--include-unprojected` (`--use-fppg` mode).
 - Use CSV FPPG as the week-1 objective (it is last season or empty).
 - Copy NFL bonuses (100 rush/rec, 300 pass) into CFB scoring.
