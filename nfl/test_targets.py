@@ -1,4 +1,4 @@
-"""Parser + join tests for Lineups WR/TE targets (no network)."""
+"""Parser + join tests for Lineups RB/WR/TE targets (no network)."""
 
 from __future__ import annotations
 
@@ -48,6 +48,7 @@ def _pl(**kw) -> Player:
             depth_rank=fields.get("depth_rank"),
             position=fields["position"],
             target_share=fields.get("target_share"),
+            snap_share=fields.get("snap_share"),
         )
     allowed = Player.__dataclass_fields__
     return Player(**{k: v for k, v in fields.items() if k in allowed})
@@ -122,12 +123,13 @@ class TestTargetsJoin(unittest.TestCase):
             _pl(name="DeVonta Smith", team="PHI", position="WR", pid="ds"),
             _pl(name="Sam LaPorta Jr.", team="DET", position="TE", pid="sl"),
             _pl(name="Marvin Harrison", team="ARI", position="WR", pid="mh"),
+            _pl(name="Saquon Barkley", team="PHI", position="RB", pid="sb"),
             _pl(name="Jared Goff", team="DET", position="QB", pid="jg"),
         ]
         attached, stats = attach_targets(pool, rows, week=1)
         self.assertEqual(stats["week"], 1)
-        self.assertEqual(stats["joined"], 3)
-        self.assertEqual(stats["slate_wr_te"], 4)
+        self.assertEqual(stats["joined"], 4)
+        self.assertEqual(stats["slate_rb_wr_te"], 5)
         lu_names = {r["player"] for r in stats["unmatched_lineups"]}
         sl_names = {r["player"] for r in stats["unmatched_slate_wr_te"]}
         self.assertEqual(lu_names, {"Hollywood Brown"})
@@ -137,6 +139,8 @@ class TestTargetsJoin(unittest.TestCase):
         self.assertAlmostEqual(by_name["AJ Brown"].target_share or 0, 0.24)
         self.assertEqual(by_name["Sam LaPorta Jr."].targets_status, "joined")
         self.assertEqual(by_name["Marvin Harrison"].targets_status, "joined")
+        self.assertEqual(by_name["Saquon Barkley"].targets_status, "joined")
+        self.assertAlmostEqual(by_name["Saquon Barkley"].target_share or 0, 0.12)
         self.assertEqual(by_name["DeVonta Smith"].targets_status, "unmatched")
         self.assertIsNone(by_name["DeVonta Smith"].target_share)
         self.assertIsNone(by_name["Jared Goff"].targets_status)
@@ -156,10 +160,25 @@ class TestTargetsJoin(unittest.TestCase):
         with redirect_stderr(buf):
             print_targets_gaps(stats)
         text = buf.getvalue()
-        self.assertIn("joined 3 / 4 slate WR/TE", text)
+        self.assertIn("joined 4 / 5 slate RB/WR/TE", text)
         self.assertIn("Hollywood Brown (PHI WR)", text)
         self.assertIn("DeVonta Smith (PHI WR)", text)
         self.assertNotIn("Jared Goff", text)
+
+    def test_rb_target_join_even_share_is_neutral(self) -> None:
+        rows = load_targets_csv(JOIN_CSV)
+        pool = [_pl(name="Saquon Barkley", team="PHI", position="RB", pid="sb")]
+        attached, stats = attach_targets(pool, rows, week=1)
+        self.assertEqual(stats["joined"], 1)
+        pl = attached[0]
+        self.assertEqual(pl.targets_status, "joined")
+        self.assertAlmostEqual(pl.target_share or 0, 0.12)
+        # RB1 expected target 0.12 → factor 1.0 (Vegas base unchanged)
+        self.assertAlmostEqual(
+            pl.objective or 0.0,
+            week1_score(30.0, 1, "RB"),
+            places=6,
+        )
 
     def test_missing_week_is_unmatched_not_fatal(self) -> None:
         rows = load_targets_csv(JOIN_CSV)

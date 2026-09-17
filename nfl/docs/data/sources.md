@@ -28,9 +28,12 @@ Skill pointer: `.cursor/skills/optimize-nfl-classic/references/sources.md`.
 | `SOLVER_PULP` | PuLP not importable | preflight / `nfl/solver.py` | `pip install pulp` | **degrade** greedy | `--greedy` |
 | `SOLVER_INFEASIBLE` | no legal 9 | `nfl/solver.py` | — | **stop** exit 2 | relax floor / `--max-per-team=4` / `--stack-qb=off` / `--bring-back` |
 | `SALARY_BOUNDS` | `--min-salary` vs cap | `nfl/rules.py` | — | **stop** | — |
-| `TARGETS_LINEUPS` | Lineups.com WR/TE target pages (public HTML + SSR JSON) | `nfl/targets.py` | none — public pages; ToS bans automated aggregation (low-rate UA + local cache) | **stop** | omit targets refresh |
-| `TARGETS_CSV` | local `nfl/data/targets.csv` (or `--targets-csv`) missing/empty/bad | `nfl/targets.py` | none — produced by `python3 -m nfl.targets --refresh` | **degrade** — usage factor 1.0 | `--skip-targets` |
+| `TARGETS_LINEUPS` | Lineups.com RB/WR/TE target pages (public HTML + SSR JSON) | `nfl/targets.py` | grant: [`lineups-authorization.md`](lineups-authorization.md) | **stop** | omit targets refresh |
+| `TARGETS_CSV` | local `nfl/data/targets.csv` (or `--targets-csv`) missing/empty/bad | `nfl/targets.py` | none — produced by `python3 -m nfl.targets --refresh` | **degrade** — usage uses snaps or 1.0 | `--skip-targets` |
 | `TARGETS_JOIN` | Lineups full team name ↔ FanDuel abbrev (refresh) | `nfl/targets.py`, `nfl/teams.py` | — | **stop** on unmapped **team**; unmatched **names** print on stderr / JSON `targets`, not fatal | add Odds full name to `TEAMS`; do not invent player aliases |
+| `SNAPS_LINEUPS` | Lineups.com RB/WR/TE snap-count pages (public HTML + SSR JSON) | `nfl/snaps.py` | grant: [`lineups-authorization.md`](lineups-authorization.md) | **stop** | omit snaps refresh |
+| `SNAPS_CSV` | local `nfl/data/snaps.csv` (or `--snaps-csv`) missing/empty/bad | `nfl/snaps.py` | none — produced by `python3 -m nfl.snaps --refresh` | **degrade** — RB usage uses targets or 1.0 | `--skip-snaps` |
+| `SNAPS_JOIN` | Lineups full team name ↔ FanDuel abbrev (snaps refresh) | `nfl/snaps.py`, `nfl/teams.py` | — | **stop** on unmapped **team**; unmatched **names** print on stderr / JSON `snaps`, not fatal | add Odds full name to `TEAMS`; do not invent player aliases |
 | `UPLOAD_CSV` | FanDuel upload write/validate | `nfl/upload.py` | — | **stop** | omit `--upload` / `--n-lineups=1` |
 
 ## Deferred (not wired this pass)
@@ -41,13 +44,14 @@ Skill pointer: `.cursor/skills/optimize-nfl-classic/references/sources.md`.
 | `INACTIVES_SUNDAY` | Sunday inactives | not ingested |
 | `PFF_PRO` | PFF Pro API | not wired |
 | `ANYTIME_TD` | Odds anytime-TD overlay | skipped in `nfl/props.py` |
+| `PROPS_LINEUPS` | Lineups player-prop pages | inventoried only: `https://www.lineups.com/nfl/player-prop-bets/` — Odds API stays the overlay |
 
 Do not scrape FanDuel. Do not `--refresh-props` unless asked (burns Odds credits).
 
 ## Stop vs degrade (quick)
 
 - **Must have to score the slate:** CSV, lines key + fetch + join.
-- **May skip:** ESPN injuries (`--skip-injuries`), OurLads depth (`--skip-depth`), Lineups WR/TE targets (`--skip-targets` or missing CSV), props (`--skip-props` or missing Odds key).
+- **May skip:** ESPN injuries (`--skip-injuries`), OurLads depth (`--skip-depth`), Lineups RB/WR/TE targets (`--skip-targets` or missing CSV), Lineups snaps (`--skip-snaps` or missing CSV), props (`--skip-props` or missing Odds key).
 - **Optional depth fallback:** `--depth-source=espn` (`DEPTH_ESPN`; often 403).
 
 Depth: [`ourlads-depth.md`](ourlads-depth.md).
@@ -57,6 +61,17 @@ Props are a **±20% tilt** on the implied score when a volume line joins.
 Missing props is not a lines failure and not a blank choke — see picker
 `note` / `prop_status`.
 
-## Targets refresh + usage tilt
+## Targets + snaps refresh + usage tilt
 
-`python3 -m nfl.targets --refresh` writes `nfl/data/targets.csv` from Lineups WR + TE public pages. Cache: `nfl/data/lineups-targets/`. Optimizer join + formula: [`targets.md`](targets.md). Missing CSV degrades (`TARGETS_CSV`); name gaps are reported, not a stop.
+Wednesday-style weekly refresh (after the prior week’s games land):
+
+```
+python3 -m nfl.targets --refresh
+python3 -m nfl.snaps --refresh
+```
+
+Targets: RB + WR + TE public pages → `nfl/data/targets.csv`. Cache: `nfl/data/lineups-targets/`. Formula: [`targets.md`](targets.md).
+
+Snaps: RB + WR + TE public pages → `nfl/data/snaps.csv`. Cache: `nfl/data/lineups-snaps/`. RB snap_share is the rush-role tilt; WR/TE snaps load for later and do not stack on targets. Formula: [`snaps.md`](snaps.md).
+
+Grant: [`lineups-authorization.md`](lineups-authorization.md). Missing CSV degrades (`TARGETS_CSV` / `SNAPS_CSV`); name gaps are reported, not a stop.

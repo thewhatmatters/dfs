@@ -323,6 +323,7 @@ def attach_props(
                 position=pl.position,
                 implied_opp=pl.implied_opp,
                 target_share=pl.target_share,
+                snap_share=pl.snap_share,
             )
             out.append(replace(pl, objective=obj, prop_status=status))
             continue
@@ -345,6 +346,7 @@ def attach_props(
             prop_fd=use_fd,
             implied_opp=pl.implied_opp,
             target_share=pl.target_share,
+            snap_share=pl.snap_share,
         )
         out.append(
             replace(

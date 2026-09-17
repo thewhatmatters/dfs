@@ -1,0 +1,6 @@
+player,team,position,week,snaps,snap_share,snaps_avg,snaps_total,team_snap_pct,source,asof
+Saquon Barkley,PHI,RB,1,45,0.65,45.0,45,0.65,lineups,2026-09-17
+AJ Dillon,PHI,RB,1,12,0.18,12.0,12,0.18,lineups,2026-09-17
+A.J. Brown,PHI,WR,1,55,0.80,55.0,55,0.80,lineups,2026-09-17
+Sam LaPorta,DET,TE,1,40,0.70,40.0,40,0.70,lineups,2026-09-17
+Ghost Back,DET,RB,2,20,0.30,20.0,20,0.30,lineups,2026-09-17

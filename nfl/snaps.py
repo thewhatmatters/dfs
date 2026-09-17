@@ -1,7 +1,7 @@
-"""Lineups.com RB/WR/TE target refresh → nfl/data/targets.csv.
+"""Lineups.com RB/WR/TE snap-count refresh → nfl/data/snaps.csv.
 
 Public pages only (no login). Identified User-Agent; cache under
-nfl/data/lineups-targets/. Grant: nfl/docs/data/lineups-authorization.md.
+nfl/data/lineups-snaps/. Grant: nfl/docs/data/lineups-authorization.md.
 
 Some egress IPs get Cloudflare 403 on live urllib. Prefer cached `.json`
 (SSR payload) when present; seed those from a network that can fetch.
@@ -12,8 +12,8 @@ Wednesday-style weekly refresh (after the prior week’s games land):
   python3 -m nfl.snaps --refresh
 
 Usage:
-  python3 -m nfl.targets --refresh
-  python3 -m nfl.targets --cache-only
+  python3 -m nfl.snaps --refresh
+  python3 -m nfl.snaps --cache-only
 """
 
 from __future__ import annotations
@@ -26,72 +26,65 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from nfl.lineups import (
-    LineupsError,
-    extract_ssr_payload as extract_lineups_ssr,
-    fetch_metric_payload,
-)
+from nfl.lineups import LineupsError, extract_ssr_payload, fetch_metric_payload
 from nfl.names import match_key
 from nfl.players import Player
 from nfl.projections import week1_score
 from nfl.teams import UnmappedTeam, lookup_odds
 
-TARGET_POS = frozenset({"RB", "WR", "TE"})
+SKILL_POS = frozenset({"RB", "WR", "TE"})
 
-RB_URL = "https://www.lineups.com/nfl/targets/running-back/"
-WR_URL = "https://www.lineups.com/nfl/targets/wide-receiver/"
-TE_URL = "https://www.lineups.com/nfl/targets/tight-end/"
-CACHE_DIR = Path(__file__).resolve().parent / "data" / "lineups-targets"
-DEFAULT_OUT = Path(__file__).resolve().parent / "data" / "targets.csv"
+RB_URL = "https://www.lineups.com/nfl/snap-counts/running-back-rb-snap-counts/"
+WR_URL = "https://www.lineups.com/nfl/snap-counts/wide-receiver-wr-snap-counts/"
+TE_URL = "https://www.lineups.com/nfl/snap-counts/tight-end-te-snap-counts/"
+CACHE_DIR = Path(__file__).resolve().parent / "data" / "lineups-snaps"
+DEFAULT_OUT = Path(__file__).resolve().parent / "data" / "snaps.csv"
 SOURCE = "lineups"
-METRIC = "targets"
-CHOKE = "TARGETS_LINEUPS"
+METRIC = "snaps"
+CHOKE = "SNAPS_LINEUPS"
 CSV_FIELDS = (
     "player",
     "team",
     "position",
     "week",
-    "targets",
-    "target_share",
-    "targets_avg",
-    "targets_total",
+    "snaps",
+    "snap_share",
+    "snaps_avg",
+    "snaps_total",
+    "team_snap_pct",
     "source",
     "asof",
 )
 
 
-class TargetsError(LineupsError):
-    """Fatal Lineups targets ingest."""
+class SnapsError(LineupsError):
+    """Fatal Lineups snaps ingest."""
 
 
 @dataclass(frozen=True)
-class TargetWeekRow:
+class SnapWeekRow:
     player: str
     team: str
     position: str
     week: int
-    targets: int
-    target_share: float
-    targets_avg: float
-    targets_total: int
+    snaps: int
+    snap_share: float
+    snaps_avg: float
+    snaps_total: int
+    team_snap_pct: float | None
     source: str
     asof: str
 
 
-def extract_ssr_payload(html: str) -> dict[str, Any]:
-    """Parse embedded Lineups SSR JSON for metric=targets."""
+def extract_snaps_ssr(html: str) -> dict[str, Any]:
+    """Parse embedded Lineups SSR JSON for metric=snaps."""
     try:
-        return extract_lineups_ssr(html, metric=METRIC, choke=CHOKE)
+        return extract_ssr_payload(html, metric=METRIC, choke=CHOKE)
     except LineupsError as e:
-        raise TargetsError(e.choke, str(e)) from e
+        raise SnapsError(e.choke, str(e)) from e
 
 
 def fetch_position_payload(position: str, url: str, *, refresh: bool) -> dict[str, Any]:
-    """Return SSR targets JSON for RB/WR/TE.
-
-    Prefer cached `.json`. Else parse cached `.html`. Else live GET (writes
-    both). Cloudflare 403 falls back to existing `.json` when present.
-    """
     try:
         return fetch_metric_payload(
             position,
@@ -102,7 +95,14 @@ def fetch_position_payload(position: str, url: str, *, refresh: bool) -> dict[st
             refresh=refresh,
         )
     except LineupsError as e:
-        raise TargetsError(e.choke, str(e)) from e
+        raise SnapsError(e.choke, str(e)) from e
+
+
+def _pct(raw: Any) -> float:
+    try:
+        return float(raw) / 100.0
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def rows_from_payload(
@@ -110,15 +110,15 @@ def rows_from_payload(
     *,
     asof: str,
     expect_pos: str | None = None,
-) -> list[TargetWeekRow]:
+) -> list[SnapWeekRow]:
     data = payload.get("data")
     if not isinstance(data, dict):
-        raise TargetsError("TARGETS_LINEUPS", "SSR data missing")
+        raise SnapsError(CHOKE, "SSR data missing")
     raw_rows = data.get("rows")
     if not isinstance(raw_rows, list) or not raw_rows:
-        raise TargetsError("TARGETS_LINEUPS", "SSR rows empty")
+        raise SnapsError(CHOKE, "SSR rows empty")
 
-    out: list[TargetWeekRow] = []
+    out: list[SnapWeekRow] = []
     for item in raw_rows:
         if not isinstance(item, dict):
             continue
@@ -131,15 +131,15 @@ def rows_from_payload(
             continue
         ref = lookup_odds(team_name)
         if ref is None:
-            raise TargetsError(
-                "TARGETS_JOIN",
+            raise SnapsError(
+                "SNAPS_JOIN",
                 f"unmapped Lineups team {team_name!r} for {name!r}; "
                 "add Odds full name to nfl/teams.py",
             )
         weeks = item.get("weeks") or []
         weeks_pct = item.get("weeksPct") or []
         if not isinstance(weeks, list):
-            raise TargetsError("TARGETS_LINEUPS", f"bad weeks for {name!r}")
+            raise SnapsError(CHOKE, f"bad weeks for {name!r}")
         if not isinstance(weeks_pct, list):
             weeks_pct = []
         try:
@@ -150,32 +150,33 @@ def rows_from_payload(
             average = float(item.get("average") or 0)
         except (TypeError, ValueError):
             average = 0.0
+        team_pct_raw = item.get("teamSnapPct")
+        team_snap_pct: float | None
+        if team_pct_raw is None or team_pct_raw == "":
+            team_snap_pct = None
+        else:
+            team_snap_pct = _pct(team_pct_raw)
 
         for i, val in enumerate(weeks):
             if val is None:
                 continue
             try:
-                targets = int(val)
+                snaps = int(val)
             except (TypeError, ValueError):
                 continue
             share_raw = weeks_pct[i] if i < len(weeks_pct) else None
-            if share_raw is None:
-                share = 0.0
-            else:
-                try:
-                    share = float(share_raw) / 100.0
-                except (TypeError, ValueError):
-                    share = 0.0
+            share = 0.0 if share_raw is None else _pct(share_raw)
             out.append(
-                TargetWeekRow(
+                SnapWeekRow(
                     player=name,
                     team=ref.fd,
                     position=pos,
                     week=i + 1,
-                    targets=targets,
-                    target_share=share,
-                    targets_avg=average,
-                    targets_total=total,
+                    snaps=snaps,
+                    snap_share=share,
+                    snaps_avg=average,
+                    snaps_total=total,
+                    team_snap_pct=team_snap_pct,
                     source=SOURCE,
                     asof=asof,
                 )
@@ -183,23 +184,20 @@ def rows_from_payload(
     return out
 
 
-def load_targets_csv(path: Path) -> list[TargetWeekRow]:
-    """Parse `targets.csv` written by `write_targets_csv` / `--refresh`."""
+def load_snaps_csv(path: Path) -> list[SnapWeekRow]:
+    """Parse `snaps.csv` written by `write_snaps_csv` / `--refresh`."""
     p = Path(path)
     if not p.is_file():
-        raise TargetsError("TARGETS_CSV", f"missing targets CSV {p}")
+        raise SnapsError("SNAPS_CSV", f"missing snaps CSV {p}")
     with p.open(encoding="utf-8", newline="") as fh:
         reader = csv.DictReader(fh)
         if not reader.fieldnames:
-            raise TargetsError("TARGETS_CSV", f"empty targets CSV {p}")
-        required = {"player", "team", "position", "week", "targets", "target_share"}
+            raise SnapsError("SNAPS_CSV", f"empty snaps CSV {p}")
+        required = {"player", "team", "position", "week", "snaps", "snap_share"}
         missing = required - set(reader.fieldnames)
         if missing:
-            raise TargetsError(
-                "TARGETS_CSV",
-                f"{p} missing columns {sorted(missing)}",
-            )
-        out: list[TargetWeekRow] = []
+            raise SnapsError("SNAPS_CSV", f"{p} missing columns {sorted(missing)}")
+        out: list[SnapWeekRow] = []
         for row in reader:
             name = (row.get("player") or "").strip()
             team = (row.get("team") or "").strip().upper()
@@ -213,50 +211,60 @@ def load_targets_csv(path: Path) -> list[TargetWeekRow]:
             if week < 1:
                 continue
             try:
-                targets = int(float(row.get("targets") or 0))
+                snaps = int(float(row.get("snaps") or 0))
             except (TypeError, ValueError):
-                targets = 0
+                snaps = 0
             try:
-                share = float(row.get("target_share") or 0)
+                share = float(row.get("snap_share") or 0)
             except (TypeError, ValueError):
                 share = 0.0
             try:
-                avg = float(row.get("targets_avg") or 0)
+                avg = float(row.get("snaps_avg") or 0)
             except (TypeError, ValueError):
                 avg = 0.0
             try:
-                total = int(float(row.get("targets_total") or 0))
+                total = int(float(row.get("snaps_total") or 0))
             except (TypeError, ValueError):
                 total = 0
+            raw_tm = (row.get("team_snap_pct") or "").strip()
+            team_snap_pct: float | None
+            if not raw_tm:
+                team_snap_pct = None
+            else:
+                try:
+                    team_snap_pct = float(raw_tm)
+                except (TypeError, ValueError):
+                    team_snap_pct = None
             out.append(
-                TargetWeekRow(
+                SnapWeekRow(
                     player=name,
                     team=team,
                     position=pos,
                     week=week,
-                    targets=targets,
-                    target_share=share,
-                    targets_avg=avg,
-                    targets_total=total,
+                    snaps=snaps,
+                    snap_share=share,
+                    snaps_avg=avg,
+                    snaps_total=total,
+                    team_snap_pct=team_snap_pct,
                     source=(row.get("source") or SOURCE).strip() or SOURCE,
                     asof=(row.get("asof") or "").strip(),
                 )
             )
     if not out:
-        raise TargetsError("TARGETS_CSV", f"no player-week rows in {p}")
+        raise SnapsError("SNAPS_CSV", f"no player-week rows in {p}")
     return out
 
 
-def latest_week(rows: list[TargetWeekRow]) -> int | None:
+def latest_week(rows: list[SnapWeekRow]) -> int | None:
     weeks = [r.week for r in rows if r.week >= 1]
     return max(weeks) if weeks else None
 
 
-def rows_for_week(rows: list[TargetWeekRow], week: int) -> list[TargetWeekRow]:
+def rows_for_week(rows: list[SnapWeekRow], week: int) -> list[SnapWeekRow]:
     return [r for r in rows if r.week == week]
 
 
-def _row_key(row: TargetWeekRow) -> tuple[str, str]:
+def _row_key(row: SnapWeekRow) -> tuple[str, str]:
     return (row.team.upper(), match_key(row.player))
 
 
@@ -264,40 +272,39 @@ def _player_key(pl: Player) -> tuple[str, str]:
     return ((pl.team or "").upper(), match_key(pl.name))
 
 
-def targets_index(
-    rows: list[TargetWeekRow],
-) -> dict[tuple[str, str], TargetWeekRow]:
+def snaps_index(rows: list[SnapWeekRow]) -> dict[tuple[str, str], SnapWeekRow]:
     """(team, match_key) → row. First row wins."""
-    out: dict[tuple[str, str], TargetWeekRow] = {}
+    out: dict[tuple[str, str], SnapWeekRow] = {}
     for r in rows:
         key = _row_key(r)
-        prev = out.get(key)
-        if prev is None:
+        if key not in out:
             out[key] = r
     return out
 
 
-def attach_targets(
+def attach_snaps(
     players: list[Player],
-    rows: list[TargetWeekRow],
+    rows: list[SnapWeekRow],
     *,
     week: int | None = None,
 ) -> tuple[list[Player], dict[str, Any]]:
-    """Join RB/WR/TE pool players to one Lineups week.
+    """Join RB/WR/TE pool players to one Lineups snap week.
 
     Name join is `match_key` (Jr/Sr/II stripped). No invented aliases.
-    Missing week / no hit → target_share None (usage uses snaps or 1.0).
+    Missing week / no hit → snap fields empty; week1_score uses targets
+    only (or 1.0). Snap share tilts **RB** usage only — WR/TE snaps are
+    stored for later and do not stack on target_share.
     """
     chosen = week if week is not None else latest_week(rows)
     week_rows = rows_for_week(rows, chosen) if chosen is not None else []
-    idx = targets_index(week_rows)
+    idx = snaps_index(week_rows)
     used: set[tuple[str, str]] = set()
     out: list[Player] = []
     unmatched_slate: list[dict[str, str]] = []
     joined = 0
     for pl in players:
         pos = (pl.position or "").upper()
-        if pos not in TARGET_POS:
+        if pos not in SKILL_POS:
             out.append(pl)
             continue
         key = _player_key(pl)
@@ -312,16 +319,16 @@ def attach_targets(
                 position=pl.position,
                 prop_fd=pl.prop_fd,
                 implied_opp=pl.implied_opp,
-                target_share=None,
-                snap_share=pl.snap_share,
+                target_share=pl.target_share,
+                snap_share=None,
             )
             out.append(
                 replace(
                     pl,
-                    target_share=None,
-                    targets=None,
-                    targets_week=chosen,
-                    targets_status="unmatched",
+                    snap_share=None,
+                    snaps=None,
+                    snaps_week=chosen,
+                    snaps_status="unmatched",
                     objective=obj,
                 )
             )
@@ -334,16 +341,16 @@ def attach_targets(
             position=pl.position,
             prop_fd=pl.prop_fd,
             implied_opp=pl.implied_opp,
-            target_share=hit.target_share,
-            snap_share=pl.snap_share,
+            target_share=pl.target_share,
+            snap_share=hit.snap_share,
         )
         out.append(
             replace(
                 pl,
-                target_share=hit.target_share,
-                targets=hit.targets,
-                targets_week=chosen,
-                targets_status="joined",
+                snap_share=hit.snap_share,
+                snaps=hit.snaps,
+                snaps_week=chosen,
+                snaps_status="joined",
                 objective=obj,
             )
         )
@@ -365,48 +372,44 @@ def attach_targets(
                 "week": r.week,
             }
         )
-    slate_skill = sum(1 for p in players if (p.position or "").upper() in TARGET_POS)
+    slate_skill = sum(1 for p in players if (p.position or "").upper() in SKILL_POS)
     stats: dict[str, Any] = {
         "week": chosen,
         "joined": joined,
         "slate_rb_wr_te": slate_skill,
-        "slate_wr_te": slate_skill,
         "week_rows": len(week_rows),
         "unmatched_lineups": unmatched_lineups,
         "unmatched_slate_rb_wr_te": unmatched_slate,
-        "unmatched_slate_wr_te": unmatched_slate,
         "skipped": False,
     }
     return out, stats
 
 
-def print_targets_gaps(stats: dict[str, Any]) -> None:
+def print_snaps_gaps(stats: dict[str, Any]) -> None:
     """Stderr join summary + both unmatched lists."""
     if stats.get("skipped"):
-        print("targets skipped", file=sys.stderr)
+        print("snaps skipped", file=sys.stderr)
         return
     week = stats.get("week")
     week_s = "—" if week is None else str(week)
     unmatched_lu = list(stats.get("unmatched_lineups") or [])
-    unmatched_sl = list(
-        stats.get("unmatched_slate_rb_wr_te") or stats.get("unmatched_slate_wr_te") or []
-    )
+    unmatched_sl = list(stats.get("unmatched_slate_rb_wr_te") or [])
     print(
-        f"targets week {week_s}  joined {stats.get('joined', 0)} / "
-        f"{stats.get('slate_rb_wr_te', stats.get('slate_wr_te', 0))} slate RB/WR/TE  "
+        f"snaps week {week_s}  joined {stats.get('joined', 0)} / "
+        f"{stats.get('slate_rb_wr_te', 0)} slate RB/WR/TE  "
         f"unmatched_lineups {len(unmatched_lu)}  "
         f"unmatched_slate_rb_wr_te {len(unmatched_sl)}",
         file=sys.stderr,
     )
     if unmatched_lu:
-        print(f"unmatched Lineups ({len(unmatched_lu)}):", file=sys.stderr)
+        print(f"unmatched Lineups snaps ({len(unmatched_lu)}):", file=sys.stderr)
         for row in unmatched_lu:
             print(
                 f"  {row.get('player')} ({row.get('team')} {row.get('position')})",
                 file=sys.stderr,
             )
     if unmatched_sl:
-        print(f"unmatched slate RB/WR/TE ({len(unmatched_sl)}):", file=sys.stderr)
+        print(f"unmatched slate RB/WR/TE snaps ({len(unmatched_sl)}):", file=sys.stderr)
         for row in unmatched_sl:
             print(
                 f"  {row.get('player')} ({row.get('team')} {row.get('position')})",
@@ -414,35 +417,39 @@ def print_targets_gaps(stats: dict[str, Any]) -> None:
             )
 
 
-def write_targets_csv(rows: list[TargetWeekRow], path: Path) -> None:
+def _fmt_share(val: float | None) -> str:
+    if not val:
+        return "0"
+    return f"{val:.4f}".rstrip("0").rstrip(".")
+
+
+def write_snaps_csv(rows: list[SnapWeekRow], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     ordered = sorted(rows, key=lambda r: (r.team, r.position, r.player, r.week))
     with path.open("w", encoding="utf-8", newline="") as fh:
         w = csv.DictWriter(fh, fieldnames=CSV_FIELDS)
         w.writeheader()
         for r in ordered:
-            share_s = (
-                f"{r.target_share:.4f}".rstrip("0").rstrip(".")
-                if r.target_share
-                else "0"
-            )
             w.writerow(
                 {
                     "player": r.player,
                     "team": r.team,
                     "position": r.position,
                     "week": r.week,
-                    "targets": r.targets,
-                    "target_share": share_s,
-                    "targets_avg": r.targets_avg,
-                    "targets_total": r.targets_total,
+                    "snaps": r.snaps,
+                    "snap_share": _fmt_share(r.snap_share),
+                    "snaps_avg": r.snaps_avg,
+                    "snaps_total": r.snaps_total,
+                    "team_snap_pct": (
+                        "" if r.team_snap_pct is None else _fmt_share(r.team_snap_pct)
+                    ),
                     "source": r.source,
                     "asof": r.asof,
                 }
             )
 
 
-def refresh_targets(
+def refresh_snaps(
     *,
     refresh: bool = True,
     out: Path = DEFAULT_OUT,
@@ -456,8 +463,8 @@ def refresh_targets(
     te_rows = rows_from_payload(te_payload, asof=asof, expect_pos="TE")
     rows = rb_rows + wr_rows + te_rows
     if not rows:
-        raise TargetsError("TARGETS_LINEUPS", "no player-week rows after parse")
-    write_targets_csv(rows, out)
+        raise SnapsError(CHOKE, "no player-week rows after parse")
+    write_snaps_csv(rows, out)
     return {
         "out": str(out),
         "asof": asof,
@@ -476,7 +483,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument(
         "--refresh",
         action="store_true",
-        help="re-fetch Lineups RB/WR/TE target pages (writes cache + CSV)",
+        help="re-fetch Lineups RB/WR/TE snap pages (writes cache + CSV)",
     )
     ap.add_argument(
         "--out",
@@ -496,23 +503,23 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     if not args.refresh and not args.cache_only:
         print(
-            "choke TARGETS_LINEUPS: pass --refresh (or --cache-only)",
+            "choke SNAPS_LINEUPS: pass --refresh (or --cache-only)",
             file=sys.stderr,
         )
         return 2
     try:
-        stats = refresh_targets(
+        stats = refresh_snaps(
             refresh=bool(args.refresh) and not args.cache_only,
             out=args.out,
         )
-    except TargetsError as e:
+    except SnapsError as e:
         print(f"choke {e.choke}: {e}", file=sys.stderr)
         return 1
     except UnmappedTeam as e:
-        print(f"choke TARGETS_JOIN: {e}", file=sys.stderr)
+        print(f"choke SNAPS_JOIN: {e}", file=sys.stderr)
         return 1
     print(
-        f"targets: {stats['rows']} rows "
+        f"snaps: {stats['rows']} rows "
         f"({stats['rb_players']} RB / {stats['wr_players']} WR / "
         f"{stats['te_players']} TE players) "
         f"→ {stats['out']} (asof {stats['asof']})",

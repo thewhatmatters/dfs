@@ -2,9 +2,12 @@
 
 Default: implied team total × depth prior × position share × usage factor.
 A volume prop is a clamped ±20% tilt on that base — not a second currency.
-WR/TE Lineups target_share is a second ±20% usage tilt vs a depth-conditional
-expected share — not a replacement for Vegas implied totals. DEF: implied_opp
-PA bucket + 3.0 sack/TO prior. No FPPG.
+WR/TE Lineups target_share is a ±20% usage tilt vs a depth-conditional
+expected share. RB usage blends snap_share (rush role, 70%) with
+target_share (receiving tilt, 30%), each clamped ±20% then blended —
+not two stacked clamps, and not a replacement for Vegas implied totals.
+WR/TE snaps are stored but not applied (would double-count targets).
+DEF: implied_opp PA bucket + 3.0 sack/TO prior. No FPPG.
 `--board` prints the point estimate; optional sim percentiles ride along.
 """
 
@@ -33,8 +36,20 @@ EXPECTED_TARGET_SHARE = {
     ("TE", 1): 0.18,
     ("TE", 2): 0.10,
     ("TE", 3): 0.06,
+    ("RB", 1): 0.12,
+    ("RB", 2): 0.07,
+    ("RB", 3): 0.04,
 }
-UNLISTED_TARGET_SHARE = {"WR": 0.08, "TE": 0.06}
+UNLISTED_TARGET_SHARE = {"WR": 0.08, "TE": 0.06, "RB": 0.04}
+# RB snap-share priors (rush role). WR/TE snaps are not scored.
+EXPECTED_SNAP_SHARE = {
+    ("RB", 1): 0.65,
+    ("RB", 2): 0.30,
+    ("RB", 3): 0.15,
+}
+UNLISTED_SNAP_SHARE = {"RB": 0.10}
+RB_SNAP_WEIGHT = 0.70
+RB_TARGET_WEIGHT = 0.30
 
 
 def depth_prior(rank: int | None) -> float:
@@ -54,7 +69,7 @@ def expected_target_share(
     position: str = "WR",
     depth_rank: int | None = None,
 ) -> float:
-    """Role-typical target share for a WR/TE. 0 for other positions."""
+    """Role-typical target share for WR/TE/RB. 0 for other positions."""
     pos = (position or "").upper()
     if pos not in UNLISTED_TARGET_SHARE:
         return 0.0
@@ -65,24 +80,66 @@ def expected_target_share(
     )
 
 
-def usage_factor(
-    target_share: float | None,
-    position: str = "WR",
+def expected_snap_share(
+    position: str = "RB",
     depth_rank: int | None = None,
 ) -> float:
-    """WR/TE Lineups share vs expected, clamped ±20%. Missing join → 1.0."""
-    if target_share is None:
-        return 1.0
+    """Role-typical snap share for an RB. 0 for other positions."""
     pos = (position or "").upper()
-    if pos not in UNLISTED_TARGET_SHARE:
-        return 1.0
-    expected = expected_target_share(pos, depth_rank)
+    if pos not in UNLISTED_SNAP_SHARE:
+        return 0.0
+    if depth_rank is None:
+        return UNLISTED_SNAP_SHARE[pos]
+    return EXPECTED_SNAP_SHARE.get(
+        (pos, int(depth_rank)), UNLISTED_SNAP_SHARE[pos]
+    )
+
+
+def _clamp_usage(observed: float, expected: float) -> float:
     if expected <= 0:
         return 1.0
     return max(
         USAGE_FACTOR_LO,
-        min(USAGE_FACTOR_HI, float(target_share) / expected),
+        min(USAGE_FACTOR_HI, float(observed) / expected),
     )
+
+
+def _share_factor(
+    observed: float | None,
+    expected: float,
+) -> float | None:
+    if observed is None:
+        return None
+    return _clamp_usage(observed, expected)
+
+
+def usage_factor(
+    target_share: float | None,
+    position: str = "WR",
+    depth_rank: int | None = None,
+    snap_share: float | None = None,
+) -> float:
+    """Usage tilt vs depth-conditional expected share, clamped ±20%.
+
+    WR/TE: target_share only (snap_share ignored — would double-count).
+    RB: snaps primary (70%) + targets receiving tilt (30%). One missing
+    signal uses the other at full weight. Neither → 1.0.
+    """
+    pos = (position or "").upper()
+    tgt = _share_factor(target_share, expected_target_share(pos, depth_rank))
+    snap = _share_factor(snap_share, expected_snap_share(pos, depth_rank))
+    if pos in {"WR", "TE"}:
+        return 1.0 if tgt is None else tgt
+    if pos != "RB":
+        return 1.0
+    if snap is None and tgt is None:
+        return 1.0
+    if snap is None:
+        return tgt if tgt is not None else 1.0
+    if tgt is None:
+        return snap
+    blended = RB_SNAP_WEIGHT * snap + RB_TARGET_WEIGHT * tgt
+    return max(USAGE_FACTOR_LO, min(USAGE_FACTOR_HI, blended))
 
 
 def implied_core(
@@ -90,6 +147,7 @@ def implied_core(
     depth_rank: int | None = None,
     position: str = "WR",
     target_share: float | None = None,
+    snap_share: float | None = None,
 ) -> float:
     """Implied × depth × share × usage. No prop tilt. Not DST."""
     share = POS_FD_SHARE.get((position or "WR").upper(), 0.18)
@@ -97,7 +155,9 @@ def implied_core(
         float(implied_total)
         * depth_prior(depth_rank)
         * share
-        * usage_factor(target_share, position, depth_rank)
+        * usage_factor(
+            target_share, position, depth_rank, snap_share=snap_share
+        )
     )
 
 
@@ -108,11 +168,13 @@ def week1_score(
     prop_fd: float | None = None,
     implied_opp: float | None = None,
     target_share: float | None = None,
+    snap_share: float | None = None,
 ) -> float:
     """Implied core × optional prop tilt. One currency.
 
     DEF uses opponent implied total as expected points allowed.
-    WR/TE `target_share` is a usage tilt on the role prior, not a new objective.
+    WR/TE `target_share` and RB `snap_share`/`target_share` are usage
+    tilts on the role prior, not a new objective.
     """
     pos = (position or "WR").upper()
     if pos in {"D", "DEF"}:
@@ -122,6 +184,7 @@ def week1_score(
         depth_rank=depth_rank,
         position=position,
         target_share=target_share,
+        snap_share=snap_share,
     )
     return base * prop_factor(base, prop_fd)
 
@@ -135,6 +198,7 @@ def score_player(pl: Player, depth_rank: int | None = None) -> float:
         prop_fd=pl.prop_fd,
         implied_opp=pl.implied_opp,
         target_share=pl.target_share,
+        snap_share=pl.snap_share,
     )
 
 
@@ -171,6 +235,7 @@ def attach_team_lines(
                     prop_fd=patched.prop_fd,
                     implied_opp=opp_implied,
                     target_share=patched.target_share,
+                    snap_share=patched.snap_share,
                 ),
             )
         )

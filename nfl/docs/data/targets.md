@@ -1,30 +1,33 @@
-# Lineups WR/TE targets (usage tilt)
+# Lineups RB/WR/TE targets (usage tilt)
 
-Refresh (public Lineups pages, cached):
+Grant: [`lineups-authorization.md`](lineups-authorization.md). Public Lineups
+SSR pages, cached. Do not scrape FanDuel.
+
+Wednesday-style weekly refresh (after the prior week’s games land):
 
 ```
 python3 -m nfl.targets --refresh
+python3 -m nfl.snaps --refresh
 ```
 
 writes [`nfl/data/targets.csv`](../../data/targets.csv)
 (`player, team, position, week, targets, target_share, …, source=lineups`).
-Cache: `nfl/data/lineups-targets/`. ToS risk and Cloudflare 403 notes live
-in `nfl/targets.py`. Do not scrape FanDuel.
+Cache: `nfl/data/lineups-targets/`. Pages: WR, TE, and
+https://www.lineups.com/nfl/targets/running-back/ (same SSR metrics family).
 
 ## Optimizer join
 
 `python3 -m nfl.optimize` loads the **latest week** in that CSV (or
-`--targets-week=N`) and joins WR/TE pool players — including TE-eligible
-FanDuel `TE` / `WR` — via `nfl.names.match_key` (Jr/Sr/II stripped).
-No invented aliases. `--targets-csv PATH` overrides the default file.
-`--skip-targets` leaves the usage factor at **1.0** (current implied×depth
-path).
+`--targets-week=N`) and joins RB/WR/TE pool players via `nfl.names.match_key`
+(Jr/Sr/II stripped). No invented aliases. `--targets-csv PATH` overrides
+the default file. `--skip-targets` leaves `target_share` empty (RB usage
+then uses snaps or 1.0).
 
 Name mismatches are **not fatal**. Stderr + JSON `targets` report:
 
-- `joined` — slate WR/TE that hit a Lineups row
+- `joined` — slate RB/WR/TE that hit a Lineups row
 - `unmatched_lineups` — that week's Lineups names on a **slate team** with no pool player (off-slate teams omitted)
-- `unmatched_slate_wr_te` — slate WR/TE with no Lineups row
+- `unmatched_slate_rb_wr_te` — slate RB/WR/TE with no Lineups row
 
 Missing/unreadable CSV prints `choke TARGETS_CSV:` and **degrades** (same
 path as `--skip-targets`). Team-map failures on refresh stay
@@ -37,12 +40,17 @@ role. Lineups `target_share` is a **±20% usage tilt** vs a depth-conditional
 expected share — the same clamp style as volume props. It does **not**
 replace implied totals or `POS_FD_SHARE`.
 
+WR/TE use targets only. RB blends snaps (70%, rush role) with targets
+(30%, receiving). Combined formula: [`snaps.md`](snaps.md).
+
 ```
 expected WR: rank1=0.24  rank2=0.16  rank3=0.10  unlisted=0.08
 expected TE: rank1=0.18  rank2=0.10  rank3=0.06  unlisted=0.06
+expected RB: rank1=0.12  rank2=0.07  rank3=0.04  unlisted=0.04
 
-usage_factor = 1.0                         if no join / not WR|TE
-             = clamp(target_share / expected, 0.80, 1.20)
+usage_factor = 1.0                         if no join
+             = clamp(target_share / expected, 0.80, 1.20)   WR/TE
+             = RB blend (see snaps.md)                      RB
 
 week1_score  = implied_team_total
              × depth_prior(rank)
@@ -52,8 +60,7 @@ week1_score  = implied_team_total
 ```
 
 `targets` (raw count) is attached for the picker/JSON but is not a second
-objective. QB / RB / DST are unchanged. `--skip-targets` or an unmatched
-name keeps `usage_factor = 1.0`.
+objective. `--skip-targets` or an unmatched name keeps `target_share` empty.
 
 ## Commands
 
