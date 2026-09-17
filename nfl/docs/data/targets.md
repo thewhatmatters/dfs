@@ -62,6 +62,16 @@ week1_score  = implied_team_total
 `targets` (raw count) is attached for the picker/JSON but is not a second
 objective. `--skip-targets` or an unmatched name keeps `target_share` empty.
 
+## Week-1 BAL WRs — Devontez Walker is not on Lineups
+
+Lineups week-1 Baltimore WRs in [`targets.csv`](../../data/targets.csv):
+Zay Flowers, Rashod Bateman, Ja'Kobi Lane, LaJohntay Wester, **Chris Moore**.
+FanDuel lists **Devontez Walker** (BAL WR, Q groin). He is **absent** from
+the Lineups feed — do **not** invent an alias (`Jahdae Walker` is CHI).
+He stays `targets_status=unmatched` / usage 1.0 (“Lineups name unmatched”).
+`--diversity=coverage` downweights unmatched OurLads-only fillers so they
+are not cheap unique swaps; it does not invent a join.
+
 ## Commands
 
 ```

@@ -11,12 +11,14 @@ from __future__ import annotations
 
 import sys
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from nfl.explain import explain_player, lineup_notes
 from nfl.players import Player
 from nfl.rules import (
     BRING_BACK_POS,
+    DIVERSITY_CHALK,
+    DIVERSITY_COVERAGE,
     FANDUEL_NFL,
     FANDUEL_PICKER_ORDER,
     FanDuelNflClassic,
@@ -27,11 +29,31 @@ from nfl.rules import (
     bring_back_illegal,
     bring_back_players,
     max_per_team_illegal,
+    max_player_appearances,
     opp_dst_illegal,
     pass_catchers_by_team,
     pass_stack_players,
     stack_qb_illegal,
 )
+
+# Soft coverage (n>1, diversity=coverage): after lineup #1, subtract
+# COUNT_PENALTY * prior_count from the objective per selected player.
+# Unmatched Lineups RB/WR/TE get an extra hit so OurLads-only names are
+# not cheap unique swaps. Mean remains the only objective for lineup #1.
+COVERAGE_COUNT_PENALTY = 0.75
+UNMATCHED_FILLER_PENALTY = 3.0
+
+
+def is_unmatched_filler(player: Player) -> bool:
+    """True for RB/WR/TE with no Lineups name join (usage stays 1.0)."""
+    pos = player.position
+    if pos in {"WR", "TE"}:
+        return player.targets_status == "unmatched"
+    if pos == "RB":
+        tgt = player.targets_status == "unmatched"
+        snap = player.snaps_status in {None, "unmatched"}
+        return tgt and snap
+    return False
 
 
 @dataclass
@@ -136,6 +158,34 @@ class Infeasible(Exception):
 
 def lineup_pids(lineup: Lineup) -> frozenset[str]:
     return frozenset(p.pid for p in lineup.slots.values())
+
+
+def player_exposure_counts(lineups: list[Lineup]) -> dict[str, int]:
+    counts: dict[str, int] = defaultdict(int)
+    for lu in lineups:
+        for p in lu.slots.values():
+            counts[p.pid] += 1
+    return dict(counts)
+
+
+def _coverage_penalty(player: Player, prior_count: int) -> float:
+    pen = COVERAGE_COUNT_PENALTY * prior_count
+    if is_unmatched_filler(player):
+        pen += UNMATCHED_FILLER_PENALTY
+    return pen
+
+
+def _coverage_adjusted_pool(
+    pool: list[Player], counts: dict[str, int]
+) -> list[Player]:
+    out: list[Player] = []
+    for p in pool:
+        pen = _coverage_penalty(p, counts.get(p.pid, 0))
+        if pen:
+            out.append(replace(p, objective=p.projection - pen))
+        else:
+            out.append(p)
+    return out
 
 
 def _slot_families(rules: FanDuelNflClassic) -> list[tuple[str, str, frozenset[str]]]:
@@ -419,22 +469,31 @@ def solve_ilp_many(
     *,
     n_lineups: int = 1,
     min_unique: int = MIN_UNIQUE_DEFAULT,
+    max_exposure: float = 1.0,
+    diversity: str = DIVERSITY_CHALK,
 ) -> list[Lineup]:
     """Sequential CBC. Reuses one model.
 
-    Unique player-sets vs **each** locked 9 (overlap ≤ 8). `--min-unique` is
-    vs the **immediately previous** 9 only (overlap ≤ 9 − min_unique) — not
-    stacked vs every earlier 9. n=1 is exact CBC. n>1 uses a time/gap limit.
-    Duplicate incumbents get a unique cut and retry. If a later CBC is
-    infeasible, return the lineups we already have — do not raise.
+    Unique player-sets vs **each** locked 9. `--min-unique` is stacked vs
+    **every** locked 9 (overlap ≤ 9 − min_unique), not only the previous
+    one — cores cannot cycle forever by swapping the same two cheap seats.
+    `--max-exposure` is a running count cap (all positions, including DST);
+    1.0 disables. `diversity=coverage` keeps lineup #1 on the mean
+    objective, then soft-penalizes high-exposure / unmatched-Lineups
+    fillers. n=1 is exact CBC. n>1 uses a time/gap limit. Duplicate
+    incumbents get a unique cut and retry. If a later CBC is infeasible,
+    return the lineups we already have — do not raise.
     """
     if n_lineups < 1:
         raise ValueError("n_lineups must be >= 1")
     roster_n = len(_slot_families(rules))
     if min_unique < 1 or min_unique > roster_n:
         raise ValueError(f"min_unique must be 1..{roster_n}")
+    max_count = max_player_appearances(max_exposure, n_lineups)
+    use_coverage = diversity == DIVERSITY_COVERAGE and n_lineups > 1
 
     pulp, prob, x, slots, selected = _build_ilp(pool, rules)
+    base_obj = prob.objective
     # n=1 stays exact. n>1: ceiling has many near-ties; do not prove 0.5%.
     if n_lineups == 1:
         solver = pulp.PULP_CBC_CMD(msg=False)
@@ -445,6 +504,7 @@ def solve_ilp_many(
     pid_index = {p.pid: i for i, p in enumerate(pool)}
     cut_sets: set[frozenset[str]] = set()
     dup_cuts = 0
+    counts: dict[str, int] = defaultdict(int)
 
     def _idxs(pids: frozenset[str]) -> list[int]:
         return [pid_index[pid] for pid in pids if pid in pid_index]
@@ -458,7 +518,23 @@ def solve_ilp_many(
         cut_sets.add(pids)
         return True
 
+    def _set_coverage_obj(*, apply: bool) -> None:
+        if not apply:
+            prob.setObjective(base_obj)
+            return
+        extra = []
+        for i, p in enumerate(pool):
+            pen = _coverage_penalty(p, counts.get(p.pid, 0))
+            if pen:
+                extra.append(pen * selected(i))
+        if extra:
+            prob.setObjective(base_obj - pulp.lpSum(extra))
+        else:
+            prob.setObjective(base_obj)
+
     for k in range(n_lineups):
+        if use_coverage:
+            _set_coverage_obj(apply=k > 0)
         while True:
             for var in x.values():
                 var.varValue = None
@@ -481,6 +557,14 @@ def solve_ilp_many(
                 return lineups
         lineups.append(lu)
         used.add(pids)
+        for p in lu.slots.values():
+            counts[p.pid] += 1
+            if max_count is not None and counts[p.pid] >= max_count:
+                i = pid_index.get(p.pid)
+                if i is not None:
+                    name = f"exposure_{i}_{k}"
+                    if name not in prob.constraints:
+                        prob += selected(i) == 0, name
         if n_lineups >= 10 and ((k + 1) % 10 == 0 or k + 1 == n_lineups):
             print(f"  solved {k + 1}/{n_lineups}", file=sys.stderr)
         if k + 1 >= n_lineups:
@@ -488,14 +572,15 @@ def solve_ilp_many(
         idxs = _idxs(pids)
         if not idxs:
             break
-        # Unique vs this locked 9: at least 1 different (overlap ≤ 8).
-        _add_unique_cut(pids, f"unique_{k}")
-        # min_unique vs immediately previous 9 only — replace, do not stack.
+        # min_unique vs **this** locked 9 — keep every cut (do not replace).
         if min_unique > 1:
-            if "min_unique_prev" in prob.constraints:
-                del prob.constraints["min_unique_prev"]
             cap = roster_n - min_unique
-            prob += pulp.lpSum(selected(i) for i in idxs) <= cap, "min_unique_prev"
+            prob += (
+                pulp.lpSum(selected(i) for i in idxs) <= cap,
+                f"min_unique_{k}",
+            )
+        else:
+            _add_unique_cut(pids, f"unique_{k}")
     return lineups
 
 
@@ -671,16 +756,27 @@ def solve_greedy_many(
     *,
     n_lineups: int = 1,
     min_unique: int = MIN_UNIQUE_DEFAULT,
+    max_exposure: float = 1.0,
+    diversity: str = DIVERSITY_CHALK,
 ) -> list[Lineup]:
     """Greedy 9s. Next lineup cannot use `min_unique` lowest-proj players
-    from the previous 9. Stops on infeasible / duplicate set."""
+    from the previous 9. Exposure cap blocks players at the running
+    max. Coverage downweights high-count / unmatched fillers after #1.
+    Stops on infeasible / duplicate set."""
     if n_lineups < 1:
         raise ValueError("n_lineups must be >= 1")
+    max_count = max_player_appearances(max_exposure, n_lineups)
+    use_coverage = diversity == DIVERSITY_COVERAGE and n_lineups > 1
     lineups: list[Lineup] = []
     used: set[frozenset[str]] = set()
     blocked: set[str] = set()
-    for _ in range(n_lineups):
-        trial = [p for p in pool if p.pid not in blocked] if blocked else pool
+    blocked_exposure: set[str] = set()
+    counts: dict[str, int] = defaultdict(int)
+    for k in range(n_lineups):
+        skip = blocked | blocked_exposure
+        trial = [p for p in pool if p.pid not in skip] if skip else list(pool)
+        if use_coverage and k > 0:
+            trial = _coverage_adjusted_pool(trial, counts)
         try:
             lu = solve_greedy(trial, rules)
         except Infeasible:
@@ -696,6 +792,10 @@ def solve_greedy_many(
                 break
         lineups.append(lu)
         used.add(pids)
+        for p in lu.slots.values():
+            counts[p.pid] += 1
+            if max_count is not None and counts[p.pid] >= max_count:
+                blocked_exposure.add(p.pid)
         cheapest = sorted(lu.slots.values(), key=lambda p: (p.projection, -p.salary))
         blocked = {p.pid for p in cheapest[:min_unique]}
     return lineups
@@ -708,11 +808,18 @@ def solve_many(
     prefer_ilp: bool = True,
     n_lineups: int = 1,
     min_unique: int = MIN_UNIQUE_DEFAULT,
+    max_exposure: float = 1.0,
+    diversity: str = DIVERSITY_CHALK,
 ) -> list[Lineup]:
     if prefer_ilp:
         try:
             return solve_ilp_many(
-                pool, rules, n_lineups=n_lineups, min_unique=min_unique
+                pool,
+                rules,
+                n_lineups=n_lineups,
+                min_unique=min_unique,
+                max_exposure=max_exposure,
+                diversity=diversity,
             )
         except RuntimeError as e:
             if "pulp_missing" not in str(e):
@@ -720,7 +827,12 @@ def solve_many(
         except Infeasible:
             raise
     return solve_greedy_many(
-        pool, rules, n_lineups=n_lineups, min_unique=min_unique
+        pool,
+        rules,
+        n_lineups=n_lineups,
+        min_unique=min_unique,
+        max_exposure=max_exposure,
+        diversity=diversity,
     )
 
 

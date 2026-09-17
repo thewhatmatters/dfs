@@ -85,6 +85,15 @@ NFL path is flags-only.
   `python3 -m nfl.status` is the status-only entry. JSON `slate_status`
   is on every successful ingest so chat can answer “what’s the slate
   status?” from `--out`.
+- 2026-09-17: **Multi-lineup coverage, not chalk lock-in.** `--n-lineups=150
+  --min-unique=2` only differed from the *previous* 9, so a top RB (e.g.
+  Javonte) could appear in 100%. n>1 now defaults `--max-exposure=0.60`
+  (running count in `solve_ilp_many`; `--max-exposure=1` disables),
+  `--min-unique=3` stacked vs **every** locked 9, and
+  `--diversity=coverage` (lineup #1 stays mean; later 9s soft-penalize
+  high-exposure + unmatched-Lineups fillers). Devontez Walker is **not**
+  on Lineups week-1 BAL WRs (Flowers, Bateman, Lane, Wester, Chris Moore)
+  — do not invent an alias; he stays unmatched / usage 1.0.
 
 ## 4. Known limitations / environment caveats
 

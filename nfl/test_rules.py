@@ -14,9 +14,12 @@ from nfl.rules import (
     FANDUEL_PICKER_ORDER,
     FanDuelNflClassic,
     HOUSE_CASH_LINE,
+    MAX_EXPOSURE_DEFAULT,
     MAX_LINEUPS,
     MIN_UNIQUE_DEFAULT,
+    MIN_UNIQUE_MULTI_DEFAULT,
     STACK_COEF,
+    max_player_appearances,
     SkillSide,
     bring_back_illegal,
     bring_back_players,
@@ -41,6 +44,12 @@ class CapFloorTest(unittest.TestCase):
         self.assertEqual(HOUSE_CASH_LINE, 150.0)
         self.assertEqual(MAX_LINEUPS, 150)
         self.assertEqual(MIN_UNIQUE_DEFAULT, 2)
+        self.assertEqual(MIN_UNIQUE_MULTI_DEFAULT, 3)
+        self.assertAlmostEqual(MAX_EXPOSURE_DEFAULT, 0.60)
+        self.assertEqual(max_player_appearances(0.60, 20), 12)
+        self.assertEqual(max_player_appearances(0.60, 150), 90)
+        self.assertIsNone(max_player_appearances(1.0, 20))
+        self.assertIsNone(max_player_appearances(0.60, 1))
         self.assertLessEqual(MAX_LINEUPS, 250)
         self.assertEqual(FANDUEL_NFL.bring_back, 0)
         self.assertTrue(FANDUEL_NFL.require_qb_with_two_pass_catchers)

@@ -10,6 +10,8 @@ Do not import `ncaaf`. CFB has no DST/K slots and no yardage bonuses.
 
 `--bring-back=N` (default **0**) is a house stack construction flag, off unless passed. Mean cash and existing 150 ceiling uploads stay unchanged at N=0.
 
+`--n-lineups>1` is **coverage**, not chalk lock-in. Default `--max-exposure=0.60` caps any one player (including DST) as a running count while the set is built; `--max-exposure=1` disables. `--min-unique` defaults to **3** and is stacked vs every locked 9 (a 7-man core cannot persist by swapping the same two cheap seats). `--diversity=coverage` (default when n>1): lineup #1 is the mean-optimal 9; later solves soft-penalize high-exposure players and unmatched-Lineups fillers (OurLads-only names with usage 1.0). `--diversity=chalk` is the old “keep maximizing mean” path. Salary, stack-qb, and house DST rules stay intact.
+
 ## Command
 
 ```bash

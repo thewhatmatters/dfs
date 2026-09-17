@@ -8,6 +8,7 @@ import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 
+from nfl.names import match_key
 from nfl.players import Player
 from nfl.projections import week1_score
 from nfl.targets import (
@@ -220,6 +221,33 @@ class TestTargetsJoin(unittest.TestCase):
         with self.assertRaises(TargetsError) as ctx:
             load_targets_csv(Path("/tmp/dfs-missing-targets.csv"))
         self.assertEqual(ctx.exception.choke, "TARGETS_CSV")
+
+
+class TestWalkerAbsentFromLineups(unittest.TestCase):
+    """Devontez Walker is not in the Lineups week-1 BAL WR feed.
+
+    FanDuel lists him (BAL WR, Q groin). Lineups week 1 BAL WRs are
+    Flowers, Bateman, Lane, Wester, Chris Moore. Jahdae Walker is CHI —
+    do not invent an alias. He stays unmatched / usage 1.0.
+    """
+
+    def test_week1_bal_wrs_omit_devontez_walker(self) -> None:
+        path = Path(__file__).resolve().parent / "data" / "targets.csv"
+        self.assertTrue(path.is_file(), path)
+        rows = [r for r in load_targets_csv(path) if r.week == 1 and r.team == "BAL"]
+        wr_keys = {match_key(r.player) for r in rows if r.position == "WR"}
+        self.assertEqual(
+            wr_keys,
+            {
+                match_key("Zay Flowers"),
+                match_key("Rashod Bateman"),
+                match_key("Ja'Kobi Lane"),
+                match_key("LaJohntay Wester"),
+                match_key("Chris Moore"),
+            },
+        )
+        self.assertNotIn(match_key("Devontez Walker"), wr_keys)
+        self.assertNotIn(match_key("Devontez Walker"), {match_key(r.player) for r in rows})
 
 
 if __name__ == "__main__":

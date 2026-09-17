@@ -34,6 +34,8 @@ Do not scrape FanDuel. Do not import `ncaaf`. Do not pass `-m`.
 Solve immediately with `python3 -m nfl.optimize --csv … --sim --out results/nfl-lineup.json` (mean ILP, print p10/p90). **Do not** pass `--agent` on a TTY (stdout would be a JSON blob). Newest `FanDuel-NFL-*-players-list.csv` in `nfl/data/`.
 GPP / ceiling → `--objective=ceiling`. Cash / floor → `--objective=floor`.
 `--n-lineups=N` **only** if the user named a count (do not run 150).
+n>1 defaults `--max-exposure=0.60`, `--min-unique=3`, `--diversity=coverage`
+(lineup #1 stays mean). Do not pass `--diversity=chalk` unless asked.
 `--bring-back=N` **only** if the user asked; default 0. House max 3/team
 (FanDuel 4; `--max-per-team=4` restores lobby). `--stack-qb` on unless the
 user asked `--stack-qb=off`. n>1 writes
@@ -71,7 +73,10 @@ Repo-root `scripts/optimize.py` is the **NCAAF** shim — do not use it here.
 | `--sim-seed=1` | RNG seed for `--sim` |
 | `--objective=mean\|floor\|ceiling` | ILP score. **Default `mean`** = week1_score. `floor` = sim p10. `ceiling` = sim p90 |
 | `--n-lineups=N` | unique 9s (default 1; max 150). Only if the user named a count |
-| `--min-unique=N` | min different players vs the previous 9 (default 2) |
+| `--min-unique=N` | min different players vs **every** locked 9 (default 2 when n=1; **3 when n>1**). `--min-unique=2` restores the old default |
+| `--max-exposure=F` | max fraction of the set any one player may appear in (default **0.60 when n>1**; 1.0 when n=1). `--max-exposure=1` disables. Running count in the ILP — stops 100% chalk RBs |
+| `--diversity=chalk\|coverage` | n>1 default **coverage**: lineup #1 is mean-optimal; later 9s soft-penalize high-exposure and unmatched-Lineups fillers. `chalk` keeps maximizing mean every 9 (old behavior) |
+| `--coverage` | alias for `--diversity=coverage` |
 | `--bring-back=N` | require N opposing WR/TE/QB vs a QB pass stack (default **0** = off) |
 | `--max-per-team=N` | max from one team (house default **3**; FanDuel lobby 4). `--max-per-team=4` restores lobby. Validate 1..4 |
 | `--stack-qb=on\|off` | 2+ WR/TE from a team requires that team's QB (default **on**) |
