@@ -29,7 +29,16 @@ from nfl.rules import (
     stack_qb_illegal,
 )
 from nfl.sim import SimStats
-from nfl.solver import Infeasible, Lineup, lineup_pids, solve_greedy, solve_ilp, solve_ilp_many
+from nfl.solver import (
+    Infeasible,
+    Lineup,
+    is_unmatched_filler,
+    lineup_pids,
+    player_exposure_counts,
+    solve_greedy,
+    solve_ilp,
+    solve_ilp_many,
+)
 from nfl.teams import lookup_odds, require_mapped
 
 
@@ -488,6 +497,109 @@ def _wide_pool() -> list[Player]:
     return rows
 
 
+def _chalk_rb_pool() -> list[Player]:
+    """Wide pool with one dominant RB so uncapped n=20 locks him 100%."""
+    rows: list[Player] = []
+    for p in _wide_pool():
+        if p.pid == "RB0":
+            rows.append(
+                replace(
+                    p,
+                    pid="RB-STAR",
+                    name="RB-STAR",
+                    salary=4500,
+                    objective=40.0,
+                )
+            )
+        else:
+            rows.append(p)
+    extras = [
+        ("KC", "HOU", "HOU@KC"),
+        ("HOU", "KC", "HOU@KC"),
+        ("DAL", "NYG", "NYG@DAL"),
+        ("NYG", "DAL", "NYG@DAL"),
+        ("SF", "SEA", "SEA@SF"),
+        ("SEA", "SF", "SEA@SF"),
+        ("BAL", "CLE", "CLE@BAL"),
+        ("CLE", "BAL", "CLE@BAL"),
+    ]
+    for i, (team, opp, game) in enumerate(extras):
+        rows.append(
+            _pl(
+                pid=f"QB-X{i}",
+                name=f"QB-X{i}",
+                position="QB",
+                team=team,
+                opponent=opp,
+                game=game,
+                salary=6000,
+                objective=18.0 - i * 0.2,
+            )
+        )
+        rows.append(
+            _pl(
+                pid=f"RB-X{i}",
+                name=f"RB-X{i}",
+                position="RB",
+                team=team,
+                opponent=opp,
+                game=game,
+                salary=5000,
+                objective=10.0 - i * 0.2,
+            )
+        )
+        rows.append(
+            _pl(
+                pid=f"WR-X{i}a",
+                name=f"WR-X{i}a",
+                position="WR",
+                team=team,
+                opponent=opp,
+                game=game,
+                salary=5000,
+                objective=9.0 - i * 0.15,
+            )
+        )
+        rows.append(
+            _pl(
+                pid=f"WR-X{i}b",
+                name=f"WR-X{i}b",
+                position="WR",
+                team=team,
+                opponent=opp,
+                game=game,
+                salary=5000,
+                objective=8.5 - i * 0.15,
+            )
+        )
+        rows.append(
+            _pl(
+                pid=f"TE-X{i}",
+                name=f"TE-X{i}",
+                position="TE",
+                team=team,
+                opponent=opp,
+                game=game,
+                salary=4500,
+                objective=7.0 - i * 0.1,
+            )
+        )
+        if i % 2 == 0:
+            rows.append(
+                _pl(
+                    pid=f"DST-X{i}",
+                    name=f"DST-X{i}",
+                    position="D",
+                    team=team,
+                    opponent=opp,
+                    game=game,
+                    salary=3000,
+                    objective=4.0 - i * 0.1,
+                )
+            )
+    return rows
+
+
 class LineupTotalsTest(unittest.TestCase):
     def test_proj_is_week1_not_ilp_obj(self):
         players = []
@@ -534,9 +646,10 @@ class NLineupsTest(unittest.TestCase):
         self.assertGreaterEqual(len(many), 3)
         sets = [lineup_pids(lu) for lu in many]
         self.assertEqual(len(sets), len(set(sets)))
-        for prev, cur in zip(sets, sets[1:]):
-            self.assertGreaterEqual(len(cur - prev), 2)
-            self.assertLessEqual(len(cur & prev), 7)
+        for i, a in enumerate(sets):
+            for b in sets[i + 1 :]:
+                self.assertGreaterEqual(len(a - b), 2)
+                self.assertLessEqual(len(a & b), 7)
         for lu in many:
             self.assertEqual(len(lu.slots), 9)
             self.assertLessEqual(lu.salary, rules.salary_cap)
@@ -555,6 +668,69 @@ class NLineupsTest(unittest.TestCase):
                     ],
                 )
             )
+
+    def test_max_exposure_prevents_100pct_rb(self):
+        rules = replace(FANDUEL_NFL, salary_floor=0)
+        pool = _chalk_rb_pool()
+        star = "RB-STAR"
+        uncapped = solve_ilp_many(
+            pool,
+            rules,
+            n_lineups=20,
+            min_unique=2,
+            max_exposure=1.0,
+            diversity="chalk",
+        )
+        self.assertEqual(len(uncapped), 20)
+        self.assertEqual(player_exposure_counts(uncapped).get(star, 0), 20)
+        capped = solve_ilp_many(
+            pool,
+            rules,
+            n_lineups=20,
+            min_unique=2,
+            max_exposure=0.6,
+            diversity="chalk",
+        )
+        self.assertEqual(len(capped), 20)
+        capped_n = player_exposure_counts(capped).get(star, 0)
+        self.assertLessEqual(capped_n, 12)
+        self.assertGreater(capped_n, 0)
+        for lu in capped:
+            self.assertEqual(len(lu.slots), 9)
+            self.assertLessEqual(lu.salary, rules.salary_cap)
+
+    def test_coverage_first_lineup_is_mean(self):
+        rules = replace(FANDUEL_NFL, salary_floor=0)
+        pool = _wide_pool()
+        one = solve_ilp(pool, rules)
+        many = solve_ilp_many(
+            pool,
+            rules,
+            n_lineups=5,
+            min_unique=2,
+            diversity="coverage",
+        )
+        self.assertEqual(lineup_pids(many[0]), lineup_pids(one))
+        self.assertGreaterEqual(len(many), 3)
+
+    def test_unmatched_filler_is_lineups_gap_only(self):
+        walker = _pl(
+            name="Devontez Walker",
+            position="WR",
+            team="BAL",
+            targets_status="unmatched",
+        )
+        flowers = _pl(
+            name="Zay Flowers",
+            position="WR",
+            team="BAL",
+            targets_status="joined",
+            target_share=0.24,
+        )
+        qb = _pl(name="Lamar Jackson", position="QB", team="BAL")
+        self.assertTrue(is_unmatched_filler(walker))
+        self.assertFalse(is_unmatched_filler(flowers))
+        self.assertFalse(is_unmatched_filler(qb))
 
     def test_infeasible_later_returns_what_we_got(self):
         rules = replace(FANDUEL_NFL, salary_floor=0)

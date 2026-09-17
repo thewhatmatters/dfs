@@ -17,7 +17,7 @@ python3 -m ncaaf.optimize --csv "ncaaf/data/<FanDuel-export>.csv"
 python3 -m nfl.optimize --csv "nfl/data/<players-list>.csv"
 ```
 
-JSON on stdout; human lineup + per-game spread/total/implied totals on stderr. `--out PATH` writes the JSON. `--agent` skips prompts. NCAAF `--use-fppg` is prior-season FPPG, not this slate. NFL uploads: `nfl/export/` when `--n-lineups>1`.
+JSON on stdout; human lineup + per-game spread/total/implied totals on stderr. `--out PATH` writes the JSON. `--agent` skips prompts. NCAAF `--use-fppg` is prior-season FPPG, not this slate. NFL uploads: `nfl/export/` when `--n-lineups>1` (coverage defaults: `--max-exposure=0.60`, `--diversity=coverage`; `--max-exposure=1 --diversity=chalk` is chalk lock-in).
 
 Implementation work is meant to run on **Grok CLI**. From Cursor, the in-session model should dispatch via `bash scripts/dispatch-grok.sh results/grok-prompt.md` rather than editing the tree itself. Or just `grok` in this directory.
 

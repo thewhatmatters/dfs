@@ -9,6 +9,7 @@
 - Slate coverage via `--slate-status` / `python3 -m nfl.status` (JSON `slate_status`)
 - An exact ILP when PuLP is installed; an approximate greedy fill otherwise (labeled)
 - FanDuel upload CSV in `nfl/export/` when `--n-lineups>1`
+- Multi-lineup **coverage** (default when n>1): `--max-exposure=0.60` so no player is in every 9; `--diversity=coverage` keeps lineup #1 on mean and tilts later 9s toward underused players. `--diversity=chalk --max-exposure=1 --min-unique=2` is the old “swap two seats” path
 
 ## How to run
 
@@ -34,6 +35,7 @@ injuries, and Odds props; do not `--refresh-props` unless asked.
 2. Drop IR/NA. Join Odds lines, OurLads depth, Lineups targets + snaps, ESPN injuries, player props (cached).
 3. Maximize week1_score + house QB+WR/TE stack premium under roster/cap/team/house DST / stack-qb rules. Printed Proj stays week1_score.
 4. `--bring-back=N` (default 0) optionally requires opposing WR/TE vs a QB pass stack. `--stack-qb` on. `--max-per-team=4` restores lobby.
+5. `--n-lineups>1` defaults to coverage, not chalk lock-in: exposure cap 0.60, min-unique 3 vs every locked 9, coverage penalty after the first mean 9. Salary / stack-qb / house DST rules stay intact.
 
 ## Where to look next
 

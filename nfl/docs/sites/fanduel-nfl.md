@@ -199,7 +199,7 @@ Do not invent a 150 ceiling.
 
 ## What this project optimizes
 
-**Max objective** (week1_score + house stack premium) subject to the roster, cap, team limits (house max **3**/team; FanDuel 4), house spend floor, `forbid_qb_opp_dst`, `forbid_stud_rb_opp_dst` (`stud_rb_min_salary`), `require_qb_with_two_pass_catchers` (default on), and `--bring-back` (default 0). `--n-lineups=1..150` unique 9s (default 1; `--min-unique=2` vs the previous 9). Upload CSV: picker order, `Id:Nickname` cells. `--n-lineups>1` always writes `nfl/export/nfl-{contest}-{objective}-{YYYYMMDD}-{HHMMSS}.csv` (local time); `--upload PATH` writes that path as well.
+**Max objective** (week1_score + house stack premium) subject to the roster, cap, team limits (house max **3**/team; FanDuel 4), house spend floor, `forbid_qb_opp_dst`, `forbid_stud_rb_opp_dst` (`stud_rb_min_salary`), `require_qb_with_two_pass_catchers` (default on), and `--bring-back` (default 0). `--n-lineups=1..150` unique 9s (default 1). When n>1: `--max-exposure=0.60` (any one player; `--max-exposure=1` disables), `--min-unique=3` vs **every** locked 9 (not only the previous), `--diversity=coverage` (lineup #1 is mean-optimal; later 9s soft-penalize high-exposure / unmatched-Lineups fillers). `--diversity=chalk` keeps maximizing mean every 9. Upload CSV: picker order, `Id:Nickname` cells. `--n-lineups>1` always writes `nfl/export/nfl-{contest}-{objective}-{YYYYMMDD}-{HHMMSS}.csv` (local time); `--upload PATH` writes that path as well.
 
 ## Sources
 

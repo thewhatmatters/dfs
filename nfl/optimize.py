@@ -60,11 +60,15 @@ from nfl.props import (  # noqa: E402
     ingest_slate_props,
 )
 from nfl.rules import (  # noqa: E402
+    DIVERSITY_CHOICES,
+    DIVERSITY_COVERAGE,
     FANDUEL_MAX_PER_TEAM,
     FANDUEL_NFL,
     HOUSE_CASH_LINE,
+    MAX_EXPOSURE_DEFAULT,
     MAX_LINEUPS,
     MIN_UNIQUE_DEFAULT,
+    MIN_UNIQUE_MULTI_DEFAULT,
 )
 from nfl.sim import (  # noqa: E402
     DEFAULT_DRAWS,
@@ -121,6 +125,29 @@ def _min_unique(value: str) -> int:
     if n < 1 or n > roster_n:
         raise argparse.ArgumentTypeError(f"must be 1..{roster_n}")
     return n
+
+
+def _max_exposure(value: str) -> float:
+    x = float(value)
+    if x <= 0 or x > 1:
+        raise argparse.ArgumentTypeError("must be in (0, 1]; 1 disables")
+    return x
+
+
+def _apply_multi_lineup_defaults(args: argparse.Namespace) -> argparse.Namespace:
+    """n>1 defaults: min-unique 3, max-exposure 0.60, diversity=coverage."""
+    n = args.n_lineups
+    if args.min_unique is None:
+        args.min_unique = MIN_UNIQUE_MULTI_DEFAULT if n > 1 else MIN_UNIQUE_DEFAULT
+    if args.max_exposure is None:
+        args.max_exposure = MAX_EXPOSURE_DEFAULT if n > 1 else 1.0
+    if args.diversity is None:
+        args.diversity = (
+            DIVERSITY_COVERAGE if (args.coverage or n > 1) else "chalk"
+        )
+    elif args.coverage:
+        args.diversity = DIVERSITY_COVERAGE
+    return args
 
 
 def _max_per_team(value: str) -> int:
@@ -295,9 +322,32 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument(
         "--min-unique",
         type=_min_unique,
-        default=MIN_UNIQUE_DEFAULT,
+        default=None,
         metavar="N",
-        help="min different players vs the previous 9 (default 2; overlap ≤ 7)",
+        help="min different players vs **every** locked 9 (default 2 when n=1; "
+        "3 when n>1). Overlap ≤ 9−N. --min-unique=2 restores the old default.",
+    )
+    ap.add_argument(
+        "--max-exposure",
+        type=_max_exposure,
+        default=None,
+        metavar="F",
+        help="max fraction of the set any one player may appear in "
+        f"(default {MAX_EXPOSURE_DEFAULT:.2f} when n>1; 1.0 when n=1). "
+        "--max-exposure=1 disables. Enforced as a running count in the ILP.",
+    )
+    ap.add_argument(
+        "--diversity",
+        choices=DIVERSITY_CHOICES,
+        default=None,
+        help="multi-lineup objective. chalk = keep maximizing mean for every 9. "
+        "coverage = lineup #1 is mean-optimal, later 9s soft-penalize "
+        "high-exposure and unmatched-Lineups fillers (default coverage when n>1).",
+    )
+    ap.add_argument(
+        "--coverage",
+        action="store_true",
+        help="alias for --diversity=coverage",
     )
     ap.add_argument(
         "--bring-back",
@@ -339,7 +389,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--slate-status=with-solve prints then solves. "
         "JSON always includes slate_status after a successful ingest.",
     )
-    return ap.parse_args(argv)
+    return _apply_multi_lineup_defaults(ap.parse_args(argv))
 
 
 def _sim_n(args) -> int:
@@ -600,6 +650,8 @@ def main(argv: list[str] | None = None) -> int:
             "cash_line": args.cash_line,
             "n_lineups": args.n_lineups,
             "min_unique": args.min_unique,
+            "max_exposure": args.max_exposure,
+            "diversity": args.diversity,
             "bring_back": args.bring_back,
             "max_per_team": args.max_per_team,
             "stack_qb": args.stack_qb,
@@ -609,6 +661,8 @@ def main(argv: list[str] | None = None) -> int:
         "cash_line": args.cash_line,
         "n_lineups_requested": args.n_lineups,
         "min_unique": args.min_unique,
+        "max_exposure": args.max_exposure,
+        "diversity": args.diversity,
     }
     if args.slate_status == "only":
         payload["status"] = "ok"
@@ -638,6 +692,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.n_lineups > 1:
         print(
             f"solving {args.n_lineups} unique 9s  min_unique {args.min_unique} "
+            f"max_exposure {args.max_exposure:g}  diversity {args.diversity} "
             f"(one scored pool)",
             file=sys.stderr,
         )
@@ -648,6 +703,8 @@ def main(argv: list[str] | None = None) -> int:
             prefer_ilp=not args.greedy,
             n_lineups=args.n_lineups,
             min_unique=args.min_unique,
+            max_exposure=args.max_exposure,
+            diversity=args.diversity,
         )
     except Infeasible as e:
         payload["status"] = "infeasible"

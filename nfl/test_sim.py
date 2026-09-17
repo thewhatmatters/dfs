@@ -119,6 +119,9 @@ class FlagsTest(unittest.TestCase):
         self.assertEqual(off.cash_line, 150.0)
         self.assertEqual(off.n_lineups, 1)
         self.assertEqual(off.min_unique, 2)
+        self.assertEqual(off.max_exposure, 1.0)
+        self.assertEqual(off.diversity, "chalk")
+        self.assertFalse(off.coverage)
         self.assertEqual(off.bring_back, 0)
         self.assertEqual(off.max_per_team, 3)
         self.assertEqual(off.stack_qb, "on")
@@ -161,6 +164,29 @@ class FlagsTest(unittest.TestCase):
         self.assertEqual(custom.n_lineups, 20)
         self.assertEqual(custom.min_unique, 3)
         self.assertEqual(custom.bring_back, 1)
+        multi = parse_args(["--csv", "x.csv", "--n-lineups", "20"])
+        self.assertEqual(multi.min_unique, 3)
+        self.assertAlmostEqual(multi.max_exposure, 0.60)
+        self.assertEqual(multi.diversity, "coverage")
+        restore = parse_args(
+            [
+                "--csv",
+                "x.csv",
+                "--n-lineups",
+                "20",
+                "--min-unique",
+                "2",
+                "--max-exposure",
+                "1",
+                "--diversity",
+                "chalk",
+            ]
+        )
+        self.assertEqual(restore.min_unique, 2)
+        self.assertEqual(restore.max_exposure, 1.0)
+        self.assertEqual(restore.diversity, "chalk")
+        alias = parse_args(["--csv", "x.csv", "--n-lineups", "5", "--coverage"])
+        self.assertEqual(alias.diversity, "coverage")
         self.assertEqual(custom.max_per_team, 4)
         self.assertEqual(custom.stack_qb, "off")
         self.assertEqual(custom.upload, "results/nfl-133104-upload.csv")
@@ -175,6 +201,12 @@ class FlagsTest(unittest.TestCase):
             parse_args(["--csv", "x.csv", "--min-unique", "0"])
         ok = parse_args(["--csv", "x.csv", "--n-lineups", "150"])
         self.assertEqual(ok.n_lineups, 150)
+        self.assertEqual(ok.min_unique, 3)
+        self.assertAlmostEqual(ok.max_exposure, 0.60)
+        with redirect_stderr(buf), self.assertRaises(SystemExit):
+            parse_args(["--csv", "x.csv", "--max-exposure", "0"])
+        with redirect_stderr(buf), self.assertRaises(SystemExit):
+            parse_args(["--csv", "x.csv", "--max-exposure", "1.1"])
         with redirect_stderr(buf), self.assertRaises(SystemExit):
             parse_args(["--csv", "x.csv", "--max-per-team", "0"])
         with redirect_stderr(buf), self.assertRaises(SystemExit):

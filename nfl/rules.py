@@ -6,6 +6,8 @@ code seam the optimizer and tests share — change the doc and this file togethe
 Optimizer: python3 -m nfl.optimize
 """
 
+from __future__ import annotations
+
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, FrozenSet, NamedTuple, Sequence
@@ -126,6 +128,28 @@ HOUSE_CASH_LINE = 150.0
 # FanDuel upload max is 250; we cap below that.
 MAX_LINEUPS = 150
 MIN_UNIQUE_DEFAULT = 2
+# n>1: differ by 3 vs every locked 9 (n=1 ignores uniqueness).
+MIN_UNIQUE_MULTI_DEFAULT = 3
+# n>1 default cap on any one player's share of the set. 1.0 disables.
+MAX_EXPOSURE_DEFAULT = 0.60
+DIVERSITY_CHALK = "chalk"
+DIVERSITY_COVERAGE = "coverage"
+DIVERSITY_CHOICES = (DIVERSITY_CHALK, DIVERSITY_COVERAGE)
+
+
+def max_player_appearances(max_exposure: float, n_lineups: int) -> int | None:
+    """Hard cap on how many of `n_lineups` a player may appear in.
+
+    ``max_exposure >= 1`` (or n=1) is uncapped. Otherwise
+    ``floor(max_exposure * n_lineups)``, at least 1.
+    """
+    if n_lineups < 1:
+        raise ValueError("n_lineups must be >= 1")
+    if max_exposure <= 0 or max_exposure > 1:
+        raise ValueError("max_exposure must be in (0, 1]")
+    if n_lineups == 1 or max_exposure >= 1.0:
+        return None
+    return max(1, int(max_exposure * n_lineups + 1e-9))
 
 # FanDuel classic picker / upload order (template: QB, RB, RB, WR, WR, WR, TE, FLEX, DEF).
 # Internal keys stay unique (RB1/RB2/…) for the ILP.
