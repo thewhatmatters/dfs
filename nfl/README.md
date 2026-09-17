@@ -18,7 +18,7 @@ python3 -m nfl.optimize \
   --out results/nfl-lineup.json
 ```
 
-JSON on stdout; picker (QB, RB, RB, WR, WR, WR, TE, FLEX, DEF) on stderr — last column is **Sources** (join tags). Slate coverage: `python3 -m nfl.status --csv …` or `--slate-status` (JSON `slate_status`). Needs `ODDS_API_KEY` (hard `LINES_KEY` if missing). Cached OurLads depth (`python3 -m nfl.depth --csv …`), ESPN injuries, and Odds props; do not `--refresh-props` unless the cache is empty. `--depth-source=espn` is an optional fallback (often 403).
+JSON on stdout; picker (QB, RB, RB, WR, WR, WR, TE, FLEX, DEF) on stderr — last column is **Sources** (join tags). Slate coverage: `python3 -m nfl.status --csv …` or `--slate-status` (JSON `slate_status`) — **relevant-band** first (QB>$6500, WR>$5000, RB>$5000, TE>$4500, DEF>$3500), full pool on the `all pool` line. Needs `ODDS_API_KEY` (hard `LINES_KEY` if missing). Cached OurLads depth (`python3 -m nfl.depth --csv …`), ESPN injuries, and Odds props; do not `--refresh-props` unless the cache is empty. `--depth-source=espn` is an optional fallback (often 403).
 
 Week-1 objective: implied team total × OurLads depth prior × position share × Lineups **usage tilt** (WR/TE `target_share`; RB 70% `snap_share` / 30% `target_share`, each vs a depth-conditional expected share, clamped ±20%). Volume player props (including 100/300 bonuses when the *line* is ≥ threshold) are a **±20% tilt** on that base — not a second currency. `--skip-targets` / `--skip-snaps` / `--skip-props` leave the matching factor at 1.0. DEF uses opponent implied total as PA plus a +3.0 sack/TO prior. `--sim` is a structural game draw (Vegas total+spread; teammates share the world), not independent per-player noise.
 

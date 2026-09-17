@@ -3,6 +3,9 @@
 
 Same ``--csv`` / ``--agent`` / ``--out`` flags as ``nfl.optimize``.
 Exit 0 after the report (adds ``--slate-status`` if omitted).
+
+Coverage is cash-relevant salary bands (see ``nfl.slate_status``), not the
+full FanDuel pool.
 """
 
 from __future__ import annotations

@@ -61,7 +61,15 @@ Props are a **±20% tilt** on the implied score when a volume line joins.
 Missing props is not a lines failure and not a blank choke — see picker
 `note` / `prop_status` / **Sources** (join tags) and JSON `slate_status`.
 `--slate-status` (or `python3 -m nfl.status`) prints pool + per-source
-coverage without solving.
+coverage without solving. **Lead with cash-relevant salary bands**
+(strictly greater than: QB $6,500 / WR $5,000 / RB $5,000 / TE $4,500 /
+DEF $3,500) — not the full FanDuel pool of $4k fillers. Per-position
+expects: skill depth (OurLads/ESPN); RB/WR/TE Lineups targets; RB snaps
+(WR/TE snaps reported, not required for the headline); props when not
+skipped. DEF: Vegas implied opp / optional prop; no depth/targets/snaps.
+Missing relevant names print on stderr (capped) and in JSON `slate_status`.
+Full-pool ratios stay on the secondary `all pool` line. Floors are
+constants in `nfl/slate_status.py` (`RELEVANT_SALARY_FLOOR`).
 
 ## Targets + snaps refresh + usage tilt
 
