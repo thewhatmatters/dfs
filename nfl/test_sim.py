@@ -52,6 +52,7 @@ def _pl(**kw) -> Player:
             prop_fd=fields.get("prop_fd"),
             implied_opp=fields.get("implied_opp"),
             target_share=fields.get("target_share"),
+            snap_share=fields.get("snap_share"),
         )
     allowed = Player.__dataclass_fields__
     return Player(**{k: v for k, v in fields.items() if k in allowed})
@@ -123,11 +124,18 @@ class FlagsTest(unittest.TestCase):
         self.assertEqual(off.stack_qb, "on")
         self.assertFalse(off.skip_targets)
         self.assertIsNone(off.targets_week)
+        self.assertFalse(off.skip_snaps)
+        self.assertIsNone(off.snaps_week)
         skipped = parse_args(["--csv", "x.csv", "--skip-targets", "--targets-week", "1"])
         self.assertTrue(skipped.skip_targets)
         self.assertEqual(skipped.targets_week, 1)
+        snap_args = parse_args(["--csv", "x.csv", "--skip-snaps", "--snaps-week", "2"])
+        self.assertTrue(snap_args.skip_snaps)
+        self.assertEqual(snap_args.snaps_week, 2)
         with self.assertRaises(SystemExit):
             parse_args(["--csv", "x.csv", "--targets-week", "0"])
+        with self.assertRaises(SystemExit):
+            parse_args(["--csv", "x.csv", "--snaps-week", "0"])
         self.assertIsNone(off.upload)
         custom = parse_args(
             [

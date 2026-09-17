@@ -100,14 +100,20 @@ def explain_player(player: Player, *, slot_key: str | None = None) -> dict:
     implied = player.implied_total
     imp_s = "—" if implied is None else _g(implied)
     usage = usage_factor(
-        player.target_share, player.position, player.depth_rank
+        player.target_share,
+        player.position,
+        player.depth_rank,
+        snap_share=player.snap_share,
     )
     usage_s = ""
+    bits: list[str] = []
+    if player.snap_share is not None:
+        bits.append(f"snap {_g(player.snap_share)}")
     if player.target_share is not None:
-        usage_s = (
-            f" × usage {usage:g} (tgt {_g(player.target_share)})"
-        )
-    elif player.targets_status == "unmatched":
+        bits.append(f"tgt {_g(player.target_share)}")
+    if bits:
+        usage_s = f" × usage {usage:g} ({', '.join(bits)})"
+    elif player.snaps_status == "unmatched" or player.targets_status == "unmatched":
         usage_s = " × usage 1.0 (Lineups name unmatched)"
     note = (
         f"no player props{why} — implied {imp_s} × "

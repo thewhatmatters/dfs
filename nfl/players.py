@@ -40,6 +40,10 @@ class Player:
     targets: int | None = None
     targets_week: int | None = None
     targets_status: str | None = None
+    snap_share: float | None = None
+    snaps: int | None = None
+    snaps_week: int | None = None
+    snaps_status: str | None = None
     ownership: float | None = None
     weather: str | None = None
 

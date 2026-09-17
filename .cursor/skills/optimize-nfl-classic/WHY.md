@@ -67,6 +67,16 @@ NFL path is flags-only.
   totals stay the environment. `--skip-targets` = factor 1.0. Join is
   `match_key` only (Jr. strip); unmatched Lineups + unmatched slate WR/TE
   print on stderr and JSON `targets`. Do not invent aliases.
+- 2026-09-17: **Lineups snaps + RB targets.** Roommate grant recorded in
+  `nfl/docs/data/lineups-authorization.md` (same roommate context as
+  OurLads). `python3 -m nfl.snaps --refresh` → `nfl/data/snaps.csv`
+  (RB/WR/TE). Targets refresh now includes RB
+  (`/nfl/targets/running-back/`). RB usage = 70% snap_share + 30%
+  target_share, each ±20% vs a depth prior, then clamp again (do not
+  stack two ±20% tilts). WR/TE snaps attach but do not score (targets
+  already measure receiving). `--skip-snaps` / missing CSV degrades.
+  Wednesday refresh: targets then snaps. Props pages inventoried only
+  (`https://www.lineups.com/nfl/player-prop-bets/`).
 
 ## 4. Known limitations / environment caveats
 

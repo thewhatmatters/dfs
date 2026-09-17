@@ -155,7 +155,12 @@ def model_point(player: Player) -> float:
         implied
         * depth_prior(player.depth_rank)
         * share
-        * usage_factor(player.target_share, player.position, player.depth_rank)
+        * usage_factor(
+            player.target_share,
+            player.position,
+            player.depth_rank,
+            snap_share=player.snap_share,
+        )
     )
 
 
@@ -403,7 +408,12 @@ def _score_world(player: Player, team_pts: float, opp_pts: float) -> float:
         float(team_pts)
         * depth_prior(player.depth_rank)
         * share
-        * usage_factor(player.target_share, player.position, player.depth_rank)
+        * usage_factor(
+            player.target_share,
+            player.position,
+            player.depth_rank,
+            snap_share=player.snap_share,
+        )
     )
     if has_volume_props(player):
         pts *= prop_factor(model_point(player), player.prop_fd)
@@ -429,7 +439,12 @@ def _one_draw(rng: random.Random, player: Player, props: bool) -> float:
         team_pts
         * depth_prior(player.depth_rank)
         * share
-        * usage_factor(player.target_share, player.position, player.depth_rank)
+        * usage_factor(
+            player.target_share,
+            player.position,
+            player.depth_rank,
+            snap_share=player.snap_share,
+        )
     )
     if props:
         pts *= prop_factor(model_point(player), player.prop_fd)

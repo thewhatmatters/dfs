@@ -76,6 +76,13 @@ from nfl.sim import (  # noqa: E402
     simulate_games,
 )
 from nfl.solver import Infeasible, Lineup, solve_many  # noqa: E402
+from nfl.snaps import (  # noqa: E402
+    DEFAULT_OUT as DEFAULT_SNAPS_CSV,
+    SnapsError,
+    attach_snaps,
+    load_snaps_csv,
+    print_snaps_gaps,
+)
 from nfl.targets import (  # noqa: E402
     DEFAULT_OUT as DEFAULT_TARGETS_CSV,
     TargetsError,
@@ -194,7 +201,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument(
         "--skip-targets",
         action="store_true",
-        help="do not join Lineups WR/TE targets (usage factor stays 1.0)",
+        help="do not join Lineups RB/WR/TE targets (usage uses snaps or 1.0)",
     )
     ap.add_argument(
         "--targets-csv",
@@ -208,6 +215,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         metavar="N",
         help="targets.csv week to join (default: latest week in the CSV)",
+    )
+    ap.add_argument(
+        "--skip-snaps",
+        action="store_true",
+        help="do not join Lineups snap counts (RB usage uses targets or 1.0)",
+    )
+    ap.add_argument(
+        "--snaps-csv",
+        type=Path,
+        default=DEFAULT_SNAPS_CSV,
+        help=f"Lineups snaps CSV (default: {DEFAULT_SNAPS_CSV})",
+    )
+    ap.add_argument(
+        "--snaps-week",
+        type=_positive_week,
+        default=None,
+        metavar="N",
+        help="snaps.csv week to join (default: latest week in the CSV)",
     )
     ap.add_argument(
         "--skip-props",
@@ -432,6 +457,26 @@ def main(argv: list[str] | None = None) -> int:
             tstats["csv"] = str(tpath)
             print_targets_gaps(tstats)
 
+    sstats: dict = {"skipped": True}
+    if args.skip_snaps:
+        print("snaps skipped", file=sys.stderr)
+    else:
+        spath = Path(args.snaps_csv).expanduser()
+        try:
+            srows = load_snaps_csv(spath)
+        except SnapsError as e:
+            emit(e.choke, str(e))
+            sstats = {
+                "skipped": True,
+                "csv": str(spath),
+                "choke": e.choke,
+                "error": str(e),
+            }
+        else:
+            pool, sstats = attach_snaps(pool, srows, week=args.snaps_week)
+            sstats["csv"] = str(spath)
+            print_snaps_gaps(sstats)
+
     if not args.skip_props:
         try:
             by_pid, pstats = ingest_slate_props(
@@ -485,6 +530,7 @@ def main(argv: list[str] | None = None) -> int:
         },
         "games": games_payload,
         "targets": tstats,
+        "snaps": sstats,
         "flags": {
             "exclude_questionable": args.exclude_questionable,
             "keep_out": args.keep_out,
@@ -494,6 +540,9 @@ def main(argv: list[str] | None = None) -> int:
             "skip_targets": args.skip_targets,
             "targets_csv": str(args.targets_csv),
             "targets_week": args.targets_week,
+            "skip_snaps": args.skip_snaps,
+            "snaps_csv": str(args.snaps_csv),
+            "snaps_week": args.snaps_week,
             "skip_props": args.skip_props,
             "skip_injuries": args.skip_injuries,
             "min_salary": args.min_salary,

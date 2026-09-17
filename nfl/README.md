@@ -20,8 +20,8 @@ python3 -m nfl.optimize \
 
 JSON on stdout; picker (QB, RB, RB, WR, WR, WR, TE, FLEX, DEF) on stderr. Needs `ODDS_API_KEY` (hard `LINES_KEY` if missing). Cached OurLads depth (`python3 -m nfl.depth --csv …`), ESPN injuries, and Odds props; do not `--refresh-props` unless the cache is empty. `--depth-source=espn` is an optional fallback (often 403).
 
-Week-1 objective: implied team total × OurLads depth prior × position share × Lineups WR/TE **usage tilt** (`target_share` vs a depth-conditional expected share, clamped ±20%). Volume player props (including 100/300 bonuses when the *line* is ≥ threshold) are a **±20% tilt** on that base — not a second currency. `--skip-targets` / `--skip-props` leave the matching factor at 1.0. DEF uses opponent implied total as PA plus a +3.0 sack/TO prior. `--sim` is a structural game draw (Vegas total+spread; teammates share the world), not independent per-player noise.
+Week-1 objective: implied team total × OurLads depth prior × position share × Lineups **usage tilt** (WR/TE `target_share`; RB 70% `snap_share` / 30% `target_share`, each vs a depth-conditional expected share, clamped ±20%). Volume player props (including 100/300 bonuses when the *line* is ≥ threshold) are a **±20% tilt** on that base — not a second currency. `--skip-targets` / `--skip-snaps` / `--skip-props` leave the matching factor at 1.0. DEF uses opponent implied total as PA plus a +3.0 sack/TO prior. `--sim` is a structural game draw (Vegas total+spread; teammates share the world), not independent per-player noise.
 
-Targets: [`docs/data/targets.md`](docs/data/targets.md). `python3 -m nfl.targets --refresh` → `nfl/data/targets.csv`. Name-join gaps print on stderr and JSON `targets`.
+Wednesday refresh: `python3 -m nfl.targets --refresh` (RB/WR/TE) → `nfl/data/targets.csv`; `python3 -m nfl.snaps --refresh` (RB/WR/TE) → `nfl/data/snaps.csv`. Name-join gaps print on stderr and JSON `targets` / `snaps`. Docs: [`docs/data/targets.md`](docs/data/targets.md), [`docs/data/snaps.md`](docs/data/snaps.md).
 
-Depth grant: [`docs/data/ourlads-authorization.md`](docs/data/ourlads-authorization.md).
+Lineups grant: [`docs/data/lineups-authorization.md`](docs/data/lineups-authorization.md). Depth grant: [`docs/data/ourlads-authorization.md`](docs/data/ourlads-authorization.md).
