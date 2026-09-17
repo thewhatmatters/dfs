@@ -75,6 +75,7 @@ from nfl.sim import (  # noqa: E402
     sim_header,
     simulate_games,
 )
+from nfl.slate_status import build_slate_status, format_slate_status  # noqa: E402
 from nfl.solver import Infeasible, Lineup, solve_many  # noqa: E402
 from nfl.snaps import (  # noqa: E402
     DEFAULT_OUT as DEFAULT_SNAPS_CSV,
@@ -326,6 +327,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--upload",
         help="write FanDuel upload CSV (Id:Nickname, picker order)",
     )
+    ap.add_argument(
+        "--slate-status",
+        nargs="?",
+        const="only",
+        default=None,
+        choices=("only", "with-solve"),
+        help="print source-coverage after ingest. "
+        "--slate-status (or =only) exits 0 after the report; "
+        "--slate-status=with-solve prints then solves. "
+        "JSON always includes slate_status after a successful ingest.",
+    )
     return ap.parse_args(argv)
 
 
@@ -373,6 +385,7 @@ def main(argv: list[str] | None = None) -> int:
         emit("CSV_FANDUEL", str(e))
         return 1
 
+    n_raw = len(raw)
     pool = filter_pool(
         raw,
         drop_out=not args.keep_out,
@@ -380,6 +393,7 @@ def main(argv: list[str] | None = None) -> int:
         out_codes=FANDUEL_NFL.out_codes,
         questionable_codes=FANDUEL_NFL.questionable_codes,
     )
+    n_after_ir = len(pool)
 
     slate_day = infer_slate_date(csv_path)
     json_path = Path(args.lines_json).expanduser() if args.lines_json else None
@@ -402,6 +416,7 @@ def main(argv: list[str] | None = None) -> int:
         emit("LINES_ATTACH", "no players left after attaching implied totals")
         return 1
 
+    istats: dict = {"skipped": True, "dropped": 0, "unmatched": 0}
     if not args.skip_injuries:
         try:
             pool, istats = ingest_slate_injuries(
@@ -410,11 +425,14 @@ def main(argv: list[str] | None = None) -> int:
         except InjuryError as e:
             emit(inj_id(e), str(e))
             return 1
+        istats = {**istats, "skipped": False}
         print(
             f"injuries dropped {istats['dropped']}  unmatched {istats['unmatched']}",
             file=sys.stderr,
         )
+    n_after_inj = len(pool)
 
+    dstats: dict = {"skipped": True, "matched": 0, "players": 0}
     if not args.skip_depth:
         slate_teams = {p.team for p in pool} | {p.opponent for p in pool if p.opponent}
         try:
@@ -430,7 +448,9 @@ def main(argv: list[str] | None = None) -> int:
             pool,
             depth_rows,
             score_fn=lambda pl, rank: score_player(pl, rank),
+            source=args.depth_source,
         )
+        dstats = {**dstats, "skipped": False, "source": args.depth_source}
         print(
             f"depth matched {dstats['matched']} / {dstats['players']}  "
             f"rows {dstats['depth_rows']}",
@@ -477,6 +497,7 @@ def main(argv: list[str] | None = None) -> int:
             sstats["csv"] = str(spath)
             print_snaps_gaps(sstats)
 
+    pstats: dict = {"skipped": True, "reason": "skip-props"}
     if not args.skip_props:
         try:
             by_pid, pstats = ingest_slate_props(
@@ -484,10 +505,12 @@ def main(argv: list[str] | None = None) -> int:
             )
         except PropsKeyMissing as e:
             emit("PROPS_ODDS_KEY", f"skip overlay — {e}")
+            pstats = {"skipped": True, "reason": "PROPS_ODDS_KEY"}
         except PropsError as e:
             emit(props_id(e), str(e))
             return 1
         else:
+            pstats = {**pstats, "skipped": False}
             pool = attach_props(
                 pool, by_pid, unmatched=pstats.get("unmatched") or []
             )
@@ -505,6 +528,28 @@ def main(argv: list[str] | None = None) -> int:
         f"floor ${rules.salary_floor:,}  cap ${rules.salary_cap:,}",
         file=sys.stderr,
     )
+    slate_status = build_slate_status(
+        raw_n=n_raw,
+        after_ir_n=n_after_ir,
+        after_inj_n=n_after_inj,
+        pool=pool,
+        depth_source=args.depth_source,
+        depth=dstats,
+        targets=tstats,
+        snaps=sstats,
+        props=pstats,
+        injuries=istats,
+        flags={
+            "skip_depth": args.skip_depth,
+            "skip_targets": args.skip_targets,
+            "skip_snaps": args.skip_snaps,
+            "skip_props": args.skip_props,
+            "skip_injuries": args.skip_injuries,
+            "depth_source": args.depth_source,
+        },
+    )
+    if args.slate_status:
+        print(format_slate_status(slate_status), file=sys.stderr)
     payload = {
         "title": "FanDuel NFL classic lineup",
         "date": date.today().isoformat(),
@@ -531,6 +576,7 @@ def main(argv: list[str] | None = None) -> int:
         "games": games_payload,
         "targets": tstats,
         "snaps": sstats,
+        "slate_status": slate_status,
         "flags": {
             "exclude_questionable": args.exclude_questionable,
             "keep_out": args.keep_out,
@@ -563,6 +609,10 @@ def main(argv: list[str] | None = None) -> int:
         "n_lineups_requested": args.n_lineups,
         "min_unique": args.min_unique,
     }
+    if args.slate_status == "only":
+        payload["status"] = "ok"
+        _write_payload(payload, args)
+        return 0
     sim_n = _sim_n(args)
     sim_by_pid: dict = {}
     game_sim = None

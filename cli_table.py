@@ -49,6 +49,7 @@ PICKER_HEADERS = (
     "Fl",
     "Cl",
     "Props",
+    "Sources",
 )
 _NUM_RE = re.compile(r"^\$?-?\d[\d,]*(\.\d+)?$")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -193,6 +194,49 @@ def format_picker_props(p: dict) -> str:
     return " / ".join(bits) if bits else "-"
 
 
+def format_picker_sources(
+    p: dict,
+    *,
+    depth_source: str | None = None,
+) -> str:
+    """Compact join tags. Slash-separated; ``-`` if nothing joined."""
+    if p.get("sources"):
+        return str(p["sources"])
+    tags: list[str] = []
+    pos = str(p.get("position") or "").upper()
+    slot = str(p.get("slot") or "").upper()
+    is_dst = pos in _DST_POS or slot in _DST_POS
+    src = str(p.get("depth_source") or depth_source or "").strip().lower()
+    if p.get("depth_rank") is not None:
+        tags.append("espn" if src == "espn" else "ourlads")
+    if p.get("target_share") is not None:
+        tags.append("lineups-tgt")
+    if p.get("snap_share") is not None:
+        tags.append("lineups-snap")
+    prop_status = str(p.get("prop_status") or "").strip().lower()
+    if (
+        prop_status == "props"
+        or p.get("prop_fd") is not None
+        or any(
+            p.get(k) is not None
+            for k in (
+                "prop_pass_yds",
+                "prop_pass_tds",
+                "prop_rush_yds",
+                "prop_rec_yds",
+                "prop_receptions",
+            )
+        )
+    ):
+        tags.append("odds-props")
+    inj = str(p.get("injury") or "").strip().upper()
+    if inj == "Q":
+        tags.append("espn-inj")
+    if is_dst and p.get("implied_opp") is not None:
+        tags.append("vegas-dst")
+    return "/".join(tags) if tags else "-"
+
+
 def _round_pts(x: object) -> int | None:
     """Nearest integer, .5 up (25.5 → 26)."""
     if x is None or x == "":
@@ -270,9 +314,15 @@ def format_picker_table(
     box: bool | None = None,
     color: bool | None = None,
 ) -> str:
-    """Picker 7/9: Slot | Player | Pos | Team | Opp | Sal | FPPG | Proj | Fl | Cl | Props."""
+    """Picker 7/9: Slot | Player | Pos | Team | Opp | Sal | FPPG | Proj | Fl | Cl | Props | Sources."""
     if color is None:
         color = supports_color()
+    flags = lu.get("flags") if isinstance(lu.get("flags"), dict) else {}
+    depth_source = None
+    if isinstance(flags, dict):
+        depth_source = flags.get("depth_source")
+    if depth_source is None:
+        depth_source = lu.get("depth_source")
     picker = list(lu.get("picker") or [])
     rows: list[tuple[str, ...]] = []
     for p in picker:
@@ -293,6 +343,7 @@ def format_picker_table(
                 one_dec(p.get("floor")),
                 one_dec(p.get("ceiling")),
                 format_picker_props(p),
+                format_picker_sources(p, depth_source=depth_source),
             )
         )
     sal = lu.get("salary")
@@ -322,6 +373,7 @@ def format_picker_table(
             format_proj_value(proj, sal),
             one_dec(floor),
             one_dec(ceiling),
+            "",
             "",
         )
     )
@@ -375,7 +427,7 @@ def _cells(row: Sequence[object], n: int) -> list[str]:
 
 
 def _right_align(i: int, headers: Sequence[str], body: Sequence[Sequence[str]]) -> bool:
-    if headers[i] == "Props":
+    if headers[i] in {"Props", "Sources"}:
         return False
     cells = [headers[i], *(row[i] for row in body)]
     nonempty = [c for c in cells if c and c != headers[i]]

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from cli_table import format_picker_sources
 from nfl.players import Player
 from nfl.projections import POS_FD_SHARE, depth_prior, usage_factor
 from nfl.rules import (
@@ -67,6 +68,30 @@ def _prop_line_bits(player: Player) -> list[str]:
     return bits
 
 
+def player_source_fields(player: Player, *, prop_status: str | None) -> dict:
+    """Picker join tags from fields already on the player. No scrapes."""
+    return {
+        "sources": format_picker_sources(
+            {
+                "position": player.position,
+                "depth_rank": player.depth_rank,
+                "depth_source": player.depth_source,
+                "target_share": player.target_share,
+                "snap_share": player.snap_share,
+                "prop_status": prop_status,
+                "prop_fd": player.prop_fd,
+                "prop_pass_yds": player.prop_pass_yds,
+                "prop_pass_tds": player.prop_pass_tds,
+                "prop_rush_yds": player.prop_rush_yds,
+                "prop_rec_yds": player.prop_rec_yds,
+                "prop_receptions": player.prop_receptions,
+                "injury": player.injury,
+                "implied_opp": player.implied_opp,
+            }
+        )
+    }
+
+
 def explain_player(player: Player, *, slot_key: str | None = None) -> dict:
     _ = slot_key
     starter = is_starter(player)
@@ -80,7 +105,9 @@ def explain_player(player: Player, *, slot_key: str | None = None) -> dict:
                 f"DST PA proxy: opp implied {_g(opp)} → {band} "
                 f"({FANDUEL_NFL.scoring[band]:g} pts) + 3.0 sack/TO prior."
             )
-        return {"note": note, "starter": False, "prop_status": None}
+        info = {"note": note, "starter": False, "prop_status": None}
+        info.update(player_source_fields(player, prop_status=None))
+        return info
 
     if player.prop_fd is not None:
         bits = _prop_line_bits(player)
@@ -89,7 +116,9 @@ def explain_player(player: Player, *, slot_key: str | None = None) -> dict:
             f"Odds props ({_book_label(player)}): {lines} "
             "— ±20% tilt on implied."
         )
-        return {"note": note, "starter": starter, "prop_status": "props"}
+        info = {"note": note, "starter": starter, "prop_status": "props"}
+        info.update(player_source_fields(player, prop_status="props"))
+        return info
 
     why = ""
     if player.prop_status == "unmatched":
@@ -120,11 +149,14 @@ def explain_player(player: Player, *, slot_key: str | None = None) -> dict:
         f"{_prior_label(player.depth_rank)} ({depth_prior(player.depth_rank):g}) × "
         f"{player.position} {share:.2f} share{usage_s}."
     )
-    return {
+    status = player.prop_status or "no_market"
+    info = {
         "note": note,
         "starter": starter,
-        "prop_status": player.prop_status or "no_market",
+        "prop_status": status,
     }
+    info.update(player_source_fields(player, prop_status=status))
+    return info
 
 
 def _last_names(players: Sequence[Player]) -> str:

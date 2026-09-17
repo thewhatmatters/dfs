@@ -5,7 +5,8 @@
 ## What you get
 
 - One JSON lineup (slots, salaries, projection, teams) on stdout / `--out`
-- A stderr table you can paste into chat (QB, RB, RB, WR, WR, WR, TE, FLEX, DEF)
+- A stderr table you can paste into chat (QB, RB, RB, WR, WR, WR, TE, FLEX, DEF; last column Sources)
+- Slate coverage via `--slate-status` / `python3 -m nfl.status` (JSON `slate_status`)
 - An exact ILP when PuLP is installed; an approximate greedy fill otherwise (labeled)
 - FanDuel upload CSV in `nfl/export/` when `--n-lineups>1`
 

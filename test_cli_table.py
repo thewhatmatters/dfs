@@ -7,6 +7,7 @@ import unittest
 from cli_table import (
     GREEN,
     RED,
+    format_picker_sources,
     format_picker_table,
     format_table,
     json_stdout_enabled,
@@ -49,6 +50,29 @@ class PickerTableTest(unittest.TestCase):
                     "prop_pass_yds": 267.5,
                     "prop_pass_tds": 2.5,
                     "prop_rush_yds": 6.5,
+                    "prop_status": "props",
+                    "depth_rank": 1,
+                    "depth_source": "ourlads",
+                },
+                {
+                    "slot": "WR",
+                    "name": "Amon-Ra St. Brown",
+                    "position": "WR",
+                    "team": "DET",
+                    "opponent": "CHI",
+                    "game": "DET@CHI",
+                    "implied_total": 24.5,
+                    "implied_opp": 21.0,
+                    "salary": 7800,
+                    "fppg": 14.0,
+                    "projection": 16.2,
+                    "floor": 11.0,
+                    "ceiling": 24.0,
+                    "starter": True,
+                    "depth_rank": 1,
+                    "depth_source": "ourlads",
+                    "target_share": 0.28,
+                    "snap_share": 0.91,
                 },
                 {
                     "slot": "DEF",
@@ -82,6 +106,10 @@ class PickerTableTest(unittest.TestCase):
         self.assertIn("FPPG", text)
         self.assertIn("18.2", text)
         self.assertIn("Props", text)
+        self.assertIn("Sources", text)
+        self.assertIn("ourlads/odds-props", text)
+        self.assertIn("ourlads/lineups-tgt/lineups-snap", text)
+        self.assertIn("vegas-dst", text)
         self.assertIn("Joe Burrow (*)", text)
         self.assertIn("Opp", text)
         self.assertIn("CIN (A) 27", text)
@@ -104,7 +132,40 @@ class PickerTableTest(unittest.TestCase):
         ascii_text = format_picker_table(lu, box=False, color=False)
         self.assertIn("+", ascii_text)
         self.assertIn("Props", ascii_text)
+        self.assertIn("Sources", ascii_text)
         self.assertNotIn("┌", ascii_text)
+
+    def test_picker_sources_tags(self):
+        self.assertEqual(
+            format_picker_sources(
+                {
+                    "position": "WR",
+                    "depth_rank": 1,
+                    "depth_source": "ourlads",
+                    "target_share": 0.24,
+                }
+            ),
+            "ourlads/lineups-tgt",
+        )
+        self.assertEqual(
+            format_picker_sources(
+                {"position": "WR", "depth_rank": 2, "depth_source": "espn"}
+            ),
+            "espn",
+        )
+        self.assertEqual(
+            format_picker_sources({"position": "QB", "prop_status": "props"}),
+            "odds-props",
+        )
+        self.assertEqual(
+            format_picker_sources({"position": "D", "implied_opp": 22.5}),
+            "vegas-dst",
+        )
+        self.assertEqual(format_picker_sources({"position": "RB"}), "-")
+        self.assertEqual(
+            format_picker_sources({"position": "WR", "sources": "ourlads/lineups-tgt"}),
+            "ourlads/lineups-tgt",
+        )
 
     def test_json_stdout_flags(self):
         self.assertTrue(json_stdout_enabled(agent=True, json_flag=False))

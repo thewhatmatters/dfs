@@ -59,7 +59,9 @@ Depth: [`ourlads-depth.md`](ourlads-depth.md).
 
 Props are a **±20% tilt** on the implied score when a volume line joins.
 Missing props is not a lines failure and not a blank choke — see picker
-`note` / `prop_status`.
+`note` / `prop_status` / **Sources** (join tags) and JSON `slate_status`.
+`--slate-status` (or `python3 -m nfl.status`) prints pool + per-source
+coverage without solving.
 
 ## Targets + snaps refresh + usage tilt
 

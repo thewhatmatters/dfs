@@ -198,12 +198,15 @@ class JoinTest(unittest.TestCase):
             _p("Walk On", pos="WR"),
             _p("Chiefs", pos="D"),
         ]
-        attached, stats = attach_depth_ranks(players, depth)
+        attached, stats = attach_depth_ranks(players, depth, source="ourlads")
         by = {p.name: p.depth_rank for p in attached}
+        src = {p.name: p.depth_source for p in attached}
         self.assertEqual(by["Patrick Mahomes"], 1)
         self.assertEqual(by["Rashee Rice"], 1)
         self.assertIsNone(by["Walk On"])
         self.assertIsNone(by["Chiefs"])
+        self.assertEqual(src["Patrick Mahomes"], "ourlads")
+        self.assertIsNone(src["Walk On"])
         self.assertEqual(stats["matched"], 2)
         starter = week1_score(24.0, 1, "QB")
         unlisted = week1_score(24.0, None, "WR")

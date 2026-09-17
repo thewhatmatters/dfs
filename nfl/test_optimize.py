@@ -124,8 +124,20 @@ class Week1ScoreTest(unittest.TestCase):
         )
         info = explain_player(pl)
         self.assertEqual(info["prop_status"], "props")
+        self.assertEqual(info["sources"], "ourlads/odds-props")
         self.assertIn("±20% tilt on implied", info["note"])
         self.assertIn("250.5 pass yds", info["note"])
+
+    def test_skill_sources_depth_and_targets(self):
+        pl = _pl(
+            name="Amon-Ra St. Brown",
+            position="WR",
+            depth_rank=1,
+            depth_source="ourlads",
+            target_share=0.28,
+        )
+        info = explain_player(pl)
+        self.assertEqual(info["sources"], "ourlads/lineups-tgt")
 
     def test_def_uses_pa_plus_prior(self):
         self.assertAlmostEqual(week1_score(0.0, None, "D", implied_opp=24.5), 3.0)
@@ -616,6 +628,7 @@ class PickerPrintTest(unittest.TestCase):
         self.assertIn("Slot", text)
         self.assertIn("Proj", text)
         self.assertIn("Props", text)
+        self.assertIn("Sources", text)
         self.assertIn("Joe Burrow (*)", text)
         self.assertIn("$8,200", text)
         self.assertIn("267.5 pass / 2.5 TD", text)
