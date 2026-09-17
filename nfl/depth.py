@@ -188,6 +188,8 @@ def attach_depth_ranks(
     players: list[Player],
     rows: list[DepthRow],
     score_fn=None,
+    *,
+    source: str | None = None,
 ) -> tuple[list[Player], dict]:
     idx = depth_index(rows)
     out: list[Player] = []
@@ -203,7 +205,8 @@ def attach_depth_ranks(
         obj = pl.objective
         if score_fn is not None:
             obj = score_fn(pl, rank)
-        out.append(replace(pl, depth_rank=rank, objective=obj))
+        src = source if rank is not None else None
+        out.append(replace(pl, depth_rank=rank, depth_source=src, objective=obj))
     stats = {
         "depth_rows": len(rows),
         "players": len(players),

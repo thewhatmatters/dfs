@@ -28,6 +28,7 @@ class Player:
     lines_source: str | None = None
     objective: float | None = None
     depth_rank: int | None = None
+    depth_source: str | None = None
     prop_fd: float | None = None
     prop_pass_yds: float | None = None
     prop_pass_tds: float | None = None
