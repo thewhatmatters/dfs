@@ -505,6 +505,7 @@ def solve_ilp_many(
     cut_sets: set[frozenset[str]] = set()
     dup_cuts = 0
     counts: dict[str, int] = defaultdict(int)
+    capped: set[int] = set()
 
     def _idxs(pids: frozenset[str]) -> list[int]:
         return [pid_index[pid] for pid in pids if pid in pid_index]
@@ -561,10 +562,9 @@ def solve_ilp_many(
             counts[p.pid] += 1
             if max_count is not None and counts[p.pid] >= max_count:
                 i = pid_index.get(p.pid)
-                if i is not None:
-                    name = f"exposure_{i}_{k}"
-                    if name not in prob.constraints:
-                        prob += selected(i) == 0, name
+                if i is not None and i not in capped:
+                    capped.add(i)
+                    prob += selected(i) == 0, f"exposure_{i}"
         if n_lineups >= 10 and ((k + 1) % 10 == 0 or k + 1 == n_lineups):
             print(f"  solved {k + 1}/{n_lineups}", file=sys.stderr)
         if k + 1 >= n_lineups:
