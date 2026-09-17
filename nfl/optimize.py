@@ -333,7 +333,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         const="only",
         default=None,
         choices=("only", "with-solve"),
-        help="print source-coverage after ingest. "
+        help="print source-coverage after ingest (cash-relevant salary "
+        "bands; full pool on the all-pool line). "
         "--slate-status (or =only) exits 0 after the report; "
         "--slate-status=with-solve prints then solves. "
         "JSON always includes slate_status after a successful ingest.",
