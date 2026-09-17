@@ -243,7 +243,7 @@ class BuildSlateStatusTest(unittest.TestCase):
         )
         self.assertEqual(status["depth"]["matched"], 4)
         self.assertEqual(status["depth"]["eligible"], 4)
-        self.assertEqual(status["depth"]["all"]["matched"], 6)
+        self.assertEqual(status["depth"]["all"]["matched"], 7)
         self.assertEqual(status["depth"]["all"]["eligible"], 9)
         self.assertEqual(status["targets"]["matched"], 3)
         self.assertEqual(status["targets"]["eligible"], 3)
@@ -262,7 +262,7 @@ class BuildSlateStatusTest(unittest.TestCase):
         text = format_slate_status(status)
         self.assertTrue(text.startswith("slate status\nrelevant  5 / 11"))
         self.assertIn("QB 1  RB 1  WR 1  TE 1  D 1", text)
-        self.assertIn("all pool  depth 6/9 skill", text)
+        self.assertIn("all pool  depth 7/9 skill", text)
         self.assertNotIn("FillerWR", text)
         self.assertNotIn("OldFloorWR", text)
 
