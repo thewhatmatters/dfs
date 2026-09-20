@@ -375,7 +375,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     ap.add_argument(
         "--upload",
-        help="write FanDuel upload CSV (Id:Nickname, picker order)",
+        help="write FanDuel upload CSV (Id:Nickname, picker order). "
+        "Uses nfl/data/FanDuel-NFL-*-entries-upload-template.csv when present "
+        "(keeps entry_id); legacy QB-first templates still work.",
     )
     ap.add_argument(
         "--slate-status",

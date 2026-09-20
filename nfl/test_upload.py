@@ -20,6 +20,8 @@ from nfl.upload import (
     _display_path,
     export_lineups,
     parse_upload_id,
+    resolve_upload_template,
+    slot_start_index,
     stamped_export_name,
     stamped_export_path,
     upload_cell,
@@ -27,6 +29,38 @@ from nfl.upload import (
     validate_upload,
     write_upload_csv,
 )
+
+_ENTRIES_HEADER = [
+    "entry_id",
+    "contest_id",
+    "contest_name",
+    "entry_fee",
+    "QB",
+    "RB",
+    "RB",
+    "WR",
+    "WR",
+    "WR",
+    "TE",
+    "FLEX",
+    "DEF",
+    "",
+    "Instructions",
+]
+
+
+def _write_entries_template(path: Path, n: int = 4) -> Path:
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        w = csv.writer(fh, lineterminator="\n")
+        w.writerow(_ENTRIES_HEADER)
+        for i in range(n):
+            instr = "Create a lineup" if i == 0 else ""
+            w.writerow(
+                [f"E{i + 1}", "C99", "Test Contest", "$1"]
+                + [""] * 9
+                + ["", instr]
+            )
+    return path
 
 
 def _pl(**kw) -> Player:
@@ -95,8 +129,29 @@ class UploadCellTest(unittest.TestCase):
 
 
 class UploadCsvTest(unittest.TestCase):
-    def test_template_exists(self):
-        self.assertTrue(UPLOAD_TEMPLATE.is_file())
+    def test_resolves_latest_entries_template(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            (folder / "FanDuel-NFL-2026-09-13-133104-lineup-upload-template.csv").write_text(
+                "x\n", encoding="utf-8"
+            )
+            (folder / "FanDuel-NFL-2026-09-13-133104-entries-upload-template.csv").write_text(
+                "x\n", encoding="utf-8"
+            )
+            newest = folder / "FanDuel-NFL-2026-09-20-134251-entries-upload-template.csv"
+            newest.write_text("x\n", encoding="utf-8")
+            self.assertEqual(resolve_upload_template(folder), newest)
+
+    def test_fallback_entries_filename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(
+                resolve_upload_template(tmp).name,
+                "FanDuel-NFL-2026-09-20-134251-entries-upload-template.csv",
+            )
+        self.assertEqual(
+            UPLOAD_TEMPLATE.name,
+            resolve_upload_template().name,
+        )
 
     def test_write_and_validate(self):
         a = _nine("a")
@@ -129,6 +184,38 @@ class UploadCsvTest(unittest.TestCase):
             write_upload_csv(path, [lu])
             with self.assertRaises(ValueError):
                 validate_upload(path, {"not-an-id"}, 1)
+
+    def test_entries_template_preserves_entry_ids(self):
+        a, b = _nine("a"), _nine("b")
+        ids = {p.pid for lu in (a, b) for p in lu.slots.values()}
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpl = _write_entries_template(Path(tmp) / "tmpl.csv", n=4)
+            path = Path(tmp) / "upload.csv"
+            write_upload_csv(path, [a, b], template=tmpl)
+            rows = validate_upload(path, ids, 2)
+            self.assertEqual(rows[0], upload_row(a))
+            self.assertEqual(rows[1], upload_row(b))
+            with path.open(newline="", encoding="utf-8") as fh:
+                all_rows = list(csv.reader(fh))
+            self.assertEqual(slot_start_index(all_rows[0]), 4)
+            self.assertEqual(all_rows[0][:4], ["entry_id", "contest_id", "contest_name", "entry_fee"])
+            self.assertEqual(all_rows[0][4:13], ["QB", "RB", "RB", "WR", "WR", "WR", "TE", "FLEX", "DEF"])
+            self.assertEqual(all_rows[1][0], "E1")
+            self.assertEqual(all_rows[2][0], "E2")
+            self.assertEqual(all_rows[1][1:4], ["C99", "Test Contest", "$1"])
+            self.assertEqual(all_rows[1][4:13], upload_row(a))
+            self.assertEqual(all_rows[2][4:13], upload_row(b))
+            self.assertEqual(all_rows[1][-1], "Create a lineup")
+            self.assertEqual(len(all_rows), 3)
+            self.assertFalse(all_rows[1][0].startswith("133104"))
+
+    def test_entries_template_needs_enough_rows(self):
+        lu = _nine("a")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpl = _write_entries_template(Path(tmp) / "tmpl.csv", n=1)
+            path = Path(tmp) / "upload.csv"
+            with self.assertRaises(ValueError):
+                write_upload_csv(path, [lu, _nine("b")], template=tmpl)
 
 
 class StampedExportTest(unittest.TestCase):
