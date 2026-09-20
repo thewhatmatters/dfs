@@ -34,7 +34,7 @@ Skill pointer: `.cursor/skills/optimize-nfl-classic/references/sources.md`.
 | `SNAPS_LINEUPS` | Lineups.com RB/WR/TE snap-count pages (public HTML + SSR JSON) | `nfl/snaps.py` | grant: [`lineups-authorization.md`](lineups-authorization.md) | **stop** | omit snaps refresh |
 | `SNAPS_CSV` | local `nfl/data/snaps.csv` (or `--snaps-csv`) missing/empty/bad | `nfl/snaps.py` | none — produced by `python3 -m nfl.snaps --refresh` | **degrade** — RB usage uses targets or 1.0 | `--skip-snaps` |
 | `SNAPS_JOIN` | Lineups full team name ↔ FanDuel abbrev (snaps refresh) | `nfl/snaps.py`, `nfl/teams.py` | — | **stop** on unmapped **team**; unmatched **names** print on stderr / JSON `snaps`, not fatal | add Odds full name to `TEAMS`; do not invent player aliases |
-| `UPLOAD_CSV` | FanDuel upload write/validate | `nfl/upload.py` | — | **stop** | omit `--upload` / `--n-lineups=1` |
+| `UPLOAD_CSV` | FanDuel upload write/validate | `nfl/upload.py` | contest `FanDuel-NFL-*-entries-upload-template.csv` (or legacy QB-first lineup-upload) in `nfl/data/` | **stop** | omit `--upload` / `--n-lineups=1`; pass `template=` |
 
 ## Deferred (not wired this pass)
 
