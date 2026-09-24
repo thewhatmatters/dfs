@@ -49,16 +49,29 @@ Mapped `prop` strings (case, punctuation, and a trailing Over/Under ignored):
 
 | field | accepted forms |
 |-------|----------------|
-| `pass_yds` | Passing Yards, Pass Yards, Pass Yds, `player_pass_yds` |
-| `pass_tds` | Passing Touchdowns, Passing TDs, Pass TDs, Pass TD, `player_pass_tds` |
-| `rush_yds` | Rushing Yards, Rush Yards, Rush Yds, `player_rush_yds` |
-| `rec_yds` | Receiving Yards, Rec Yards, Rec Yds, Reception Yards, `player_reception_yds` |
-| `receptions` | Receptions, `player_receptions` |
+| `pass_yds` | **Pass YDs** (live), Passing Yards, Pass Yards, Pass Yds, `player_pass_yds` |
+| `pass_tds` | **Pass TDs** (live), Passing Touchdowns, Passing TDs, Pass TD, `player_pass_tds` |
+| `rush_yds` | **Rush YDs** (live), Rushing Yards, Rush Yards, Rush Yds, `player_rush_yds` |
+| `rec_yds` | **Rec YDs** (live), Receiving Yards, Rec Yards, Rec Yds, Reception Yards, `player_reception_yds` |
+| `receptions` | **Recs** (live, confirmed), Receptions, Rec, `player_receptions` |
 
-TODO: confirm the live BettingPros `prop` strings from a `--refresh-props`
-dump. The table is the conservative set. Anything else is **not dropped
-quietly** — stderr prints `props unmapped (not scored): <exact string> (n)`
-and JSON stats include `unmapped_props`. Do not map anytime TD, interceptions,
-completions, or attempts onto the five fields until those exact strings are
-seen and a scoring rule exists. Same-timestamp duplicate lines keep the first
-value and record `conflicts`.
+Live BettingPros `prop` counter, 2026-09-24 gangstash smoke (671 rows):
+
+| prop | rows | scored |
+|------|------|--------|
+| Rec YDs | 188 | `rec_yds` |
+| Recs | 180 | `receptions` |
+| Rush YDs | 87 | `rush_yds` |
+| Rush ATTs | 67 | unmapped |
+| Pass TDs | 29 | `pass_tds` |
+| Pass CMPs | 28 | unmapped |
+| Pass YDs | 28 | `pass_yds` |
+| INTs | 27 | unmapped |
+| Pass ATTs | 23 | unmapped |
+| Rsh + Rec | 14 | unmapped |
+
+Recs is confirmed as receptions. INTs, Pass ATTs, Pass CMPs, Rush ATTs, and
+Rsh + Rec stay unmapped on purpose. Anything else still prints
+`props unmapped (not scored): <exact string> (n)` and is counted in
+`unmapped_props`. Same-timestamp duplicate lines keep the first value and
+record `conflicts`.

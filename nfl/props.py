@@ -10,10 +10,9 @@ does not call Odds and does not need ODDS_API_KEY.
 
 Prop strings: see PROP_FIELD. Unmapped `prop` values are counted and returned
 as unmapped_props (exact strings). They are not scored.
-TODO: confirm live BettingPros `prop` strings against a refreshed dump. The
-alias table is the conservative set (yards / TDs / receptions only). Do not
-fold anytime TD, interceptions, completions, or attempts into those fields
-until a dump shows the exact strings and a scoring rule exists.
+Live BettingPros board (2026-09-24, 671 rows): Pass YDs, Pass TDs, Rush YDs,
+Rec YDs, and Recs are scored. INTs, Pass ATTs, Pass CMPs, Rush ATTs, and
+Rsh + Rec stay unmapped.
 """
 
 from __future__ import annotations
@@ -65,6 +64,8 @@ PROP_FIELD = {
     "player receiving yards": "rec_yds",
     "receptions": "receptions",
     "player receptions": "receptions",
+    "recs": "receptions",
+    "rec": "receptions",
 }
 
 _TRAILING_SIDE = re.compile(r"\s+(?:over under|over|under)$")

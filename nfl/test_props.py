@@ -28,12 +28,20 @@ class PropFieldTest(unittest.TestCase):
         self.assertEqual(prop_field("Receiving Yards"), "rec_yds")
         self.assertEqual(prop_field("Receptions"), "receptions")
 
+    def test_recs_is_receptions(self):
+        self.assertEqual(prop_field("Recs"), "receptions")
+
     def test_unscored_markets_stay_unmapped(self):
         for raw in (
             "Anytime Touchdown",
             "Interceptions",
             "Pass Completions",
             "Rush Attempts",
+            "INTs",
+            "Pass ATTs",
+            "Pass CMPs",
+            "Rush ATTs",
+            "Rsh + Rec",
         ):
             self.assertIsNone(prop_field(raw), raw)
 
