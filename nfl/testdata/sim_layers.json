@@ -1,0 +1,62 @@
+{
+  "team_stats": [
+    {
+      "team_fd": "DET",
+      "side": "offense",
+      "pass_rate": 0.61,
+      "neutral_pass_rate": 0.58,
+      "proe": 0.03,
+      "epa_per_play": 0.12,
+      "n": 400,
+      "epa_sum": 48,
+      "epa_sq_sum": 560,
+      "pass_n": 250,
+      "rush_n": 150,
+      "pass_epa_sum": 30,
+      "pass_epa_sq_sum": 340,
+      "rush_epa_sum": 18,
+      "rush_epa_sq_sum": 220
+    },
+    {
+      "team_fd": "DET",
+      "side": "defense",
+      "n": 400,
+      "epa_sum": 10,
+      "epa_sq_sum": 500,
+      "pass_n": 240,
+      "rush_n": 160
+    },
+    {
+      "team_fd": "NO",
+      "side": "offense",
+      "pass_rate": 0.55,
+      "neutral_pass_rate": 0.54,
+      "proe": 0.01,
+      "epa_per_play": -0.04,
+      "n": 380,
+      "epa_sum": -16,
+      "epa_sq_sum": 520,
+      "pass_n": 210,
+      "rush_n": 170,
+      "pass_epa_sum": -8,
+      "pass_epa_sq_sum": 280,
+      "rush_epa_sum": -8,
+      "rush_epa_sq_sum": 240
+    }
+  ],
+  "targets": [
+    {"season": 2025, "week": 1, "position": "WR", "player_name": "Amon-Ra St. Brown", "team_fd": "DET", "targets": 12, "target_share": 0.45, "team_targets": 34, "team_pass_attempts": 36, "gsis_id": "00-0036322"},
+    {"season": 2025, "week": 2, "position": "WR", "player_name": "Amon-Ra St. Brown", "team_fd": "DET", "targets": 4, "target_share": 0.12, "team_targets": 33, "team_pass_attempts": 35, "gsis_id": "00-0036322"},
+    {"season": 2025, "week": 3, "position": "WR", "player_name": "Amon-Ra St. Brown", "team_fd": "DET", "targets": 11, "target_share": 0.40, "team_targets": 35, "team_pass_attempts": 37, "gsis_id": "00-0036322"},
+    {"season": 2025, "week": 4, "position": "WR", "player_name": "Amon-Ra St. Brown", "team_fd": "DET", "targets": 5, "target_share": 0.15, "team_targets": 32, "team_pass_attempts": 34, "gsis_id": "00-0036322"},
+    {"season": 2025, "week": 1, "position": "WR", "player_name": "Jameson Williams", "team_fd": "DET", "targets": 4, "target_share": 0.12, "team_targets": 34, "team_pass_attempts": 36, "gsis_id": "00-0037236"},
+    {"season": 2025, "week": 2, "position": "WR", "player_name": "Jameson Williams", "team_fd": "DET", "targets": 14, "target_share": 0.42, "team_targets": 33, "team_pass_attempts": 35, "gsis_id": "00-0037236"},
+    {"season": 2025, "week": 3, "position": "WR", "player_name": "Jameson Williams", "team_fd": "DET", "targets": 5, "target_share": 0.14, "team_targets": 35, "team_pass_attempts": 37, "gsis_id": "00-0037236"},
+    {"season": 2025, "week": 4, "position": "WR", "player_name": "Jameson Williams", "team_fd": "DET", "targets": 12, "target_share": 0.38, "team_targets": 32, "team_pass_attempts": 34, "gsis_id": "00-0037236"},
+    {"season": 2025, "week": 1, "position": "RB", "player_name": "Jahmyr Gibbs", "team_fd": "DET", "targets": 4, "target_share": 0.10, "team_targets": 34, "team_pass_attempts": 36, "gsis_id": "00-0038542"},
+    {"season": 2025, "week": 2, "position": "RB", "player_name": "Jahmyr Gibbs", "team_fd": "DET", "targets": 6, "target_share": 0.18, "team_targets": 33, "team_pass_attempts": 35, "gsis_id": "00-0038542"},
+    {"season": 2025, "week": 3, "position": "RB", "player_name": "Jahmyr Gibbs", "team_fd": "DET", "targets": 3, "target_share": 0.08, "team_targets": 35, "team_pass_attempts": 37, "gsis_id": "00-0038542"},
+    {"season": 2025, "week": 4, "position": "RB", "player_name": "Jahmyr Gibbs", "team_fd": "DET", "targets": 5, "target_share": 0.14, "team_targets": 32, "team_pass_attempts": 34, "gsis_id": "00-0038542"}
+  ],
+  "snaps": []
+}

@@ -1,9 +1,25 @@
-"""Structural game Monte Carlo for FanDuel-point draws.
+"""Layered game Monte Carlo for FanDuel-point draws.
 
-One world per slate draw: each game gets a Vegas total + home-spread
-realization; both teams' points come from that pair. Skill players score
-from their team's points; DST PA is the opponent's points in that world.
-Teammates and bring-backs share it. Different games are independent.
+One world per slate draw. Games are independent. Inside a game the layers
+share that world:
+
+1. Game — Vegas total + home spread. Sigma scales with team EPA variance
+   when team stats are present; otherwise the fixed constants below.
+2. Volume + script — team plays and a pass/rush split. Neutral pass rate
+   (or pass rate minus PROE) shifts with the drawn margin: trailing teams
+   pass more, leading teams run more.
+3. Opportunity — target shares (WR/TE/RB) and RB rush shares drawn jointly
+   (Dirichlet) from weekly history so same-team catchers compete and the
+   QB moves with his catchers. Missing history keeps the deterministic
+   role share (team points × depth × position share × usage).
+
+Efficiency (yards per opportunity, TD rates) is ``PlaceholderEfficiency``
+in ``nfl/sim_efficiency.py``. Layer 4 replaces that class; it is not a
+prop-line calibration.
+
+Inputs are ``SimInputs`` (team stats, weekly targets, optional snaps).
+The sim does not call Gangstash. Empty inputs reproduce the role-share
+fallback and do not add RNG draws.
 
 Not a play-by-play copula and not SaberSim.
 
@@ -17,12 +33,22 @@ player p10s.
 from __future__ import annotations
 
 import hashlib
+import math
 import random
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
+from nfl.names import match_key
 from nfl.players import Player
-from nfl.projections import POS_FD_SHARE, depth_prior, prop_factor, usage_factor
+from nfl.projections import (
+    POS_FD_SHARE,
+    depth_prior,
+    expected_snap_share,
+    prop_factor,
+    usage_factor,
+)
 from nfl.rules import DST_SACK_TO_PRIOR, FANDUEL_NFL, dst_pa_points, dst_projection
+from nfl.sim_efficiency import EfficiencyModel, OpportunityCount, PlaceholderEfficiency
+from nfl.sim_inputs import SimInputs, SnapWeek, TargetWeek, TeamStat
 
 DEFAULT_DRAWS = 10_000
 DEFAULT_SEED = 1
@@ -41,8 +67,30 @@ TEAM_POINTS_FLOOR = 3.0
 # DEF PA: same sigma; floor 0 (points allowed cannot go negative).
 PA_FLOOR = 0.0
 # Game draw: total and home spread. Tighter than CFB (0.15 / 16).
+# These are the fallback when team EPA variance is missing, and the
+# scale=1 point of the EPA dispersion map.
 TOTAL_SIGMA_FRAC = 0.12
 SPREAD_SIGMA = 10.0
+# Per-play EPA sd that leaves total/spread sigma at the constants above.
+EPA_SD_REF = 1.15
+EPA_SCALE_MIN = 0.60
+EPA_SCALE_MAX = 1.80
+# Layer 2. Pass rates are fractions.
+LEAGUE_PLAYS = 63.0
+PLAYS_SIGMA = 4.0
+PLAYS_FLOOR = 40.0
+LEAGUE_NEUTRAL_PASS_RATE = 0.57
+# +1.2 percentage points of pass rate per point of deficit.
+SCRIPT_PASS_PER_POINT = 0.012
+PASS_RATE_MIN = 0.38
+PASS_RATE_MAX = 0.78
+DEFAULT_TARGETS_PER_ATTEMPT = 0.90
+# Dirichlet concentration when a player has fewer than two weeks.
+DEFAULT_SHARE_KAPPA = 10.0
+KAPPA_MIN = 2.0
+KAPPA_MAX = 80.0
+# QB keeps this fraction of team rushes; RBs split the rest.
+QB_RUSH_SHARE = 0.08
 
 YARD_FIELDS: tuple[tuple[str, str], ...] = (
     ("prop_pass_yds", "pass_yd"),
@@ -94,6 +142,8 @@ class GameSim:
 
     by_pid: dict[str, SimStats]
     draws: dict[str, tuple[float, ...]]
+    # Teams whose catchers had weekly target history (Dirichlet shares).
+    opportunity_teams: frozenset[str] = field(default_factory=frozenset)
 
     def lineup_stats(self, pids: list[str]) -> SimStats | None:
         cols = [self.draws[p] for p in pids if p in self.draws]
@@ -108,8 +158,9 @@ class GameSim:
 
 def sim_header(n: int) -> str:
     return (
-        f"sim {int(n)} game draws — one world per game (Vegas total+spread); "
-        "teammates share it. Not a PBP copula."
+        f"sim {int(n)} layered draws — game total+spread "
+        "(EPA dispersion when team stats exist), volume/script, "
+        "opportunity shares. Teammates share the world. Not a PBP copula."
     )
 
 
@@ -197,36 +248,77 @@ def simulate_games(
     *,
     n: int = DEFAULT_DRAWS,
     seed: int = DEFAULT_SEED,
+    inputs: SimInputs | None = None,
+    efficiency: EfficiencyModel | None = None,
 ) -> GameSim:
-    """n slate worlds. Players in a game share total+margin; games do not."""
+    """n slate worlds. Players in a game share total+margin; games do not.
+
+    ``inputs`` turns on EPA dispersion, scripted volume, and Dirichlet
+    shares. ``None`` or an empty bundle keeps deterministic role shares
+    and the fixed total/spread sigmas (same RNG steps as before).
+    """
     if n <= 0:
         return GameSim(by_pid={}, draws={})
+    bundle = inputs or SimInputs()
+    index = _HistoryIndex(bundle)
+    eff = efficiency or PlaceholderEfficiency()
     groups: dict[str, list[Player]] = {}
     for pl in players:
         groups.setdefault(_game_key(pl), []).append(pl)
     for key in groups:
         groups[key].sort(key=lambda p: p.pid)
+    opportunity = frozenset(
+        team
+        for group in groups.values()
+        for team in _teams_in(group)
+        if _catchers(team, group, index)
+    )
     rng = random.Random(int(seed))
     raw: dict[str, list[float]] = {p.pid: [] for p in players}
     for _ in range(n):
         for key in sorted(groups):
             group = groups[key]
-            home_pts, away_pts, away, home = _draw_game(rng, group)
-            for pl in group:
-                if away is None or home is None:
+            home_pts, away_pts, away, home = _draw_game(rng, group, index)
+            if away is None or home is None:
+                for pl in group:
                     team_pts, opp_pts = _solo_world(rng, pl)
-                else:
+                    raw[pl.pid].append(_score_world(pl, team_pts, opp_pts))
+                continue
+            counts: dict[str, OpportunityCount] = {}
+            for team in sorted(_teams_in(group)):
+                if team not in opportunity:
+                    continue
+                margin = _team_margin(team, home_pts, away_pts, away, home)
+                counts.update(
+                    _draw_team_opportunities(
+                        rng,
+                        [p for p in group if (p.team or "").upper() == team],
+                        margin,
+                        index,
+                    )
+                )
+            for pl in group:
+                opp_count = counts.get(pl.pid)
+                if opp_count is None:
                     team_pts, opp_pts = _player_world(
                         pl, home_pts, away_pts, away, home
                     )
-                raw[pl.pid].append(_score_world(pl, team_pts, opp_pts))
+                    raw[pl.pid].append(_score_world(pl, team_pts, opp_pts))
+                else:
+                    raw[pl.pid].append(eff.points(rng, pl, opp_count))
     draws = {pid: tuple(xs) for pid, xs in raw.items()}
+    layered = _layered_pids(groups, opportunity, index)
     by_pid: dict[str, SimStats] = {}
     for pl in players:
         xs = list(draws[pl.pid])
-        src = "props" if has_volume_props(pl) and not _is_dst(pl) else "model"
+        if pl.pid in layered:
+            src = "game"
+        elif has_volume_props(pl) and not _is_dst(pl):
+            src = "props"
+        else:
+            src = "model"
         by_pid[pl.pid] = _stats(xs, n=n, source=src)
-    return GameSim(by_pid=by_pid, draws=draws)
+    return GameSim(by_pid=by_pid, draws=draws, opportunity_teams=opportunity)
 
 
 def apply_ilp_objective(
@@ -345,19 +437,29 @@ def _vegas(group: list[Player]) -> tuple[float, float, str | None, str | None]:
 
 
 def _draw_game(
-    rng: random.Random, group: list[Player]
+    rng: random.Random,
+    group: list[Player],
+    index: _HistoryIndex | None = None,
 ) -> tuple[float, float, str | None, str | None]:
     total_mu, spread_home_mu, away, home = _vegas(group)
     if away is None or home is None:
-        # Unparsed tag: independent team totals.
+        # Unparsed tag: independent team totals. No RNG here.
         return (0.0, 0.0, None, None)
+    home_var = away_var = None
+    if index is not None and away and home:
+        home_var = index.scoring_var(home, away)
+        away_var = index.scoring_var(away, home)
+    total_sigma, spread_sigma = game_sigmas(total_mu, home_var, away_var)
     total_d = _gauss_floor(
         rng,
         total_mu,
-        TOTAL_SIGMA_FRAC * abs(total_mu),
+        total_sigma,
         2.0 * TEAM_POINTS_FLOOR,
     )
-    spread_d = rng.gauss(spread_home_mu, SPREAD_SIGMA)
+    if spread_sigma <= 0:
+        spread_d = spread_home_mu
+    else:
+        spread_d = rng.gauss(spread_home_mu, spread_sigma)
     home_pts = max(TEAM_POINTS_FLOOR, (total_d - spread_d) / 2.0)
     away_pts = max(TEAM_POINTS_FLOOR, (total_d + spread_d) / 2.0)
     return home_pts, away_pts, away, home
@@ -477,6 +579,512 @@ def _props_draw(rng: random.Random, player: Player) -> float:
             continue
         pts += _gauss_floor(rng, float(line), COUNT_SIGMA, 0.0) * sc[key]
     return pts + yardage_bonuses(drawn)
+
+
+def dispersion_scale(var: float | None) -> float:
+    """Map per-play EPA variance onto a multiplier for the fallback sigmas.
+
+    ``None`` or 0 → 1 (today's constants). Otherwise
+    ``sqrt(var) / EPA_SD_REF``, clamped.
+    """
+    if var is None or var <= 0:
+        return 1.0
+    scale = math.sqrt(var) / EPA_SD_REF
+    return min(EPA_SCALE_MAX, max(EPA_SCALE_MIN, scale))
+
+
+def game_sigmas(
+    total_mu: float,
+    home_var: float | None,
+    away_var: float | None,
+) -> tuple[float, float]:
+    """``(total_sigma, spread_sigma)`` for one game.
+
+    Home and away scoring variances are turned into scales and combined
+    by RMS. Missing variances use scale 1.
+    """
+    home_s = dispersion_scale(home_var)
+    away_s = dispersion_scale(away_var)
+    scale = math.sqrt((home_s * home_s + away_s * away_s) / 2.0)
+    return TOTAL_SIGMA_FRAC * abs(total_mu) * scale, SPREAD_SIGMA * scale
+
+
+def neutral_pass_rate_of(stat: TeamStat | None) -> float:
+    """Situation-neutral pass rate for layer 2.
+
+    Prefer ``neutral_pass_rate`` and do not add PROE on top of it.
+    Else ``pass_rate - proe`` (strip the tendency the script will reapply).
+    Else ``pass_rate``, else league + PROE, else the league constant.
+    """
+    if stat is None:
+        return LEAGUE_NEUTRAL_PASS_RATE
+    if stat.neutral_pass_rate is not None:
+        return _clamp_rate(stat.neutral_pass_rate)
+    if stat.pass_rate is not None and stat.proe is not None:
+        return _clamp_rate(stat.pass_rate - stat.proe)
+    if stat.pass_rate is not None:
+        return _clamp_rate(stat.pass_rate)
+    if stat.proe is not None:
+        return _clamp_rate(LEAGUE_NEUTRAL_PASS_RATE + stat.proe)
+    return LEAGUE_NEUTRAL_PASS_RATE
+
+
+def scripted_pass_rate(neutral: float, margin: float) -> float:
+    """Trailing (negative margin) passes more. Leading runs more."""
+    return _clamp_rate(neutral + SCRIPT_PASS_PER_POINT * (-float(margin)))
+
+
+def mean_target_share(weeks: list[TargetWeek]) -> float:
+    """Average weekly share. ``targets / team_targets`` when share is blank."""
+    shares: list[float] = []
+    for week in weeks:
+        if week.target_share is not None:
+            shares.append(float(week.target_share))
+        elif week.team_targets and week.team_targets > 0:
+            shares.append(float(week.targets) / float(week.team_targets))
+    if not shares:
+        return 0.0
+    return sum(shares) / len(shares)
+
+
+def share_kappa(series: list[list[float]]) -> float:
+    """Method-of-moments Dirichlet concentration, median across players.
+
+    ``Var(s) = μ(1-μ)/(κ+1)`` so ``κ = μ(1-μ)/Var - 1``. One week (no
+    sample variance) uses ``DEFAULT_SHARE_KAPPA``.
+    """
+    found: list[float] = []
+    for shares in series:
+        if len(shares) < 2:
+            continue
+        mu = sum(shares) / len(shares)
+        var = sum((x - mu) ** 2 for x in shares) / (len(shares) - 1)
+        if var <= 1e-8 or mu <= 0.0 or mu >= 1.0:
+            continue
+        found.append(mu * (1.0 - mu) / var - 1.0)
+    if not found:
+        return DEFAULT_SHARE_KAPPA
+    found.sort()
+    mid = found[len(found) // 2]
+    return min(KAPPA_MAX, max(KAPPA_MIN, mid))
+
+
+def draw_simplex(
+    rng: random.Random,
+    means: list[float],
+    kappa: float,
+) -> list[float]:
+    """Dirichlet draw via independent gammas. ``means`` should sum to 1."""
+    if not means:
+        return []
+    total_mean = sum(means)
+    if total_mean <= 0:
+        even = 1.0 / len(means)
+        base = [even for _ in means]
+    else:
+        base = [m / total_mean for m in means]
+    alphas = [max(m, 1e-6) * max(kappa, KAPPA_MIN) for m in base]
+    gammas = [rng.gammavariate(a, 1.0) for a in alphas]
+    total = sum(gammas)
+    if total <= 0:
+        return base
+    return [g / total for g in gammas]
+
+
+def rush_share_means(
+    players: list[Player],
+    snap_means: dict[str, float | None],
+) -> tuple[dict[str, float], bool]:
+    """Normalized RB rush weights. Second value is True when any snaps exist.
+
+    No snaps → depth role weights (deterministic). Snaps → ``offense_pct``
+    for RBs that have it, depth weight for RBs that do not.
+    """
+    rbs = [p for p in players if (p.position or "").upper() == "RB"]
+    if not rbs:
+        return {}, False
+    raw: dict[str, float] = {}
+    any_snaps = False
+    for pl in rbs:
+        snap = snap_means.get(pl.pid)
+        if snap is not None and snap > 0:
+            any_snaps = True
+            raw[pl.pid] = float(snap)
+        else:
+            raw[pl.pid] = _rush_role_weight(pl)
+    total = sum(raw.values())
+    if total <= 0:
+        even = 1.0 / len(rbs)
+        return {pl.pid: even for pl in rbs}, any_snaps
+    return {pid: val / total for pid, val in raw.items()}, any_snaps
+
+
+def pearson(xs: list[float], ys: list[float]) -> float:
+    n = min(len(xs), len(ys))
+    if n < 3:
+        return 0.0
+    mx = sum(xs[:n]) / n
+    my = sum(ys[:n]) / n
+    num = sum((xs[i] - mx) * (ys[i] - my) for i in range(n))
+    dx = sum((xs[i] - mx) ** 2 for i in range(n))
+    dy = sum((ys[i] - my) ** 2 for i in range(n))
+    den = math.sqrt(dx * dy)
+    return 0.0 if den == 0 else num / den
+
+
+def format_sim_diagnostic(players: list[Player], game_sim: GameSim) -> str:
+    """Per-player p10/p50/p90 plus same-team QB–WR and WR–WR correlations."""
+    lines = ["player  pos team     p10    p50    p90"]
+    ordered = sorted(
+        players,
+        key=lambda p: (
+            (p.team or "").upper(),
+            (p.position or ""),
+            (p.name or "").lower(),
+            p.pid,
+        ),
+    )
+    for pl in ordered:
+        st = game_sim.by_pid.get(pl.pid)
+        if st is None:
+            continue
+        lines.append(
+            f"{pl.name}  {pl.position:<3} {(pl.team or ''):<5} "
+            f"{st.p10:7.2f} {st.p50:7.2f} {st.p90:7.2f}"
+        )
+    lines.append("")
+    lines.append(format_correlation_summary(players, game_sim))
+    return "\n".join(lines)
+
+
+def format_correlation_summary(
+    players: list[Player],
+    game_sim: GameSim,
+    *,
+    list_pairs: bool = True,
+) -> str:
+    """Same-team correlation block. QB–WR should be +, WR–WR should be −."""
+    pairs = _same_team_pairs(players, game_sim)
+    lines: list[str] = ["same-team correlations"]
+    if list_pairs:
+        for kind, a, b, r in pairs:
+            lines.append(f"  {kind}  {a} / {b}  r={r:+.3f}")
+    qb_wr = [r for kind, _a, _b, r in pairs if kind == "QB-WR"]
+    wr_wr = [r for kind, _a, _b, r in pairs if kind == "WR-WR"]
+    lines.append(
+        "QB–WR mean r = "
+        + (_fmt_mean(qb_wr))
+        + f"  (n={len(qb_wr)})"
+    )
+    lines.append(
+        "WR–WR mean r = "
+        + (_fmt_mean(wr_wr))
+        + f"  (n={len(wr_wr)})"
+    )
+    if game_sim.opportunity_teams:
+        teams = ", ".join(sorted(game_sim.opportunity_teams))
+        lines.append(f"opportunity shares on: {teams}")
+    else:
+        lines.append(
+            "opportunity shares off — no weekly target history; "
+            "role shares deterministic"
+        )
+    return "\n".join(lines)
+
+
+def _fmt_mean(xs: list[float]) -> str:
+    if not xs:
+        return "n/a"
+    return f"{sum(xs) / len(xs):+.3f}"
+
+
+def _same_team_pairs(
+    players: list[Player],
+    game_sim: GameSim,
+) -> list[tuple[str, str, str, float]]:
+    by_team: dict[str, list[Player]] = {}
+    for pl in players:
+        if pl.pid not in game_sim.draws:
+            continue
+        by_team.setdefault((pl.team or "").upper(), []).append(pl)
+    out: list[tuple[str, str, str, float]] = []
+    for team in sorted(by_team):
+        group = sorted(by_team[team], key=lambda p: p.pid)
+        qbs = [p for p in group if (p.position or "").upper() == "QB"]
+        wrs = [p for p in group if (p.position or "").upper() == "WR"]
+        for qb in qbs:
+            for wr in wrs:
+                r = pearson(
+                    list(game_sim.draws[qb.pid]),
+                    list(game_sim.draws[wr.pid]),
+                )
+                out.append(("QB-WR", qb.name or qb.pid, wr.name or wr.pid, r))
+        for i, a in enumerate(wrs):
+            for b in wrs[i + 1 :]:
+                r = pearson(
+                    list(game_sim.draws[a.pid]),
+                    list(game_sim.draws[b.pid]),
+                )
+                out.append(("WR-WR", a.name or a.pid, b.name or b.pid, r))
+    return out
+
+
+def _clamp_rate(rate: float) -> float:
+    return min(PASS_RATE_MAX, max(PASS_RATE_MIN, float(rate)))
+
+
+def _rush_role_weight(player: Player) -> float:
+    snap = expected_snap_share("RB", player.depth_rank)
+    return max(depth_prior(player.depth_rank) * max(snap, 0.05), 1e-3)
+
+
+def _teams_in(group: list[Player]) -> set[str]:
+    return {(p.team or "").upper() for p in group if (p.team or "").strip()}
+
+
+def _team_margin(
+    team: str,
+    home_pts: float,
+    away_pts: float,
+    away: str | None,
+    home: str | None,
+) -> float:
+    if home and team == home:
+        return home_pts - away_pts
+    if away and team == away:
+        return away_pts - home_pts
+    return 0.0
+
+
+def _layered_pids(
+    groups: dict[str, list[Player]],
+    opportunity: frozenset[str],
+    index: _HistoryIndex,
+) -> set[str]:
+    """Players scored by the efficiency model (QB + catchers with history)."""
+    pids: set[str] = set()
+    for group in groups.values():
+        for team in _teams_in(group):
+            if team not in opportunity:
+                continue
+            members = [p for p in group if (p.team or "").upper() == team]
+            pids.update(p.pid for p in _catchers(team, members, index))
+            pids.update(
+                p.pid
+                for p in members
+                if (p.position or "").upper() == "QB"
+            )
+    return pids
+
+
+def _catchers(
+    team: str,
+    group: list[Player],
+    index: _HistoryIndex,
+) -> list[Player]:
+    out: list[Player] = []
+    for pl in group:
+        if (pl.team or "").upper() != team:
+            continue
+        if (pl.position or "").upper() not in {"WR", "TE", "RB"}:
+            continue
+        if mean_target_share(index.target_weeks(pl)) > 0:
+            out.append(pl)
+    return out
+
+
+def _weekly_shares(weeks: list[TargetWeek]) -> list[float]:
+    shares: list[float] = []
+    for week in weeks:
+        if week.target_share is not None:
+            shares.append(float(week.target_share))
+        elif week.team_targets and week.team_targets > 0:
+            shares.append(float(week.targets) / float(week.team_targets))
+    return shares
+
+
+def _draw_team_opportunities(
+    rng: random.Random,
+    team_players: list[Player],
+    margin: float,
+    index: _HistoryIndex,
+) -> dict[str, OpportunityCount]:
+    """Plays, scripted pass rate, joint shares. Empty if no target history.
+
+    RNG order (stable): one plays gaussian, then target-share gammas in
+    pid order (plus an "other" bucket), then rush-share gammas in pid
+    order only when some RB has snaps.
+    """
+    if not team_players:
+        return {}
+    team = (team_players[0].team or "").upper()
+    catchers = _catchers(team, team_players, index)
+    if not catchers:
+        return {}
+    plays = _gauss_floor(rng, LEAGUE_PLAYS, PLAYS_SIGMA, PLAYS_FLOOR)
+    neutral = neutral_pass_rate_of(index.offense(team))
+    pass_rate = scripted_pass_rate(neutral, margin)
+    pass_attempts = plays * pass_rate
+    rush_attempts = plays * (1.0 - pass_rate)
+    team_targets = pass_attempts * index.targets_per_attempt(team)
+
+    means = [mean_target_share(index.target_weeks(pl)) for pl in catchers]
+    series = [_weekly_shares(index.target_weeks(pl)) for pl in catchers]
+    kappa = share_kappa(series)
+    mean_sum = sum(means)
+    if mean_sum > 1.0:
+        means = [m / mean_sum for m in means]
+        other = 0.0
+    else:
+        other = 1.0 - mean_sum
+    simplex_means = list(means)
+    if other > 1e-6:
+        simplex_means.append(other)
+    drawn = draw_simplex(rng, simplex_means, kappa)
+    target_share = {pl.pid: drawn[i] for i, pl in enumerate(catchers)}
+
+    rbs = [pl for pl in catchers if (pl.position or "").upper() == "RB"]
+    snap_means = {pl.pid: index.snap_mean(pl) for pl in rbs}
+    rush_means, any_snaps = rush_share_means(rbs, snap_means)
+    if any_snaps and rbs:
+        ordered = [pl.pid for pl in rbs]
+        rush_drawn = draw_simplex(
+            rng,
+            [rush_means[pid] for pid in ordered],
+            kappa,
+        )
+        rush_share = {pid: rush_drawn[i] for i, pid in enumerate(ordered)}
+    else:
+        rush_share = rush_means
+
+    qb_rushes = rush_attempts * QB_RUSH_SHARE
+    rb_pool = rush_attempts * (1.0 - QB_RUSH_SHARE)
+    out: dict[str, OpportunityCount] = {}
+    for pl in catchers:
+        rushes = 0.0
+        if pl.pid in rush_share:
+            rushes = rb_pool * rush_share[pl.pid]
+        out[pl.pid] = OpportunityCount(
+            targets=team_targets * target_share[pl.pid],
+            rushes=rushes,
+        )
+    for pl in team_players:
+        if (pl.position or "").upper() != "QB":
+            continue
+        out[pl.pid] = OpportunityCount(
+            pass_attempts=pass_attempts,
+            rushes=qb_rushes,
+        )
+    return out
+
+
+class _HistoryIndex:
+    """Join weekly rows onto the pool. Name key is match_key + team."""
+
+    def __init__(self, inputs: SimInputs) -> None:
+        self.inputs = inputs
+        self._tgt_pid: dict[str, list[TargetWeek]] = {}
+        self._tgt_name: dict[tuple[str, str], list[TargetWeek]] = {}
+        self._snap_pid: dict[str, list[SnapWeek]] = {}
+        self._snap_name: dict[tuple[str, str], list[SnapWeek]] = {}
+        for row in inputs.targets:
+            self._tgt_name.setdefault(
+                (row.team_fd, match_key(row.player_name)), []
+            ).append(row)
+            if row.player_id:
+                self._tgt_pid.setdefault(row.player_id, []).append(row)
+            if row.gsis_id:
+                self._tgt_pid.setdefault(row.gsis_id, []).append(row)
+        for row in inputs.snaps:
+            self._snap_name.setdefault(
+                (row.team_fd, match_key(row.player_name)), []
+            ).append(row)
+            if row.player_id:
+                self._snap_pid.setdefault(row.player_id, []).append(row)
+            if row.gsis_id:
+                self._snap_pid.setdefault(row.gsis_id, []).append(row)
+
+    def target_weeks(self, player: Player) -> list[TargetWeek]:
+        hit = self._tgt_pid.get(player.pid)
+        if hit:
+            return hit
+        return list(
+            self._tgt_name.get(
+                ((player.team or "").upper(), match_key(player.name)),
+                [],
+            )
+        )
+
+    def snap_weeks(self, player: Player) -> list[SnapWeek]:
+        hit = self._snap_pid.get(player.pid)
+        if hit:
+            return hit
+        return list(
+            self._snap_name.get(
+                ((player.team or "").upper(), match_key(player.name)),
+                [],
+            )
+        )
+
+    def snap_mean(self, player: Player) -> float | None:
+        vals = [
+            float(w.offense_pct)
+            for w in self.snap_weeks(player)
+            if w.offense_pct is not None and w.offense_pct > 0
+        ]
+        if not vals:
+            return None
+        return sum(vals) / len(vals)
+
+    def offense(self, team: str) -> TeamStat | None:
+        rows = [
+            r
+            for r in self.inputs.team_stats
+            if r.team_fd == team.upper() and r.is_offense
+        ]
+        if not rows:
+            return None
+        rows.sort(key=lambda r: (-(r.n or 0), r.side))
+        return rows[0]
+
+    def defense(self, team: str) -> TeamStat | None:
+        rows = [
+            r
+            for r in self.inputs.team_stats
+            if r.team_fd == team.upper() and r.is_defense
+        ]
+        if not rows:
+            return None
+        rows.sort(key=lambda r: (-(r.n or 0), r.side))
+        return rows[0]
+
+    def scoring_var(self, team: str, opponent: str | None) -> float | None:
+        """Mean of this team's offensive EPA var and the opponent's defensive var."""
+        parts: list[float] = []
+        off = self.offense(team)
+        if off is not None and off.epa_variance() is not None:
+            parts.append(float(off.epa_variance()))
+        if opponent:
+            de = self.defense(opponent)
+            if de is not None and de.epa_variance() is not None:
+                parts.append(float(de.epa_variance()))
+        if not parts:
+            return None
+        return sum(parts) / len(parts)
+
+    def targets_per_attempt(self, team: str) -> float:
+        by_week: dict[int, float] = {}
+        for row in self.inputs.targets:
+            if row.team_fd != team.upper():
+                continue
+            if not row.team_targets or not row.team_pass_attempts:
+                continue
+            if row.team_pass_attempts <= 0:
+                continue
+            by_week[row.week] = float(row.team_targets) / float(row.team_pass_attempts)
+        if not by_week:
+            return DEFAULT_TARGETS_PER_ATTEMPT
+        return sum(by_week.values()) / len(by_week)
 
 
 def _percentile(sorted_xs: list[float], p: float) -> float:

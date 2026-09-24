@@ -88,9 +88,12 @@ from nfl.sim import (  # noqa: E402
     ILP_OBJECTIVES,
     SIM_OBJECTIVES,
     apply_ilp_objective,
+    format_correlation_summary,
+    format_sim_diagnostic,
     sim_header,
     simulate_games,
 )
+from nfl.sim_inputs import SimInputError, load_sim_inputs  # noqa: E402
 from nfl.slate_status import build_slate_status, format_slate_status  # noqa: E402
 from nfl.solver import Infeasible, Lineup, solve_many  # noqa: E402
 from nfl.snaps import (  # noqa: E402
@@ -392,6 +395,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=DEFAULT_SEED,
         help="RNG seed for --sim (default 1)",
+    )
+    ap.add_argument(
+        "--sim-inputs",
+        default=None,
+        metavar="PATH",
+        help="JSON {team_stats, targets, snaps} for the layered sim. "
+        "No network. Omit to keep deterministic role shares. "
+        "Used only when a sim runs.",
     )
     ap.add_argument(
         "--objective",
@@ -908,8 +919,25 @@ def main(argv: list[str] | None = None) -> int:
     game_sim = None
     if sim_n > 0:
         print(sim_header(sim_n), file=sys.stderr)
-        game_sim = simulate_games(pool, n=sim_n, seed=args.sim_seed)
+        sim_inputs = None
+        if args.sim_inputs:
+            try:
+                sim_inputs = load_sim_inputs(args.sim_inputs)
+            except SimInputError as e:
+                emit("SIM_INPUTS", str(e))
+                payload["status"] = "error"
+                stamp(payload, "SIM_INPUTS", str(e))
+                _write_payload(payload, args)
+                return 1
+        game_sim = simulate_games(
+            pool, n=sim_n, seed=args.sim_seed, inputs=sim_inputs
+        )
         sim_by_pid = game_sim.by_pid
+        payload["sim_diagnostic"] = format_sim_diagnostic(pool, game_sim)
+        print(
+            format_correlation_summary(pool, game_sim, list_pairs=False),
+            file=sys.stderr,
+        )
     board_mode = None
     board_rows: list[dict] = []
     if args.board:

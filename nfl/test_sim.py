@@ -1,10 +1,12 @@
-"""Structural game Monte Carlo FD-point draws (Vegas total+spread)."""
+"""Layered game Monte Carlo FD-point draws (total+spread, script, shares)."""
 
 from __future__ import annotations
 
 import io
+import random
 import unittest
 from contextlib import redirect_stderr
+from pathlib import Path
 
 from nfl.optimize import _sim_n, parse_args
 from nfl.players import Player
@@ -12,9 +14,19 @@ from nfl.projections import POS_FD_SHARE, projection_board, prop_factor, week1_s
 from nfl.rules import DST_SACK_TO_PRIOR, FANDUEL_NFL, dst_projection
 from nfl.sim import (
     DEFAULT_DRAWS,
+    SPREAD_SIGMA,
+    TOTAL_SIGMA_FRAC,
     apply_ilp_objective,
+    draw_simplex,
+    format_sim_diagnostic,
+    game_sigmas,
     has_volume_props,
     model_point,
+    neutral_pass_rate_of,
+    pearson,
+    rush_share_means,
+    scripted_pass_rate,
+    share_kappa,
     sim_header,
     simulate_games,
     simulate_player,
@@ -23,6 +35,13 @@ from nfl.sim import (
     yardage_bonuses,
     _props_draw,
     _score_world,
+)
+from nfl.sim_inputs import (
+    SimInputs,
+    TeamStat,
+    load_sim_inputs,
+    sim_inputs_from_records,
+    team_stat_from_row,
 )
 
 
@@ -71,8 +90,9 @@ class HeaderTest(unittest.TestCase):
         text = sim_header(10000)
         self.assertEqual(
             text,
-            "sim 10000 game draws — one world per game (Vegas total+spread); "
-            "teammates share it. Not a PBP copula.",
+            "sim 10000 layered draws — game total+spread "
+            "(EPA dispersion when team stats exist), volume/script, "
+            "opportunity shares. Teammates share the world. Not a PBP copula.",
         )
 
 
@@ -90,6 +110,11 @@ class FlagsTest(unittest.TestCase):
         self.assertEqual(seed.sim_seed, 7)
         default_seed = parse_args(["--csv", "x.csv"])
         self.assertEqual(default_seed.sim_seed, 1)
+        self.assertIsNone(default_seed.sim_inputs)
+        loaded = parse_args(
+            ["--csv", "x.csv", "--sim-inputs", "nfl/testdata/sim_layers.json"]
+        )
+        self.assertEqual(loaded.sim_inputs, "nfl/testdata/sim_layers.json")
 
     def test_objective_flag_default_mean(self):
         off = parse_args(["--csv", "x.csv"])
@@ -676,6 +701,355 @@ class GameBonusTest(unittest.TestCase):
             if yds >= 100.0 - 1e-9 and abs(team_if_bonus * share + bonus - pts) < 1e-6:
                 fired += 1
         self.assertGreater(fired, 0)
+
+
+FIXTURE = Path(__file__).resolve().parent / "testdata" / "sim_layers.json"
+
+
+def _std(xs: list[float]) -> float:
+    n = len(xs)
+    mu = sum(xs) / n
+    return (sum((x - mu) ** 2 for x in xs) / (n - 1)) ** 0.5
+
+
+class LayerInputTest(unittest.TestCase):
+    def test_pooled_epa_var_uses_sums_over_precomputed(self):
+        stat = TeamStat(
+            team_fd="DET",
+            side="offense",
+            n=5,
+            epa_sum=10.0,
+            epa_sq_sum=30.0,
+            epa_var=99.0,
+        )
+        # (30 - 10^2/5) / 4 = 2.5
+        self.assertAlmostEqual(stat.epa_variance(), 2.5, places=6)
+
+    def test_epa_var_field_when_sums_missing(self):
+        stat = TeamStat(team_fd="DET", side="offense", epa_var=1.44, n=1)
+        self.assertAlmostEqual(stat.epa_variance(), 1.44, places=6)
+
+    def test_pass_rush_blend_when_overall_missing(self):
+        # pass var = (200 - 0) / 99
+        stat = TeamStat(
+            team_fd="DET",
+            side="offense",
+            pass_n=100,
+            pass_epa_sum=0.0,
+            pass_epa_sq_sum=200.0,
+            rush_n=50,
+            rush_epa_var=4.0,
+        )
+        pass_var = 200.0 / 99.0
+        want = (100 * pass_var + 50 * 4.0) / 150.0
+        self.assertAlmostEqual(stat.epa_variance(), want, places=6)
+
+    def test_missing_variance_keeps_fallback_sigmas(self):
+        total_sigma, spread_sigma = game_sigmas(50.0, None, None)
+        self.assertAlmostEqual(total_sigma, TOTAL_SIGMA_FRAC * 50.0, places=6)
+        self.assertAlmostEqual(spread_sigma, SPREAD_SIGMA, places=6)
+
+    def test_percent_rates_are_scaled(self):
+        stat = team_stat_from_row(
+            {"team_fd": "DET", "side": "offense", "pass_rate": 58, "proe": 3}
+        )
+        assert stat is not None
+        self.assertAlmostEqual(stat.pass_rate, 0.58, places=6)
+        self.assertAlmostEqual(stat.proe, 0.03, places=6)
+
+    def test_neutral_rate_does_not_stack_proe(self):
+        both = TeamStat(
+            team_fd="DET",
+            neutral_pass_rate=0.58,
+            proe=0.10,
+            pass_rate=0.70,
+        )
+        self.assertAlmostEqual(neutral_pass_rate_of(both), 0.58, places=6)
+        stripped = TeamStat(team_fd="DET", pass_rate=0.64, proe=0.04)
+        self.assertAlmostEqual(neutral_pass_rate_of(stripped), 0.60, places=6)
+        self.assertAlmostEqual(neutral_pass_rate_of(None), 0.57, places=6)
+
+    def test_trailing_teams_pass_more(self):
+        neutral = 0.58
+        trailing = scripted_pass_rate(neutral, margin=-14.0)
+        leading = scripted_pass_rate(neutral, margin=14.0)
+        self.assertGreater(trailing, neutral)
+        self.assertLess(leading, neutral)
+        self.assertAlmostEqual(trailing, 0.748, places=3)
+        self.assertAlmostEqual(leading, 0.412, places=3)
+
+    def test_dirichlet_shares_sum_to_one_and_compete(self):
+        rng = random.Random(1)
+        one = draw_simplex(rng, [0.4, 0.35, 0.25], 12.0)
+        self.assertAlmostEqual(sum(one), 1.0, places=6)
+        s1: list[float] = []
+        s2: list[float] = []
+        rng = random.Random(2)
+        for _ in range(400):
+            drawn = draw_simplex(rng, [0.4, 0.4, 0.2], 8.0)
+            s1.append(drawn[0])
+            s2.append(drawn[1])
+        self.assertLess(pearson(s1, s2), -0.2)
+
+    def test_rush_share_without_snaps_is_deterministic_weights(self):
+        rb1 = _pl(pid="rb1", name="RB1", position="RB", depth_rank=1)
+        rb2 = _pl(pid="rb2", name="RB2", position="RB", depth_rank=2)
+        means, any_snaps = rush_share_means(
+            [rb1, rb2], {"rb1": None, "rb2": None}
+        )
+        self.assertFalse(any_snaps)
+        self.assertAlmostEqual(sum(means.values()), 1.0, places=6)
+        self.assertGreater(means["rb1"], means["rb2"])
+        again, _flag = rush_share_means([rb1, rb2], {})
+        self.assertEqual(means, again)
+
+    def test_rush_share_uses_offense_pct_when_present(self):
+        rb1 = _pl(pid="rb1", name="RB1", position="RB", depth_rank=1)
+        rb2 = _pl(pid="rb2", name="RB2", position="RB", depth_rank=1)
+        means, any_snaps = rush_share_means(
+            [rb1, rb2], {"rb1": 0.75, "rb2": 0.25}
+        )
+        self.assertTrue(any_snaps)
+        self.assertAlmostEqual(means["rb1"], 0.75, places=6)
+        self.assertAlmostEqual(means["rb2"], 0.25, places=6)
+
+
+class LayerSimTest(unittest.TestCase):
+    def test_empty_inputs_match_no_inputs(self):
+        qb = _pl(pid="qb", name="QB", position="QB", total=50.0, spread=-6.0)
+        wr = _pl(pid="wr", name="WR", position="WR", total=50.0, spread=-6.0)
+        bare = simulate_games([qb, wr], n=300, seed=4)
+        empty = simulate_games([qb, wr], n=300, seed=4, inputs=SimInputs())
+        self.assertEqual(bare.draws, empty.draws)
+        self.assertEqual(empty.opportunity_teams, frozenset())
+        text = format_sim_diagnostic([qb, wr], bare)
+        self.assertIn("role shares deterministic", text)
+        self.assertIn(qb.name, text)
+        self.assertIn("p10", text.splitlines()[0])
+
+    def test_higher_epa_variance_widens_skill_draws(self):
+        wr = _pl(
+            pid="wr",
+            name="Walk On WR",
+            position="WR",
+            team="DET",
+            opponent="NO",
+            game="NO@DET",
+            implied_total=24.0,
+            total=48.0,
+            spread=0.0,
+        )
+        low = SimInputs(
+            team_stats=(TeamStat(team_fd="DET", side="offense", epa_var=0.25),)
+        )
+        high = SimInputs(
+            team_stats=(TeamStat(team_fd="DET", side="offense", epa_var=4.0),)
+        )
+        a = simulate_games([wr], n=2500, seed=1, inputs=low)
+        b = simulate_games([wr], n=2500, seed=1, inputs=high)
+        self.assertGreater(_std(list(b.draws["wr"])), _std(list(a.draws["wr"])) * 1.3)
+        self.assertEqual(a.opportunity_teams, frozenset())
+
+    def test_fixture_catchers_correlate_and_diagnostic_prints(self):
+        inputs = load_sim_inputs(FIXTURE)
+        self.assertEqual(inputs.snaps, ())
+        self.assertGreater(len(inputs.targets), 0)
+        self.assertGreater(len(inputs.team_stats), 0)
+        qb = _pl(
+            pid="qb",
+            name="Jared Goff",
+            position="QB",
+            team="DET",
+            opponent="NO",
+            game="NO@DET",
+            implied_total=28.0,
+            implied_opp=22.0,
+            total=50.0,
+            spread=-6.0,
+            salary=8000,
+        )
+        wr1 = _pl(
+            pid="wr1",
+            name="Amon-Ra St. Brown",
+            position="WR",
+            team="DET",
+            opponent="NO",
+            game="NO@DET",
+            implied_total=28.0,
+            total=50.0,
+            spread=-6.0,
+            depth_rank=1,
+        )
+        wr2 = _pl(
+            pid="wr2",
+            name="Jameson Williams",
+            position="WR",
+            team="DET",
+            opponent="NO",
+            game="NO@DET",
+            implied_total=28.0,
+            total=50.0,
+            spread=-6.0,
+            depth_rank=2,
+        )
+        rb = _pl(
+            pid="rb",
+            name="Jahmyr Gibbs",
+            position="RB",
+            team="DET",
+            opponent="NO",
+            game="NO@DET",
+            implied_total=28.0,
+            total=50.0,
+            spread=-6.0,
+            depth_rank=1,
+        )
+        pool = [qb, wr1, wr2, rb]
+        gs = simulate_games(pool, n=3000, seed=1, inputs=inputs)
+        rev = simulate_games(list(reversed(pool)), n=3000, seed=1, inputs=inputs)
+        self.assertEqual(gs.draws["wr1"], rev.draws["wr1"])
+        self.assertEqual(gs.opportunity_teams, frozenset({"DET"}))
+        self.assertEqual(gs.by_pid["qb"].source, "game")
+        self.assertEqual(gs.by_pid["wr1"].source, "game")
+        text = format_sim_diagnostic(pool, gs)
+        self.assertIn("Amon-Ra St. Brown", text)
+        self.assertIn("Jameson Williams", text)
+        self.assertIn("Jared Goff", text)
+        self.assertIn("p10", text.splitlines()[0])
+        self.assertIn("p50", text.splitlines()[0])
+        self.assertIn("p90", text.splitlines()[0])
+        self.assertIn("QB–WR mean r", text)
+        self.assertIn("WR–WR mean r", text)
+        self.assertIn("opportunity shares on: DET", text)
+        for pl in pool:
+            st = gs.by_pid[pl.pid]
+            self.assertLess(st.p10, st.p50)
+            self.assertLess(st.p50, st.p90)
+        self.assertGreater(pearson(list(gs.draws["qb"]), list(gs.draws["wr1"])), 0.15)
+        self.assertGreater(pearson(list(gs.draws["qb"]), list(gs.draws["wr2"])), 0.15)
+        self.assertLess(pearson(list(gs.draws["wr1"]), list(gs.draws["wr2"])), -0.05)
+        want = [p.objective for p in pool]
+        mean_pool = apply_ilp_objective(pool, "mean", sim_by_pid=gs.by_pid)
+        self.assertEqual([p.objective for p in mean_pool], want)
+        floor_pool = apply_ilp_objective(pool, "floor", sim_by_pid=gs.by_pid)
+        self.assertAlmostEqual(floor_pool[0].objective, gs.by_pid["qb"].p10, places=6)
+
+    def test_kappa_from_fixture_weeks(self):
+        inputs = load_sim_inputs(FIXTURE)
+        series = []
+        for name in ("Amon-Ra St. Brown", "Jameson Williams"):
+            series.append(
+                [
+                    float(row.target_share)
+                    for row in inputs.targets
+                    if row.player_name == name and row.target_share is not None
+                ]
+            )
+        kappa = share_kappa(series)
+        self.assertGreater(kappa, 2.0)
+        self.assertLess(kappa, 20.0)
+
+    def test_unmatched_history_stays_on_role_share(self):
+        inputs = load_sim_inputs(FIXTURE)
+        qb = _pl(pid="qb", name="Nobody QB", position="QB", total=50.0, spread=-6.0)
+        wr = _pl(pid="wr", name="Nobody WR", position="WR", total=50.0, spread=-6.0)
+        bare = simulate_games([qb, wr], n=200, seed=1)
+        named = simulate_games([qb, wr], n=200, seed=1, inputs=inputs)
+        # Team stats still scale dispersion, so draws need not match.
+        # No name hit → no Dirichlet, teammates stay lockstep.
+        self.assertEqual(named.opportunity_teams, frozenset())
+        self.assertGreater(
+            pearson(list(named.draws["qb"]), list(named.draws["wr"])), 0.9
+        )
+        self.assertGreater(
+            pearson(list(bare.draws["qb"]), list(bare.draws["wr"])), 0.9
+        )
+
+    def test_snaps_shift_rb_rush_score(self):
+        def weeks(name: str, share: float, snaps: float) -> tuple[list[dict], list[dict]]:
+            tgt = []
+            snap = []
+            for week in (1, 2, 3):
+                tgt.append(
+                    {
+                        "season": 2025,
+                        "week": week,
+                        "position": "RB",
+                        "player_name": name,
+                        "team_fd": "DET",
+                        "targets": 4,
+                        "target_share": share,
+                        "team_targets": 32,
+                        "team_pass_attempts": 34,
+                    }
+                )
+                snap.append(
+                    {
+                        "season": 2025,
+                        "week": week,
+                        "position": "RB",
+                        "player_name": name,
+                        "team_fd": "DET",
+                        "offense_pct": snaps,
+                    }
+                )
+            return tgt, snap
+
+        t1, s1 = weeks("Lead Back", 0.12, 80)
+        t2, s2 = weeks("Change Back", 0.12, 20)
+        inputs = sim_inputs_from_records(
+            team_stats=[
+                {
+                    "team_fd": "DET",
+                    "side": "offense",
+                    "neutral_pass_rate": 0.52,
+                    "n": 200,
+                    "epa_sum": 20,
+                    "epa_sq_sum": 280,
+                }
+            ],
+            targets=t1 + t2,
+            snaps=s1 + s2,
+        )
+        self.assertAlmostEqual(inputs.snaps[0].offense_pct, 0.80, places=6)
+        lead = _pl(
+            pid="lead",
+            name="Lead Back",
+            position="RB",
+            depth_rank=1,
+            team="DET",
+            game="NO@DET",
+            total=46.0,
+            spread=0.0,
+            implied_total=23.0,
+        )
+        change = _pl(
+            pid="change",
+            name="Change Back",
+            position="RB",
+            depth_rank=2,
+            team="DET",
+            game="NO@DET",
+            total=46.0,
+            spread=0.0,
+            implied_total=23.0,
+        )
+        gs = simulate_games([lead, change], n=400, seed=1, inputs=inputs)
+        self.assertGreater(gs.by_pid["lead"].mean, gs.by_pid["change"].mean)
+
+    def test_sim_modules_do_not_fetch(self):
+        import inspect
+
+        import nfl.sim as sim
+        import nfl.sim_efficiency as eff
+        import nfl.sim_inputs as inputs
+
+        for mod in (sim, eff, inputs):
+            src = inspect.getsource(mod)
+            self.assertNotIn("http_json", src)
+            self.assertNotIn("supabase", src)
+            self.assertNotIn("urllib", src)
+            self.assertNotIn("requests.", src)
 
 
 if __name__ == "__main__":

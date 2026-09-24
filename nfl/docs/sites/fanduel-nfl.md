@@ -163,7 +163,7 @@ Independent `week1_score` stays the **printed Proj**. The ILP objective adds a h
 
 Product binaries: `bonus ≤ x_qb`, `bonus ≤ x_wr`. RB/DST do not get the premium (Hampton rushing is not Herbert pass volume). Displayed picker Proj remains `week1_score` — do not lie on the board. Notes: `stack premium on`.
 
-This is **not** a full game copula / PBP copula / SaberSim. Do not fake a cash-150 ceiling. `--sim` is a structural game draw (Vegas total+spread; teammates share the world).
+This is **not** a full game copula / PBP copula / SaberSim. Do not fake a cash-150 ceiling. `--sim` is a layered game draw (Vegas total+spread, scripted volume, joint opportunity shares). Layers and inputs: [`../data/sim.md`](../data/sim.md). The ILP `mean` objective stays `week1_score`.
 
 Helpers:
 
@@ -185,7 +185,7 @@ Helpers:
 
 Randy’s 2025-ish FanDuel NFL classic **cash ~150** FD points. `--cash-line=150` is a house reporting line, **not** a FanDuel contest rule and **not** an ILP constraint. Do not fake cash-150.
 
-`--sim` is a structural **game draw**: one Vegas total+spread world per game; teammates share it; DST PA is opponent points in that world; yardage bonuses fire on yards scaled by `team_pts / implied`. Not SaberSim and not a PBP copula. When `--sim` ran, JSON + stderr report:
+`--sim` is a layered **game draw**: one world per game. Layer 1 draws the Vegas total and home spread (team EPA variance widens or tightens that draw when `--sim-inputs` has team stats). Layer 2 draws team plays and a pass/rush split that shifts with the margin. Layer 3 draws joint target shares, and RB rush shares when snap history is present. With no weekly target history, skill players keep the deterministic role share and yardage bonuses still fire on yards scaled by `team_pts / implied`. DST PA is opponent points in that world. Not SaberSim and not a PBP copula. Full layer notes: [`../data/sim.md`](../data/sim.md). When `--sim` ran, JSON `sim_diagnostic` plus stderr report percentiles and same-team correlations, and the lineup fields are:
 
 | Field | Meaning |
 |-------|---------|

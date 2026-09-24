@@ -45,6 +45,7 @@ Skill pointer: `.cursor/skills/optimize-nfl-classic/references/sources.md`.
 | `SNAPS_SOURCE` | unknown `--snaps-source` | `nfl/snaps.py` | — | **stop** | `lineups` or `gangstash` |
 | `SNAPS_JOIN` | team code ↔ FanDuel abbrev (Lineups refresh or gangstash `team_fd`) | `nfl/snaps.py`, `nfl/teams.py` | — | **stop** on unmapped **team**; unmatched **names** print on stderr / JSON `snaps`, not fatal | add the abbrev to `TEAMS`; do not invent player aliases |
 | `UPLOAD_CSV` | FanDuel upload write/validate | `nfl/upload.py` | contest `FanDuel-NFL-*-entries-upload-template.csv` (or legacy QB-first lineup-upload) in `nfl/data/` | **stop** | omit `--upload` / `--n-lineups=1`; pass `template=` |
+| `SIM_INPUTS` | `--sim-inputs` JSON missing or not `{team_stats, targets, snaps}` | `nfl/sim_inputs.py` | local file only — the sim does not fetch | **stop** | omit `--sim-inputs` (deterministic role shares) |
 
 ## Deferred (not wired this pass)
 
