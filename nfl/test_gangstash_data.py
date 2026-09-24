@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stderr
 from datetime import date
 from pathlib import Path
 from unittest.mock import patch
@@ -239,6 +241,68 @@ class TargetWindowTest(unittest.TestCase):
                 ]
             )
         self.assertIn("team_targets", str(ctx.exception))
+
+    def test_null_player_name_rows_are_skipped_and_counted(self) -> None:
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            rows = aggregate_target_window(
+                [
+                    {
+                        "player_name": "A.J. Brown",
+                        "team_fd": "PHI",
+                        "position": "WR",
+                        "week": 1,
+                        "targets": 8,
+                        "team_targets": 30,
+                        "target_share": 8 / 30,
+                    },
+                    {
+                        "player_name": None,
+                        "team_fd": "NYG",
+                        "position": "WR",
+                        "week": 1,
+                        "targets": 4,
+                        "team_targets": 30,
+                        "gsis_id": None,
+                        "player_id": None,
+                    },
+                    {
+                        "team_fd": "DAL",
+                        "position": "TE",
+                        "week": 1,
+                        "targets": 2,
+                        "team_targets": 20,
+                    },
+                ]
+            )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["player_name"], "A.J. Brown")
+        self.assertAlmostEqual(rows[0]["target_share"], 8 / 30)
+        self.assertIn(
+            "gangstash targets skipped 2 rows with null player_name",
+            buf.getvalue(),
+        )
+
+    def test_empty_targets_response_is_fatal(self) -> None:
+        with self.assertRaises(GangstashDataError) as ctx:
+            aggregate_target_window([])
+        self.assertIn("empty", str(ctx.exception))
+
+    def test_missing_player_name_column_is_fatal(self) -> None:
+        with self.assertRaises(GangstashDataError) as ctx:
+            aggregate_target_window(
+                [
+                    {
+                        "team_fd": "PHI",
+                        "position": "WR",
+                        "week": 1,
+                        "targets": 8,
+                        "team_targets": 30,
+                    }
+                ]
+            )
+        self.assertIn("player_name", str(ctx.exception))
+        self.assertIn("absent", str(ctx.exception))
 
     def test_lineups_source_does_not_call_gangstash(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -518,6 +582,72 @@ class DepthSourceTest(unittest.TestCase):
             with self.assertRaises(GangstashDepthError) as ctx:
                 ingest_slate_depth({"PHI"}, source="gangstash")
         self.assertIn("pos_rank", str(ctx.exception))
+        self.assertIn("absent", str(ctx.exception))
+
+    def test_null_identity_rows_are_skipped_and_counted(self) -> None:
+        raw = [
+            {
+                "player_name": "A.J. Brown",
+                "team_fd": "PHI",
+                "team": "PHI",
+                "pos_grp": "3WR 1TE",
+                "pos_abb": "WR",
+                "pos_rank": 1,
+            },
+            {
+                "team": "NYG",
+                "team_fd": "NYG",
+                "pos_grp": "3WR 1TE",
+                "pos_abb": "TE",
+                "pos_rank": 3,
+                "player_name": None,
+                "gsis_id": None,
+                "player_id": None,
+                "espn_id": "2531358",
+            },
+            {
+                "team": "LAR",
+                "team_fd": "LAR",
+                "pos_grp": "Base 4-3 D",
+                "pos_abb": "DE",
+                "pos_rank": 1,
+                "player_name": None,
+                "gsis_id": None,
+                "player_id": None,
+            },
+            {
+                "team": "LAR",
+                "team_fd": "LAR",
+                "pos_grp": "Base 4-3 D",
+                "pos_abb": "LB",
+                "pos_rank": None,
+                "player_name": None,
+            },
+            {
+                "player_name": "Saquon Barkley",
+                "team_fd": None,
+                "pos_grp": "3WR 1TE",
+                "pos_abb": "RB",
+                "pos_rank": 1,
+            },
+        ]
+        buf = io.StringIO()
+        with patch("nfl.depth.fetch_depth_charts", return_value=(raw, {})), redirect_stderr(
+            buf
+        ):
+            rows = ingest_slate_depth({"PHI"}, source="gangstash")
+        self.assertEqual([r.name for r in rows], ["A.J. Brown"])
+        self.assertIn(
+            "gangstash depth_charts skipped 4 rows with null player_name, "
+            "team_fd, pos_abb, or pos_rank",
+            buf.getvalue(),
+        )
+
+    def test_empty_depth_response_is_fatal(self) -> None:
+        with patch("nfl.depth.fetch_depth_charts", return_value=([], {})):
+            with self.assertRaises(GangstashDepthError) as ctx:
+                ingest_slate_depth({"PHI"}, source="gangstash")
+        self.assertIn("empty", str(ctx.exception))
 
     def test_ourlads_source_does_not_call_gangstash(self) -> None:
         with patch("nfl.depth.ingest_ourlads_depth", return_value=[]) as ol, patch(

@@ -99,7 +99,9 @@ Over `--targets-weeks`, or over every week returned when neither
 are labeled with the max week so the existing single-week join keeps them.
 Unmatched slate RB/WR/TE stay `target_share` empty (usage factor 1.0). The
 join report is the same `joined` / `unmatched_lineups` /
-`unmatched_slate_rb_wr_te` block.
+`unmatched_slate_rb_wr_te` block. A row with a null or empty `player_name`
+is skipped. One stderr line reports how many were skipped. An empty payload,
+or a payload with no `player_name` column, is `TARGETS_GANGSTASH`.
 
 **`game_lines`:** `game_id`, `season`, `week`, `commence_time`,
 `home_team_fd`, `away_team_fd`, `spread` (home line; negative = home
@@ -116,8 +118,12 @@ dropped when `commence_time` is present. A missing slate game is
 `3WR 1TE` and drops the same player in other groups. `pos_rank` is the
 depth rank across that position (WR2 = `pos_abb` `WR`, `pos_rank` 2; WR
 ranks run 1–8). Non-skill `pos_abb` values are skipped. A duplicate player
-keeps the best (lowest) `pos_rank`. A slate team with no skill rows is
-`DEPTH_GANGSTASH` (stop). `--skip-depth` still leaves the unlisted prior.
+keeps the best (lowest) `pos_rank`. A row with a null `player_name`,
+`team_fd`, `pos_abb`, or `pos_rank` (an ESPN id that did not match) is
+skipped. One stderr line reports how many were skipped. An empty payload, or
+a payload missing those columns, is `DEPTH_GANGSTASH` (stop). A slate team
+with no skill rows is the same choke. `--skip-depth` still leaves the
+unlisted prior.
 
 **`team_stats` / `team_stats_weekly`:** rows are cached raw and are not
 read by `week1_score`. Season rows include `team`, `team_fd`, `side`,
@@ -134,9 +140,9 @@ read by `week1_score`. Season rows include `team`, `team_fd`, `side`,
 | `LINES_GANGSTASH_KEY` | `--lines-source=gangstash`, no key, no cache | **stop** |
 | `LINES_GANGSTASH` | lines HTTP (including 400/401), truncated board past the cap, bad fields, missing slate game | **stop** |
 | `TARGETS_GANGSTASH_KEY` | `--targets-source=gangstash`, no key, no cache | **degrade** — usage 1.0 |
-| `TARGETS_GANGSTASH` | targets HTTP, truncated board past the cap, or bad fields | **stop** |
+| `TARGETS_GANGSTASH` | targets HTTP, truncated board past the cap, empty payload, or missing `player_name` column | **stop** |
 | `TARGETS_JOIN` | unmapped `team_fd` | **stop** |
-| `DEPTH_GANGSTASH` | `--depth-source=gangstash` HTTP, truncated, bad fields, or slate team missing | **stop** |
+| `DEPTH_GANGSTASH` | `--depth-source=gangstash` HTTP, truncated, empty payload, missing columns, or slate team missing | **stop** |
 | `TEAM_STATS_GANGSTASH_KEY` | team-stats CLI, no key, no cache | **stop** (CLI only) |
 | `TEAM_STATS_GANGSTASH` | team-stats CLI HTTP or truncated board | **stop** (CLI only) |
 

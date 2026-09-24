@@ -85,21 +85,39 @@ def fetch_targets(
     )
 
 
+def _columns_present(rows: list, keys: tuple[str, ...]) -> bool:
+    """True when at least one row carries every named column (schema present)."""
+    for row in rows:
+        if isinstance(row, dict) and all(key in row for key in keys):
+            return True
+    return False
+
+
+def _warn_skipped(dataset: str, skipped: int, reason: str) -> None:
+    if skipped < 1:
+        return
+    noun = "row" if skipped == 1 else "rows"
+    print(
+        f"gangstash {dataset} skipped {skipped} {noun} with {reason}",
+        file=sys.stderr,
+    )
+
+
 def parse_target_row(row: dict) -> dict | None:
-    """One player-week. None when position is not RB/WR/TE.
+    """One player-week. None when position is not RB/WR/TE or the name is blank.
 
     Live fields: season, week, position, player_name, team_fd, targets,
     target_share, air_yards_share, wopr, receptions, rec_yards, team_targets,
     team_pass_attempts, gsis_id, player_id. No targets_total or targets_avg.
+    A null `player_name` is an unmatched id, not a schema break. Callers count
+    those rows. An empty payload or a missing `player_name` column is fatal
+    in `aggregate_target_window`.
     """
     if not isinstance(row, dict):
         return None
     name = _str(row.get("player_name"))
     if not name:
-        raise GangstashDataError(
-            "gangstash targets row missing player_name "
-            f"(keys {sorted(row)})"
-        )
+        return None
     team_raw = _str(row.get("team_fd"))
     if not team_raw:
         raise GangstashDataError(f"gangstash targets row missing team_fd for {name}")
@@ -145,10 +163,18 @@ def aggregate_target_window(
     the existing single-week join keeps the whole window. A single week with
     no `team_targets` falls back to that row's `target_share`.
     """
+    if not rows:
+        raise GangstashDataError("gangstash targets response is empty")
+    if not _columns_present(rows, ("player_name",)):
+        raise GangstashDataError("gangstash targets columns absent: player_name")
     want = set(weeks) if weeks else None
     by_week: dict[tuple, dict] = {}
     order: list[tuple] = []
+    skipped = 0
     for row in rows:
+        if isinstance(row, dict) and not _str(row.get("player_name")):
+            skipped += 1
+            continue
         item = parse_target_row(row)
         if item is None:
             continue
@@ -174,6 +200,7 @@ def aggregate_target_window(
             groups[gkey] = []
             group_order.append(gkey)
         groups[gkey].append(item)
+    _warn_skipped("targets", skipped, "null player_name")
     if not groups:
         return []
 
@@ -323,7 +350,9 @@ def parse_depth_slot(row: dict) -> GangstashDepthSlot | None:
     Live fields: team, team_fd, pos_grp, pos_abb, pos_name, pos_slot, pos_rank,
     player_name, gsis_id, espn_id, player_id, snapshot_at.
     `pos_rank` is the depth rank (WR2 = pos_abb WR, pos_rank 2). Rank does
-    not reset inside an alignment.
+    not reset inside an alignment. A null `player_name`, `team_fd`,
+    `pos_abb`, or `pos_rank` returns None. `map_depth_slots` counts those
+    rows and chokes only on an empty payload or missing columns.
     """
     if not isinstance(row, dict):
         return None
@@ -334,13 +363,8 @@ def parse_depth_slot(row: dict) -> GangstashDepthSlot | None:
     team_raw = _str(row.get("team_fd"))
     pos = _str(row.get("pos_abb")).upper()
     rank_raw = row.get("pos_rank")
-    if not name and not team_raw and not pos and rank_raw is None:
+    if not name or not team_raw or not pos or rank_raw is None or rank_raw == "":
         return None
-    if not name or not team_raw or not pos or rank_raw is None:
-        raise GangstashDataError(
-            "gangstash depth_charts row missing player_name, team_fd, pos_abb, "
-            f"or pos_rank (keys {sorted(row)})"
-        )
     rank = _int(rank_raw)
     if rank is None or rank < 1:
         raise GangstashDataError(f"gangstash pos_rank {rank_raw!r} for {name}")
@@ -351,6 +375,54 @@ def parse_depth_slot(row: dict) -> GangstashDepthSlot | None:
         rank=rank,
         player_name=name,
     )
+
+
+_DEPTH_COLUMNS = ("player_name", "team_fd", "pos_abb", "pos_rank")
+
+
+def _depth_row_gap(row: dict) -> bool:
+    """Null identity on one chart row (unmatched ESPN id), not a schema break."""
+    if not _str(row.get("player_name")):
+        return True
+    if not _str(row.get("team_fd")):
+        return True
+    if not _str(row.get("pos_abb")):
+        return True
+    rank = row.get("pos_rank")
+    return rank is None or rank == ""
+
+
+def map_depth_slots(rows: list) -> list[GangstashDepthSlot]:
+    """Base-offense slots. Null identity rows are skipped and counted once.
+
+    Chokes when `rows` is empty or no row carries `player_name`, `team_fd`,
+    `pos_abb`, and `pos_rank` (the columns are absent). A null value on an
+    otherwise present column is a skipped row.
+    """
+    if not rows:
+        raise GangstashDataError("gangstash depth_charts response is empty")
+    if not _columns_present(rows, _DEPTH_COLUMNS):
+        raise GangstashDataError(
+            "gangstash depth_charts columns absent: "
+            "player_name, team_fd, pos_abb, pos_rank"
+        )
+    skipped = 0
+    out: list[GangstashDepthSlot] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if _depth_row_gap(row):
+            skipped += 1
+            continue
+        slot = parse_depth_slot(row)
+        if slot is not None:
+            out.append(slot)
+    _warn_skipped(
+        "depth_charts",
+        skipped,
+        "null player_name, team_fd, pos_abb, or pos_rank",
+    )
+    return out
 
 
 def fetch_depth_charts(

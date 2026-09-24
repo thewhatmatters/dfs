@@ -18,7 +18,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 
 from nfl.gangstash import GangstashDataError, GangstashDataKeyMissing, GangstashTruncated
-from nfl.gangstash_data import fetch_depth_charts, parse_depth_slot
+from nfl.gangstash_data import fetch_depth_charts, map_depth_slots
 from nfl.http import HttpError, http_json
 from nfl.names import match_key
 from nfl.ourlads import (
@@ -209,15 +209,13 @@ def ingest_gangstash_slate_depth(
 
     fetched_at = datetime.now(timezone.utc).isoformat()
     src = "https://vmzgpslqoeuqmdchdekm.supabase.co/functions/v1/data?dataset=depth_charts"
+    try:
+        slots = map_depth_slots(raw)
+    except GangstashDataError as e:
+        raise GangstashDepthError(str(e)) from e
     rows: list[DepthRow] = []
     seen: set[str] = set()
-    for item in raw:
-        try:
-            slot = parse_depth_slot(item)
-        except GangstashDataError as e:
-            raise GangstashDepthError(str(e)) from e
-        if slot is None:
-            continue
+    for slot in slots:
         if slot.team_fd not in canon:
             continue
         pos = skill_pos(slot.position)
