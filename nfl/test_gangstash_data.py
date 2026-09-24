@@ -22,8 +22,10 @@ from nfl.gangstash import (
 )
 from nfl.http import HttpAuthError, HttpError
 from nfl.gangstash_data import (
+    aggregate_snap_window,
     aggregate_target_window,
     fetch_game_lines,
+    fetch_snaps,
     fetch_targets,
     fetch_team_stats,
     fetch_team_stats_weekly,
@@ -31,7 +33,8 @@ from nfl.gangstash_data import (
 )
 from nfl.http import HttpError
 from nfl.lines import ingest_slate_lines
-from nfl.optimize import parse_args
+from nfl.optimize import _gangstash_snaps_weeks, parse_args
+from nfl.snaps import _pct, attach_snaps, load_optimizer_snaps
 from nfl.players import Player
 from nfl.projections import week1_score
 from nfl.targets import attach_targets, load_optimizer_targets
@@ -412,6 +415,251 @@ class TargetWindowTest(unittest.TestCase):
         self.assertNotIn("secret-key", calls[0])
 
 
+class SnapWindowTest(unittest.TestCase):
+    def test_offense_pct_matches_lineups_fraction(self) -> None:
+        rows = aggregate_snap_window(
+            [
+                {
+                    "season": 2026,
+                    "week": 2,
+                    "position": "RB",
+                    "player_name": "Jonathan Taylor",
+                    "team_fd": "IND",
+                    "offense_snaps": 61,
+                    "offense_pct": 0.94,
+                    "gsis_id": "00-0036223",
+                    "player_id": "taylor",
+                    "opponent": "GB",
+                    "game_id": "2026_02_GB_IND",
+                    "defense_snaps": 0,
+                    "st_snaps": 4,
+                }
+            ]
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["snaps"], 61)
+        self.assertAlmostEqual(rows[0]["snap_share"], 0.94)
+        self.assertAlmostEqual(rows[0]["snap_share"], _pct(94))
+        scored = week1_score(30.0, 1, "RB", snap_share=rows[0]["snap_share"])
+        self.assertAlmostEqual(scored, week1_score(30.0, 1, "RB", snap_share=_pct(94)))
+        self.assertNotAlmostEqual(
+            scored, week1_score(30.0, 1, "RB", snap_share=0.94 / 100)
+        )
+
+    def test_window_share_is_sum_of_snaps_over_team_snaps(self) -> None:
+        rows = aggregate_snap_window(
+            [
+                {
+                    "player_name": "Jonathan Taylor",
+                    "team_fd": "IND",
+                    "position": "RB",
+                    "week": 1,
+                    "offense_snaps": 48,
+                    "offense_pct": 0.80,
+                },
+                {
+                    "player_name": "Jonathan Taylor",
+                    "team_fd": "IND",
+                    "position": "RB",
+                    "week": 2,
+                    "offense_snaps": 10,
+                    "offense_pct": 0.50,
+                },
+            ]
+        )
+        self.assertEqual(rows[0]["week"], 2)
+        self.assertEqual(rows[0]["snaps"], 58)
+        self.assertAlmostEqual(rows[0]["snap_share"], 58 / 80)
+        self.assertNotAlmostEqual(rows[0]["snap_share"], (0.80 + 0.50) / 2)
+
+    def test_jax_maps_to_fanduel_jac_and_qb_is_dropped(self) -> None:
+        rows = aggregate_snap_window(
+            [
+                {
+                    "player_name": "Travis Etienne",
+                    "team_fd": "JAX",
+                    "position": "RB",
+                    "week": 1,
+                    "offense_snaps": 30,
+                    "offense_pct": 0.55,
+                },
+                {
+                    "player_name": "Trevor Lawrence",
+                    "team_fd": "JAC",
+                    "position": "QB",
+                    "week": 1,
+                    "offense_snaps": 70,
+                    "offense_pct": 1.0,
+                },
+            ]
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["team_fd"], "JAC")
+        self.assertEqual(rows[0]["position"], "RB")
+
+    def test_null_identity_rows_are_skipped_and_counted(self) -> None:
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            rows = aggregate_snap_window(
+                [
+                    {
+                        "player_name": "Jonathan Taylor",
+                        "team_fd": "IND",
+                        "position": "RB",
+                        "week": 2,
+                        "offense_snaps": 61,
+                        "offense_pct": 0.94,
+                    },
+                    {
+                        "player_name": None,
+                        "team_fd": "LV",
+                        "position": "WR",
+                        "week": 1,
+                        "offense_snaps": 12,
+                        "offense_pct": 0.2,
+                        "gsis_id": None,
+                        "player_id": None,
+                    },
+                    {
+                        "player_name": "Cody White",
+                        "team_fd": None,
+                        "position": "WR",
+                        "week": 1,
+                        "offense_snaps": 8,
+                        "offense_pct": 0.15,
+                    },
+                    {
+                        "player_name": "Other",
+                        "team_fd": "PHI",
+                        "position": "WR",
+                        "week": 1,
+                        "offense_snaps": 10,
+                        "offense_pct": None,
+                    },
+                ]
+            )
+        self.assertEqual([r["player_name"] for r in rows], ["Jonathan Taylor"])
+        self.assertIn(
+            "gangstash snaps skipped 3 rows with null player_name, team_fd, or offense_pct",
+            buf.getvalue(),
+        )
+
+    def test_empty_snaps_response_is_fatal(self) -> None:
+        with self.assertRaises(GangstashDataError) as ctx:
+            aggregate_snap_window([])
+        self.assertIn("empty", str(ctx.exception))
+
+    def test_missing_offense_pct_column_is_fatal(self) -> None:
+        with self.assertRaises(GangstashDataError) as ctx:
+            aggregate_snap_window(
+                [
+                    {
+                        "player_name": "Jonathan Taylor",
+                        "team_fd": "IND",
+                        "position": "RB",
+                        "week": 2,
+                        "offense_snaps": 61,
+                    }
+                ]
+            )
+        self.assertIn("offense_pct", str(ctx.exception))
+        self.assertIn("absent", str(ctx.exception))
+
+    def test_lineups_source_does_not_call_gangstash(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "snaps.csv"
+            path.write_text(
+                "player,team,position,week,snaps,snap_share,snaps_avg,snaps_total,team_snap_pct,source,asof\n"
+                "Jonathan Taylor,IND,RB,2,61,0.94,61,61,0.94,lineups,2026-09-16\n",
+                encoding="utf-8",
+            )
+            with patch("nfl.snaps.fetch_snaps") as fetch:
+                rows, meta = load_optimizer_snaps(
+                    source="lineups",
+                    csv_path=path,
+                    week=2,
+                    weeks=[1, 2],
+                    season=2026,
+                )
+            fetch.assert_not_called()
+        self.assertEqual(meta["source"], "lineups")
+        self.assertAlmostEqual(rows[0].snap_share, 0.94)
+
+    def test_gangstash_source_joins_fraction_and_leaves_unmatched_empty(self) -> None:
+        payload = [
+            {
+                "player_name": "Jonathan Taylor",
+                "team_fd": "IND",
+                "position": "RB",
+                "week": 2,
+                "offense_snaps": 61,
+                "offense_pct": 0.94,
+                "gsis_id": None,
+                "player_id": None,
+            },
+            {
+                "player_name": "Cody White",
+                "team_fd": "LV",
+                "position": "WR",
+                "week": 1,
+                "offense_snaps": 20,
+                "offense_pct": 0.31,
+                "gsis_id": None,
+                "player_id": None,
+            },
+        ]
+        with patch(
+            "nfl.snaps.fetch_snaps",
+            return_value=(payload, {"cache": "c", "cache_stale": False, "live": True}),
+        ) as fetch:
+            rows, meta = load_optimizer_snaps(
+                source="gangstash",
+                csv_path=Path("unused.csv"),
+                week=None,
+                weeks=None,
+                season=2026,
+            )
+        fetch.assert_called_once()
+        self.assertIsNone(fetch.call_args.kwargs["weeks"])
+        self.assertEqual(meta["join_week"], 2)
+        pool = [
+            _pl(name="Jonathan Taylor", team="IND", position="RB", pid="jt"),
+            _pl(name="Chase Brown", team="CIN", position="RB", pid="cb"),
+            _pl(name="Cody White", team="LV", position="WR", pid="cw"),
+        ]
+        attached, stats = attach_snaps(pool, rows, week=meta["join_week"])
+        by_name = {p.name: p for p in attached}
+        self.assertAlmostEqual(by_name["Jonathan Taylor"].snap_share or 0, 0.94)
+        self.assertEqual(by_name["Jonathan Taylor"].snaps, 61)
+        self.assertEqual(by_name["Jonathan Taylor"].snaps_status, "joined")
+        self.assertAlmostEqual(
+            by_name["Jonathan Taylor"].objective or 0,
+            week1_score(30.0, 1, "RB", snap_share=0.94),
+        )
+        self.assertIsNone(by_name["Chase Brown"].snap_share)
+        self.assertEqual(by_name["Chase Brown"].snaps_status, "unmatched")
+        self.assertAlmostEqual(by_name["Cody White"].snap_share or 0, 0.31)
+        self.assertEqual(stats["joined"], 2)
+
+    def test_snaps_request_keeps_week_commas(self) -> None:
+        calls: list[str] = []
+
+        def fake_http(url, headers=None, timeout=30):
+            calls.append(url)
+            return {"data": [], "truncated": False}, {}
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "nfl.gangstash.DATA_CACHE_DIR", Path(tmp)
+        ), patch("nfl.gangstash.envmod.get", side_effect=_env_get), patch(
+            "nfl.gangstash.http_json", side_effect=fake_http
+        ):
+            fetch_snaps(season=2026, weeks=[1, 2], refresh=True, cache_day=date(2026, 9, 24))
+        self.assertIn("dataset=snaps", calls[0])
+        self.assertIn("season=2026", calls[0])
+        self.assertIn("week=1,2", calls[0])
+        self.assertNotIn("secret-key", calls[0])
+
+
 class GameLinesTest(unittest.TestCase):
     def test_flat_moneylines_and_home_spread(self) -> None:
         row = parse_game_line(
@@ -712,9 +960,18 @@ class FlagDefaultTest(unittest.TestCase):
         self.assertEqual(args.lines_source, "oddsapi")
         self.assertEqual(args.targets_source, "lineups")
         self.assertEqual(args.depth_source, "ourlads")
+        self.assertEqual(args.snaps_source, "lineups")
         self.assertIsNone(args.targets_weeks)
         self.assertIsNone(args.targets_week)
+        self.assertIsNone(args.snaps_weeks)
         self.assertFalse(args.refresh_targets)
+        self.assertFalse(args.refresh_snaps)
+
+    def test_snaps_window_follows_targets_when_unset(self) -> None:
+        self.assertEqual(_gangstash_snaps_weeks("gangstash", None, [1, 2]), [1, 2])
+        self.assertIsNone(_gangstash_snaps_weeks("gangstash", None, None))
+        self.assertEqual(_gangstash_snaps_weeks("gangstash", [2], [1, 2]), [2])
+        self.assertIsNone(_gangstash_snaps_weeks("lineups", None, [1, 2]))
 
     def test_week_list_parses(self) -> None:
         args = parse_args(
@@ -874,6 +1131,50 @@ class LiveSmokeTest(unittest.TestCase):
             ):
                 self.assertIn(key, game)
             self.assertNotIn("moneylines", game)
+
+            snaps, smeta = fetch_dataset(
+                "snaps",
+                {"season": "2026", "week": "1,2"},
+                refresh=True,
+                cache_root=root,
+                cache_day=date.today(),
+            )
+            self.assertTrue(smeta["live"])
+            self.assertFalse(smeta["truncated"])
+            self.assertEqual(len(snaps), 2994)
+            counts: dict[str, int] = {}
+            taylor = None
+            for row in snaps:
+                for key in (
+                    "season",
+                    "week",
+                    "position",
+                    "player_name",
+                    "team_fd",
+                    "offense_snaps",
+                    "offense_pct",
+                    "gsis_id",
+                    "player_id",
+                    "opponent",
+                    "game_id",
+                    "defense_snaps",
+                    "st_snaps",
+                ):
+                    self.assertIn(key, row)
+                pos = row.get("position")
+                counts[pos] = counts.get(pos, 0) + 1
+                if row.get("offense_pct") is not None:
+                    self.assertLessEqual(float(row["offense_pct"]), 1)
+                    self.assertGreaterEqual(float(row["offense_pct"]), 0)
+                if row.get("player_name") == "Jonathan Taylor" and row.get("week") == 2:
+                    taylor = row
+            self.assertEqual(counts.get("RB"), 185)
+            self.assertEqual(counts.get("WR"), 335)
+            self.assertEqual(counts.get("TE"), 220)
+            self.assertIsNotNone(taylor)
+            assert taylor is not None
+            self.assertEqual(taylor["offense_snaps"], 61)
+            self.assertAlmostEqual(float(taylor["offense_pct"]), 0.94)
 
 
 if __name__ == "__main__":

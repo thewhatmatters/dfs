@@ -255,6 +255,206 @@ def aggregate_target_window(
     return out
 
 
+def fetch_snaps(
+    *,
+    season: int,
+    weeks: list[int] | None = None,
+    position: str | None = None,
+    team: str | None = None,
+    refresh: bool = False,
+    cache_day: date | None = None,
+) -> tuple[list[dict], dict]:
+    """`dataset=snaps`. `season` is required. `week` is a comma list when set."""
+    if int(season) < 1:
+        raise GangstashDataError("gangstash snaps requires season")
+    params: dict[str, str] = {"season": str(int(season))}
+    if weeks:
+        params["week"] = ",".join(str(int(w)) for w in weeks)
+    if position:
+        params["position"] = position.strip().upper()
+    if team:
+        params["team"] = team.strip().upper()
+    return fetch_dataset(
+        dataset_id("snaps"),
+        params,
+        refresh=refresh,
+        cache_day=cache_day,
+    )
+
+
+def parse_snap_row(row: dict) -> dict | None:
+    """One player-week. None when position is not RB/WR/TE or identity is blank.
+
+    Live fields: season, week, position, player_name, team_fd, offense_snaps,
+    offense_pct (0–1 fraction, same scale as Lineups snap_share), gsis_id,
+    player_id, opponent, game_id, defense_snaps, st_snaps.
+    A null player_name, team_fd, or offense_pct is skipped by
+    `aggregate_snap_window`. Join stays name + team; ids are kept, not matched.
+    """
+    if not isinstance(row, dict):
+        return None
+    name = _str(row.get("player_name"))
+    if not name:
+        return None
+    team_raw = _str(row.get("team_fd"))
+    if not team_raw:
+        return None
+    pct = _float(row.get("offense_pct"))
+    if pct is None:
+        return None
+    pos = _str(row.get("position")).upper()
+    if not pos:
+        raise GangstashDataError(f"gangstash snaps row missing position for {name}")
+    if pos not in TARGET_POSITIONS:
+        return None
+    if pct < 0 or pct > 1:
+        raise GangstashDataError(
+            f"gangstash snaps offense_pct {pct} for {name} is outside 0-1 "
+            "(expected a fraction, same scale as Lineups snap_share)"
+        )
+    week = _int(row.get("week"))
+    if week is None or week < 1:
+        raise GangstashDataError(f"gangstash snaps row missing week for {name}")
+    snaps = _int(row.get("offense_snaps"))
+    if snaps is None:
+        raise GangstashDataError(f"gangstash snaps row missing offense_snaps for {name}")
+    team = require_fd(team_raw)
+    return {
+        "player_name": name,
+        "team_fd": team.fd,
+        "position": pos,
+        "week": week,
+        "season": _int(row.get("season")),
+        "offense_snaps": snaps,
+        "offense_pct": pct,
+        "gsis_id": _str(row.get("gsis_id")) or None,
+        "player_id": _str(row.get("player_id")) or None,
+    }
+
+
+def _snap_row_gap(row: dict) -> bool:
+    if not _str(row.get("player_name")):
+        return True
+    if not _str(row.get("team_fd")):
+        return True
+    pct = row.get("offense_pct")
+    return pct is None or pct == ""
+
+
+def _window_snap_share(items: list[dict]) -> float:
+    """sum(offense_snaps) / sum(team offense snaps).
+
+    Team snaps for a week are offense_snaps / offense_pct. One week therefore
+    returns offense_pct unchanged (already a 0–1 fraction).
+    """
+    snaps = sum(int(i["offense_snaps"]) for i in items)
+    denom = 0.0
+    for item in items:
+        pct = float(item["offense_pct"])
+        played = int(item["offense_snaps"])
+        if pct > 0:
+            denom += played / pct
+        elif played == 0:
+            continue
+        else:
+            raise GangstashDataError(
+                "gangstash snaps offense_pct is 0 with offense_snaps "
+                f"{played} for {item['player_name']}"
+            )
+    if denom > 0:
+        return snaps / denom
+    return float(items[-1]["offense_pct"])
+
+
+def aggregate_snap_window(
+    rows: list[dict],
+    *,
+    weeks: list[int] | None = None,
+) -> list[dict]:
+    """One row per player. `snap_share` is the window offense-snap fraction.
+
+    Every output row uses the same `week` label (max week in the window) so
+    the existing single-week join keeps the whole window.
+    """
+    if not rows:
+        raise GangstashDataError("gangstash snaps response is empty")
+    if not _columns_present(rows, ("player_name", "team_fd", "offense_pct")):
+        raise GangstashDataError(
+            "gangstash snaps columns absent: player_name, team_fd, offense_pct"
+        )
+    want = set(weeks) if weeks else None
+    by_week: dict[tuple, dict] = {}
+    order: list[tuple] = []
+    skipped = 0
+    for row in rows:
+        if isinstance(row, dict) and _snap_row_gap(row):
+            skipped += 1
+            continue
+        item = parse_snap_row(row)
+        if item is None:
+            continue
+        if want is not None and item["week"] not in want:
+            continue
+        key = (
+            item["team_fd"],
+            match_key(item["player_name"]),
+            item["position"],
+            item["week"],
+        )
+        if key in by_week:
+            continue
+        by_week[key] = item
+        order.append(key)
+
+    groups: dict[tuple, list[dict]] = {}
+    group_order: list[tuple] = []
+    for key in order:
+        item = by_week[key]
+        gkey = key[:3]
+        if gkey not in groups:
+            groups[gkey] = []
+            group_order.append(gkey)
+        groups[gkey].append(item)
+    _warn_skipped(
+        "snaps",
+        skipped,
+        "null player_name, team_fd, or offense_pct",
+    )
+    if not groups:
+        return []
+
+    label = max(item["week"] for item in by_week.values())
+    out: list[dict] = []
+    for gkey in group_order:
+        items = groups[gkey]
+
+        def _keep(key: str) -> str | None:
+            found = None
+            for item in items:
+                if item.get(key):
+                    found = item[key]
+            return found
+
+        snap_sum = sum(int(i["offense_snaps"]) for i in items)
+        n_weeks = len(items)
+        out.append(
+            {
+                "player_name": items[0]["player_name"],
+                "team_fd": items[0]["team_fd"],
+                "position": items[0]["position"],
+                "week": label,
+                "weeks": [int(i["week"]) for i in items],
+                "snaps": snap_sum,
+                "snap_share": _window_snap_share(items),
+                "snaps_avg": snap_sum / n_weeks,
+                "snaps_total": snap_sum,
+                "gsis_id": _keep("gsis_id"),
+                "player_id": _keep("player_id"),
+            }
+        )
+    return out
+
+
 @dataclass(frozen=True)
 class GangstashGameLine:
     """Home spread is negative when home is favored (same sign as Odds API)."""

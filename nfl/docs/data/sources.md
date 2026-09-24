@@ -39,7 +39,10 @@ Skill pointer: `.cursor/skills/optimize-nfl-classic/references/sources.md`.
 | `TARGETS_JOIN` | team code ↔ FanDuel abbrev (Lineups refresh or gangstash `team_fd`) | `nfl/targets.py`, `nfl/teams.py` | — | **stop** on unmapped **team**; unmatched **names** print on stderr / JSON `targets`, not fatal | add the abbrev to `TEAMS`; do not invent player aliases (week-1 BAL: Devontez Walker is absent — see [`targets.md`](targets.md)) |
 | `SNAPS_LINEUPS` | Lineups.com RB/WR/TE snap-count pages (public HTML + SSR JSON) | `nfl/snaps.py` | grant: [`lineups-authorization.md`](lineups-authorization.md) | **stop** | omit snaps refresh |
 | `SNAPS_CSV` | local `nfl/data/snaps.csv` (or `--snaps-csv`) missing/empty/bad | `nfl/snaps.py` | none — produced by `python3 -m nfl.snaps --refresh` | **degrade** — RB usage uses targets or 1.0 | `--skip-snaps` |
-| `SNAPS_JOIN` | Lineups full team name ↔ FanDuel abbrev (snaps refresh) | `nfl/snaps.py`, `nfl/teams.py` | — | **stop** on unmapped **team**; unmatched **names** print on stderr / JSON `snaps`, not fatal | add Odds full name to `TEAMS`; do not invent player aliases |
+| `SNAPS_GANGSTASH_KEY` | `--snaps-source=gangstash` and no key / no cache | `nfl/snaps.py`, `nfl/gangstash.py` | `GANGSTASH_API_KEY` | **degrade** — RB usage uses targets or 1.0 | `--skip-snaps` or `--snaps-source=lineups` |
+| `SNAPS_GANGSTASH` | gangstash `dataset=snaps` HTTP, truncated board, empty payload, or missing columns | `nfl/gangstash_data.py`, `nfl/snaps.py` | cache `nfl/data/gangstash-data/` | **stop** | `--snaps-source=lineups` |
+| `SNAPS_SOURCE` | unknown `--snaps-source` | `nfl/snaps.py` | — | **stop** | `lineups` or `gangstash` |
+| `SNAPS_JOIN` | team code ↔ FanDuel abbrev (Lineups refresh or gangstash `team_fd`) | `nfl/snaps.py`, `nfl/teams.py` | — | **stop** on unmapped **team**; unmatched **names** print on stderr / JSON `snaps`, not fatal | add the abbrev to `TEAMS`; do not invent player aliases |
 | `UPLOAD_CSV` | FanDuel upload write/validate | `nfl/upload.py` | contest `FanDuel-NFL-*-entries-upload-template.csv` (or legacy QB-first lineup-upload) in `nfl/data/` | **stop** | omit `--upload` / `--n-lineups=1`; pass `template=` |
 
 ## Deferred (not wired this pass)
@@ -58,7 +61,7 @@ Do not scrape FanDuel. Do not `--refresh-props` unless asked (refetches the Gang
 ## Stop vs degrade (quick)
 
 - **Must have to score the slate:** CSV, lines key + fetch + join. Default lines key is `ODDS_API_KEY` (`LINES_KEY`). `--lines-source=gangstash` uses `GANGSTASH_API_KEY` (`LINES_GANGSTASH_KEY`).
-- **May skip:** ESPN injuries (`--skip-injuries`), OurLads depth (`--skip-depth`), Lineups RB/WR/TE targets (`--skip-targets`, missing CSV, or gangstash targets with no key and no cache), Lineups snaps (`--skip-snaps` or missing CSV), props (`--skip-props` or missing Gangstash key and no cache).
+- **May skip:** ESPN injuries (`--skip-injuries`), OurLads depth (`--skip-depth`), Lineups RB/WR/TE targets (`--skip-targets`, missing CSV, or gangstash targets with no key and no cache), snaps (`--skip-snaps`, missing CSV, or gangstash snaps with no key and no cache), props (`--skip-props` or missing Gangstash key and no cache).
 - **Optional depth:** `--depth-source=espn` (`DEPTH_ESPN`; often 403) or `--depth-source=gangstash` (`DEPTH_GANGSTASH`). Default remains OurLads.
 
 Depth: [`ourlads-depth.md`](ourlads-depth.md).
@@ -90,6 +93,6 @@ python3 -m nfl.snaps --refresh
 
 Targets: RB + WR + TE public pages → `nfl/data/targets.csv`. Cache: `nfl/data/lineups-targets/`. Formula: [`targets.md`](targets.md).
 
-Snaps: RB + WR + TE public pages → `nfl/data/snaps.csv`. Cache: `nfl/data/lineups-snaps/`. RB snap_share is the rush-role tilt; WR/TE snaps load for later and do not stack on targets. Formula: [`snaps.md`](snaps.md).
+Snaps: RB + WR + TE public pages → `nfl/data/snaps.csv`. Cache: `nfl/data/lineups-snaps/`. RB snap_share is the rush-role tilt; WR/TE snaps load for later and do not stack on targets. Formula: [`snaps.md`](snaps.md). Optional `--snaps-source=gangstash` uses the same 0–1 share from `dataset=snaps`.
 
 Grant: [`lineups-authorization.md`](lineups-authorization.md). Missing CSV degrades (`TARGETS_CSV` / `SNAPS_CSV`); name gaps are reported, not a stop.

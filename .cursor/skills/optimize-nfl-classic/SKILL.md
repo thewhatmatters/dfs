@@ -63,9 +63,12 @@ Repo-root `scripts/optimize.py` is the **NCAAF** shim — do not use it here.
 | `--targets-week=N` | join that week (lineups default: latest week in the CSV) |
 | `--targets-weeks=1,2` | gangstash window only |
 | `--refresh-targets` | refetch gangstash targets (not the Lineups scrape) |
-| `--skip-snaps` | skip Lineups snap join (RB usage uses targets or 1.0) |
+| `--skip-snaps` | skip snap join (RB usage uses targets or 1.0) |
+| `--snaps-source=lineups\|gangstash` | default **lineups** CSV. `gangstash` `offense_pct` is the 0–1 `snap_share` |
 | `--snaps-csv=PATH` | Lineups `snaps.csv` (default `nfl/data/snaps.csv`) |
-| `--snaps-week=N` | join that week (default: latest week in the CSV) |
+| `--snaps-week=N` | Lineups join week (default: latest week in the CSV) |
+| `--snaps-weeks=1,2` | gangstash window; if omitted, uses `--targets-weeks` or every week returned |
+| `--refresh-snaps` | refetch gangstash snaps (not the Lineups scrape) |
 | `--skip-props` | skip Gangstash player props |
 | `--refresh-props` | refetch Gangstash props — do not unless asked |
 | `--exclude-questionable` | drop CSV Q; IR/NA already dropped |

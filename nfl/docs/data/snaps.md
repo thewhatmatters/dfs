@@ -27,10 +27,18 @@ with `metric:"snaps"`. Row fields: `name`, `team` (full name), `position`,
 
 ## Optimizer join
 
-`python3 -m nfl.optimize` loads the **latest week** in that CSV (or
-`--snaps-week=N`) and joins RB/WR/TE pool players via `nfl.names.match_key`.
-No invented aliases. `--snaps-csv PATH` overrides the default file.
-`--skip-snaps` leaves snap fields empty (RB usage then uses targets or 1.0).
+Default source is this CSV (`--snaps-source=lineups`). `python3 -m nfl.optimize`
+loads the **latest week** in that CSV (or `--snaps-week=N`) and joins RB/WR/TE
+pool players via `nfl.names.match_key`. No invented aliases. `--snaps-csv PATH`
+overrides the default file. `--skip-snaps` leaves snap fields empty (RB usage
+then uses targets or 1.0).
+
+`--snaps-source=gangstash` reads `dataset=snaps` instead of this CSV.
+`offense_pct` is already a 0–1 fraction (Lineups stores `weeksPct / 100` as
+the same `snap_share`). A window (`--snaps-weeks 1,2`, or `--targets-weeks`
+when snaps weeks are omitted, or every week returned) collapses to
+`sum(offense_snaps) / sum(offense_snaps / offense_pct)`. See
+[`gangstash.md`](gangstash.md).
 
 Name mismatches are **not fatal**. Stderr + JSON `snaps` report:
 
@@ -91,4 +99,5 @@ python3 -m nfl.snaps --refresh
 python3 -m nfl.optimize --csv "nfl/data/<players-list>.csv"
 python3 -m nfl.optimize --csv "nfl/data/<players-list>.csv" --skip-snaps
 python3 -m nfl.optimize --csv "nfl/data/<players-list>.csv" --snaps-week=1
+python3 -m nfl.optimize --csv "nfl/data/<players-list>.csv" --snaps-source=gangstash --snaps-weeks=1,2
 ```

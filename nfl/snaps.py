@@ -26,6 +26,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from nfl.gangstash_data import aggregate_snap_window, fetch_snaps
 from nfl.lineups import LineupsError, extract_ssr_payload, fetch_metric_payload
 from nfl.names import match_key
 from nfl.players import Player
@@ -401,8 +402,9 @@ def print_snaps_gaps(stats: dict[str, Any]) -> None:
         f"unmatched_slate_rb_wr_te {len(unmatched_sl)}",
         file=sys.stderr,
     )
+    feed = "gangstash" if stats.get("source") == "gangstash" else "Lineups"
     if unmatched_lu:
-        print(f"unmatched Lineups snaps ({len(unmatched_lu)}):", file=sys.stderr)
+        print(f"unmatched {feed} snaps ({len(unmatched_lu)}):", file=sys.stderr)
         for row in unmatched_lu:
             print(
                 f"  {row.get('player')} ({row.get('team')} {row.get('position')})",
@@ -475,6 +477,66 @@ def refresh_snaps(
         "rb_rows": len(rb_rows),
         "wr_rows": len(wr_rows),
         "te_rows": len(te_rows),
+    }
+
+
+def load_optimizer_snaps(
+    *,
+    source: str,
+    csv_path: Path,
+    week: int | None,
+    weeks: list[int] | None,
+    season: int,
+    refresh: bool = False,
+    cache_day: date | None = None,
+) -> tuple[list[SnapWeekRow], dict[str, Any]]:
+    """Lineups CSV, or a gangstash window collapsed to one snap_share per player.
+
+    `offense_pct` is already a 0–1 fraction. The window share is
+    sum(offense_snaps) / sum(offense_snaps / offense_pct), which equals
+    `offense_pct` for a single week and matches Lineups `snap_share`.
+    """
+    src = (source or "lineups").strip().lower()
+    if src == "lineups":
+        return load_snaps_csv(csv_path), {"source": "lineups", "join_week": week}
+    if src != "gangstash":
+        raise SnapsError(
+            "SNAPS_SOURCE",
+            f"unknown --snaps-source {source!r} (lineups|gangstash)",
+        )
+    window = list(weeks) if weeks else None
+    raw, meta = fetch_snaps(
+        season=season,
+        weeks=window,
+        refresh=refresh,
+        cache_day=cache_day,
+    )
+    normalized = aggregate_snap_window(raw, weeks=window)
+    asof = (cache_day or date.today()).isoformat()
+    rows: list[SnapWeekRow] = []
+    for item in normalized:
+        rows.append(
+            SnapWeekRow(
+                player=item["player_name"],
+                team=item["team_fd"],
+                position=item["position"],
+                week=int(item["week"]),
+                snaps=int(item["snaps"]),
+                snap_share=float(item["snap_share"]),
+                snaps_avg=float(item["snaps_avg"]),
+                snaps_total=int(item["snaps_total"]),
+                team_snap_pct=None,
+                source="gangstash",
+                asof=asof,
+            )
+        )
+    join_week = rows[0].week if rows else None
+    return rows, {
+        **meta,
+        "source": "gangstash",
+        "join_week": join_week,
+        "weeks": window,
+        "season": season,
     }
 
 
