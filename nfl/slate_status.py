@@ -272,8 +272,8 @@ def build_slate_status(
         gaps.append("snaps joined 0")
     if props_skipped:
         reason = str(props.get("reason") or "")
-        if reason == "PROPS_ODDS_KEY":
-            gaps.append("props skipped (no Odds key)")
+        if reason == "PROPS_GANGSTASH_KEY":
+            gaps.append("props skipped (no Gangstash key)")
         else:
             gaps.append("props skipped")
     elif p_e and p_m == 0:
@@ -430,7 +430,7 @@ def format_slate_status(status: Mapping) -> str:
     lines.append(_snaps_line(snaps))
     if props.get("skipped"):
         why = str(props.get("reason") or "")
-        extra = " (no Odds key)" if why == "PROPS_ODDS_KEY" else ""
+        extra = " (no Gangstash key)" if why == "PROPS_GANGSTASH_KEY" else ""
         lines.append(f"props  skipped{extra}")
     else:
         cred = props.get("credits_remaining")

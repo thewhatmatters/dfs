@@ -331,7 +331,7 @@ class BuildSlateStatusTest(unittest.TestCase):
                 "skip_props": True,
                 "skip_injuries": True,
             },
-            props={"skipped": True, "reason": "PROPS_ODDS_KEY"},
+            props={"skipped": True, "reason": "PROPS_GANGSTASH_KEY"},
             targets={"skipped": True, "choke": "TARGETS_CSV"},
             snaps={"skipped": True},
         )
@@ -342,10 +342,10 @@ class BuildSlateStatusTest(unittest.TestCase):
         self.assertIn("depth  ourlads  skipped", text)
         self.assertIn("targets  skipped (TARGETS_CSV)", text)
         self.assertIn("snaps  skipped", text)
-        self.assertIn("props  skipped (no Odds key)", text)
+        self.assertIn("props  skipped (no Gangstash key)", text)
         self.assertIn("injuries  skipped", text)
         self.assertIn("targets TARGETS_CSV", text)
-        self.assertIn("props skipped (no Odds key)", "\n".join(status["gaps"]))
+        self.assertIn("props skipped (no Gangstash key)", "\n".join(status["gaps"]))
         self.assertNotIn("missing depth", text)
         self.assertNotIn("missing targets", text)
 

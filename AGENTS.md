@@ -29,7 +29,8 @@ python3 -m ncaaf.depth --csv ncaaf/data/<export>.csv                 # OurLads s
 python3 -m nfl.optimize --csv "nfl/data/<players-list>.csv"          # FanDuel NFL classic
 python3 -m nfl.depth --csv "nfl/data/<players-list>.csv"             # OurLads NFL depth → nfl/data/depth.csv
 # NFL uploads: nfl/export/ when --n-lineups>1. Cached props; do not --refresh-props unless asked.
-# Player props: ODDS_API_KEY, cached, ~70 credits/slate (see ncaaf/docs/data/player-props.md)
+# NCAAF player props: ODDS_API_KEY, cached, ~70 credits/slate (see ncaaf/docs/data/player-props.md)
+# NFL player props: GANGSTASH_API_KEY (see nfl/docs/data/player-props.md). Game lines still use ODDS_API_KEY.
 # After week 1: CFBD pass/rush mix — ncaaf/docs/data/play-distribution.md (not live until 2026 boxes)
 ```
 

@@ -99,7 +99,7 @@ from nfl.teams import UnmappedTeam  # noqa: E402
 from nfl.upload import export_lineups  # noqa: E402
 
 VEGAS_LABEL = (
-    "Odds API player-prop FD points when volume lines join; else implied "
+    "Gangstash player-prop FD points when volume lines join; else implied "
     "team total × depth × position share × Lineups usage tilt "
     "(DEF: opp implied PA bucket + 3.0)"
 )
@@ -265,12 +265,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument(
         "--skip-props",
         action="store_true",
-        help="do not pull Odds API player props",
+        help="do not pull Gangstash player props",
     )
     ap.add_argument(
         "--refresh-props",
         action="store_true",
-        help="bypass Odds API player-prop cache (burns credits)",
+        help="bypass the Gangstash player-prop cache and refetch",
     )
     ap.add_argument(
         "--board",
@@ -557,8 +557,8 @@ def main(argv: list[str] | None = None) -> int:
                 pool, refresh=args.refresh_props, slate_day=slate_day
             )
         except PropsKeyMissing as e:
-            emit("PROPS_ODDS_KEY", f"skip overlay — {e}")
-            pstats = {"skipped": True, "reason": "PROPS_ODDS_KEY"}
+            emit("PROPS_GANGSTASH_KEY", f"skip overlay — {e}")
+            pstats = {"skipped": True, "reason": "PROPS_GANGSTASH_KEY"}
         except PropsError as e:
             emit(props_id(e), str(e))
             return 1
@@ -567,14 +567,25 @@ def main(argv: list[str] | None = None) -> int:
             pool = attach_props(
                 pool, by_pid, unmatched=pstats.get("unmatched") or []
             )
-            rem = pstats.get("credits_remaining")
             print(
                 f"props {pstats['players_with_props']} players  "
                 f"games {pstats['games_with_props']}/"
                 f"{pstats['games_with_props'] + pstats['games_unmatched']}"
-                + (f"  credits_left {rem}" if rem is not None else ""),
+                f"  source {pstats.get('source', 'gangstash')}",
                 file=sys.stderr,
             )
+            if pstats.get("cache_stale"):
+                print(
+                    f"props using cache {pstats.get('cache')} "
+                    "(live gangstash unreachable or key unset)",
+                    file=sys.stderr,
+                )
+            unmapped = pstats.get("unmapped_props") or {}
+            if unmapped:
+                shown = ", ".join(
+                    f"{name} ({count})" for name, count in sorted(unmapped.items())
+                )
+                print(f"props unmapped (not scored): {shown}", file=sys.stderr)
 
     print(
         f"pool {len(pool)} / {len(raw)} players  "

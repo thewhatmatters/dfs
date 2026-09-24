@@ -228,7 +228,8 @@ def format_picker_sources(
             )
         )
     ):
-        tags.append("odds-props")
+        book = str(p.get("prop_book") or "").strip().lower()
+        tags.append("gangstash" if book == "gangstash" else "odds-props")
     inj = str(p.get("injury") or "").strip().upper()
     if inj == "Q":
         tags.append("espn-inj")

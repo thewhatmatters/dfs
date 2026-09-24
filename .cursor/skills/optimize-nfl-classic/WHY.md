@@ -94,6 +94,12 @@ NFL path is flags-only.
   high-exposure + unmatched-Lineups fillers). Devontez Walker is **not**
   on Lineups week-1 BAL WRs (Flowers, Bateman, Lane, Wester, Chris Moore)
   — do not invent an alias; he stays unmatched / usage 1.0.
+- 2026-09-24: **NFL player props use the Gangstash HTTP API.**
+  `GANGSTASH_API_KEY`, header `x-api-key`, cache
+  `nfl/data/gangstash-props/`. Game lines stay on `ODDS_API_KEY`.
+  Unmapped `prop` strings print and are not scored. Picker tag is
+  `gangstash` when `prop_book` is gangstash. See
+  `nfl/docs/data/player-props.md`.
 
 ## 4. Known limitations / environment caveats
 
@@ -110,4 +116,4 @@ See `skill-architecture.md` §B; this skill targets every PASS that applies.
 ## 6. Notes
 
 Hard dep: repo `nfl` package (same git tree). Soft: `pulp` (gated, greedy degrade).
-Vegas path: `ODDS_API_KEY` (hard gate `LINES_KEY`). Choke ids: `nfl/docs/data/sources.md`.
+Vegas game lines: `ODDS_API_KEY` (hard gate `LINES_KEY`). Player props: `GANGSTASH_API_KEY` (degrade `PROPS_GANGSTASH_KEY` when no cache). Choke ids: `nfl/docs/data/sources.md`.

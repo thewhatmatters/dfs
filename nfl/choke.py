@@ -58,7 +58,7 @@ def inj_id(exc: BaseException) -> str:
 
 def props_id(exc: BaseException) -> str:
     if isinstance(exc, PropsKeyMissing):
-        return "PROPS_ODDS_KEY"
+        return "PROPS_GANGSTASH_KEY"
     if isinstance(exc, PropsError):
-        return "PROPS_ODDS"
-    return "PROPS_ODDS"
+        return "PROPS_GANGSTASH"
+    return "PROPS_GANGSTASH"

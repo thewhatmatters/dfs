@@ -36,6 +36,7 @@ Implementation work is meant to run on **Grok CLI**. From Cursor, the in-session
 | `ncaaf/data/` | FanDuel "Download Players List" CSVs |
 | `.cursor/skills/optimize-ncaaf-classic/` | Agent skill (NCAAF classic; bare “Let’s optimize”) |
 | `nfl/` | FanDuel NFL classic adapter (`python3 -m nfl.optimize`) |
+| `nfl/docs/data/player-props.md` | NFL player props via `GANGSTASH_API_KEY` (game lines stay on `ODDS_API_KEY`) |
 | `nfl/export/` | FanDuel upload CSVs when `--n-lineups>1` |
 | `.cursor/skills/optimize-nfl-classic/` | Agent skill (NFL; “optimize NFL”, `/optimize-nfl-classic`) |
 

@@ -22,8 +22,8 @@ Skill pointer: `.cursor/skills/optimize-nfl-classic/references/sources.md`.
 | `DEPTH_OURLADS` | OurLads NFL HTML, slate teams only | `nfl/ourlads.py` | grant: [`ourlads-authorization.md`](ourlads-authorization.md) | **stop** | `--skip-depth` (unlisted prior) |
 | `DEPTH_ESPN` | ESPN depth charts (optional `--depth-source=espn`) | `nfl/depth.py` | none (public ESPN; often 403) | **stop** | `--skip-depth` or default OurLads |
 | `DEPTH_JOIN` | OurLads/ESPN team/name map | `nfl/ourlads.py`, `nfl/depth.py`, `nfl/teams.py` | — | **stop** if unmapped team; unmatched **names** print on the board, not fatal | `NAME_OVERRIDES`; JAC→JAX, ARI→ARZ; WAS is WAS not WSH |
-| `PROPS_ODDS_KEY` | no Odds key for player props | `nfl/props.py` | `ODDS_API_KEY` | **degrade** — skip overlay, keep implied×depth | `--skip-props` |
-| `PROPS_ODDS` | events / per-game prop HTTP | `nfl/props.py` | cache `nfl/data/odds-props/` | **stop** | `--skip-props` |
+| `PROPS_GANGSTASH_KEY` | no Gangstash key and no props cache | `nfl/props.py`, `nfl/gangstash.py` | `GANGSTASH_API_KEY` | **degrade** — skip overlay, keep implied×depth | `--skip-props` |
+| `PROPS_GANGSTASH` | gangstash props HTTP, truncated board, or bad payload | `nfl/gangstash.py` | cache `nfl/data/gangstash-props/`; header `x-api-key` (do not log it) | **stop** | `--skip-props` |
 | `PROPS_JOIN` | book name unmatched | `nfl/props.py` | — | **not a stop** — `prop_status=unmatched` on the note | — |
 | `SOLVER_PULP` | PuLP not importable | preflight / `nfl/solver.py` | `pip install pulp` | **degrade** greedy | `--greedy` |
 | `SOLVER_INFEASIBLE` | no legal 9 | `nfl/solver.py` | — | **stop** exit 2 | relax floor / `--max-per-team=4` / `--stack-qb=off` / `--bring-back` |
@@ -43,21 +43,22 @@ Skill pointer: `.cursor/skills/optimize-nfl-classic/references/sources.md`.
 | `WEATHER_NWS` | NWS hourly | still too short for Sep 13 kickoffs |
 | `INACTIVES_SUNDAY` | Sunday inactives | not ingested |
 | `PFF_PRO` | PFF Pro API | not wired |
-| `ANYTIME_TD` | Odds anytime-TD overlay | skipped in `nfl/props.py` |
-| `PROPS_LINEUPS` | Lineups player-prop pages | inventoried only: `https://www.lineups.com/nfl/player-prop-bets/` — Odds API stays the overlay |
+| `ANYTIME_TD` | anytime-TD prop strings | not scored; counted in `unmapped_props` (`nfl/props.py`) |
+| `PROPS_LINEUPS` | Lineups player-prop pages | inventoried only: `https://www.lineups.com/nfl/player-prop-bets/` — Gangstash is the overlay |
 
-Do not scrape FanDuel. Do not `--refresh-props` unless asked (burns Odds credits).
+Do not scrape FanDuel. Do not `--refresh-props` unless asked (refetches the Gangstash board).
 
 ## Stop vs degrade (quick)
 
 - **Must have to score the slate:** CSV, lines key + fetch + join.
-- **May skip:** ESPN injuries (`--skip-injuries`), OurLads depth (`--skip-depth`), Lineups RB/WR/TE targets (`--skip-targets` or missing CSV), Lineups snaps (`--skip-snaps` or missing CSV), props (`--skip-props` or missing Odds key).
+- **May skip:** ESPN injuries (`--skip-injuries`), OurLads depth (`--skip-depth`), Lineups RB/WR/TE targets (`--skip-targets` or missing CSV), Lineups snaps (`--skip-snaps` or missing CSV), props (`--skip-props` or missing Gangstash key and no cache).
 - **Optional depth fallback:** `--depth-source=espn` (`DEPTH_ESPN`; often 403).
 
 Depth: [`ourlads-depth.md`](ourlads-depth.md).
 - **May degrade:** PuLP → greedy (label the lineup).
 
 Props are a **±20% tilt** on the implied score when a volume line joins.
+Source and prop-string map: [`player-props.md`](player-props.md).
 Missing props is not a lines failure and not a blank choke — see picker
 `note` / `prop_status` / **Sources** (join tags) and JSON `slate_status`.
 `--slate-status` (or `python3 -m nfl.status`) prints pool + per-source

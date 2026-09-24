@@ -16,7 +16,7 @@ Solve the highest-projection legal FanDuel NFL classic lineup for a slate CSV.
 ## What it does
 
 Loads contest rules from this repo, filters the FanDuel export, joins Vegas
-lines + OurLads depth + Lineups RB/WR/TE targets + Lineups snaps + ESPN injuries + Odds props (cached), and runs the PuLP ILP
+lines + OurLads depth + Lineups RB/WR/TE targets + Lineups snaps + ESPN injuries + Gangstash props (cached), and runs the PuLP ILP
 (greedy if PuLP is missing). Default objective is **week1_score** (implied×depth×share×usage, volume props a
 ±20% tilt — not an override). No FPPG. No stdin interview. No question card.
 
@@ -62,8 +62,8 @@ Repo-root `scripts/optimize.py` is the **NCAAF** shim — do not use it here.
 | `--skip-snaps` | skip Lineups snap join (RB usage uses targets or 1.0) |
 | `--snaps-csv=PATH` | Lineups `snaps.csv` (default `nfl/data/snaps.csv`) |
 | `--snaps-week=N` | join that week (default: latest week in the CSV) |
-| `--skip-props` | skip Odds API player props |
-| `--refresh-props` | refetch props (burns credits) — do not unless asked |
+| `--skip-props` | skip Gangstash player props |
+| `--refresh-props` | refetch Gangstash props — do not unless asked |
 | `--exclude-questionable` | drop CSV Q; IR/NA already dropped |
 | `--greedy` | skip PuLP even if installed |
 | `--min-salary=N` | house spend floor (default 58000; 0 disables) |
