@@ -1,57 +1,81 @@
-"""Odds API NFL player-prop overlay.
+"""NFL player-prop overlay from the gangstash props API.
 
-Slate games only. Markets: pass/rush/rec yds, receptions, pass TDs.
-Skip anytime_td this pass. FanDuel book else median Over.
-NFL scoring includes 100/300 bonuses when the *line* is ≥ threshold.
-Jr. name join. Volume line is a ±20% tilt on implied, not an override.
-Missing props → model path (factor 1.0).
-Cache: nfl/data/odds-props/YYYY-MM-DD/. ~60 credits + 1 events.
+Volume lines (pass/rush/rec yards, receptions, pass TDs) are a ±20% tilt on
+implied, not an override. NFL scoring includes 100/300 bonuses when the *line*
+is ≥ threshold. Jr. name join via match_key. Missing props → model path
+(factor 1.0).
+
+Game lines (spreads/totals) stay on The Odds API in nfl/lines.py. This module
+does not call Odds and does not need ODDS_API_KEY.
+
+Prop strings: see PROP_FIELD. Unmapped `prop` values are counted and returned
+as unmapped_props (exact strings). They are not scored.
+TODO: confirm live BettingPros `prop` strings against a refreshed dump. The
+alias table is the conservative set (yards / TDs / receptions only). Do not
+fold anytime TD, interceptions, completions, or attempts into those fields
+until a dump shows the exact strings and a scoring rule exists.
 """
 
 from __future__ import annotations
 
-import json
-import statistics
-import urllib.parse
+import re
+from collections import defaultdict
 from dataclasses import dataclass, replace
 from datetime import date
-from pathlib import Path
-from nfl import env as envmod
-from nfl.http import HttpError, http_json
-from nfl.lines import filter_commence, infer_slate_date, slate_from_players, slate_window
+
+from nfl.gangstash import (
+    GangstashError,
+    GangstashKeyMissing,
+    fetch_props,
+)
+from nfl.lines import slate_from_players
 from nfl.names import match_key
 from nfl.players import Player
 from nfl.projections import week1_score
 from nfl.rules import FANDUEL_NFL
-from nfl.teams import lookup_odds
 
-ODDS_EVENTS = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events"
-ODDS_EVENT_ODDS = (
-    "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/events/{eid}/odds"
-)
-CACHE_DIR = Path(__file__).resolve().parent / "data" / "odds-props"
-MARKETS = (
-    "player_pass_yds",
-    "player_pass_tds",
-    "player_rush_yds",
-    "player_reception_yds",
-    "player_receptions",
-)
-MARKET_FIELD = {
-    "player_pass_yds": "pass_yds",
-    "player_pass_tds": "pass_tds",
-    "player_rush_yds": "rush_yds",
-    "player_reception_yds": "rec_yds",
-    "player_receptions": "receptions",
+# Normalized prop string → PlayerProp field. Normalization is casefold, strip
+# punctuation, collapse space, drop a trailing over/under.
+PROP_FIELD = {
+    "passing yards": "pass_yds",
+    "pass yards": "pass_yds",
+    "pass yds": "pass_yds",
+    "passing yds": "pass_yds",
+    "player pass yds": "pass_yds",
+    "player passing yards": "pass_yds",
+    "passing touchdowns": "pass_tds",
+    "passing tds": "pass_tds",
+    "pass tds": "pass_tds",
+    "pass td": "pass_tds",
+    "passing td": "pass_tds",
+    "player pass tds": "pass_tds",
+    "player passing touchdowns": "pass_tds",
+    "rushing yards": "rush_yds",
+    "rush yards": "rush_yds",
+    "rush yds": "rush_yds",
+    "rushing yds": "rush_yds",
+    "player rush yds": "rush_yds",
+    "player rushing yards": "rush_yds",
+    "receiving yards": "rec_yds",
+    "rec yards": "rec_yds",
+    "rec yds": "rec_yds",
+    "receiving yds": "rec_yds",
+    "reception yards": "rec_yds",
+    "player reception yds": "rec_yds",
+    "player receiving yards": "rec_yds",
+    "receptions": "receptions",
+    "player receptions": "receptions",
 }
 
+_TRAILING_SIDE = re.compile(r"\s+(?:over under|over|under)$")
 
-class PropsError(Exception):
+
+class PropsError(GangstashError):
     """Fatal props ingest."""
 
 
-class PropsKeyMissing(PropsError):
-    gate = "PROPS_ODDS_KEY"
+class PropsKeyMissing(GangstashKeyMissing):
+    gate = "PROPS_GANGSTASH_KEY"
 
 
 @dataclass(frozen=True)
@@ -100,148 +124,89 @@ class PlayerProp:
         )
 
 
-def _key() -> str:
-    k = envmod.get("ODDS_API_KEY") or envmod.get("THE_ODDS_API_KEY")
-    if not k:
-        raise PropsKeyMissing("ODDS_API_KEY is not set")
-    return k
+def norm_prop(raw: str) -> str:
+    s = (raw or "").casefold().replace("_", " ").replace("-", " ").replace("/", " ")
+    s = re.sub(r"[^a-z0-9 ]+", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return _TRAILING_SIDE.sub("", s).strip()
 
 
-def _cache_day() -> Path:
-    d = CACHE_DIR / date.today().isoformat()
-    d.mkdir(parents=True, exist_ok=True)
-    return d
+def prop_field(raw: str) -> str | None:
+    return PROP_FIELD.get(norm_prop(raw))
 
 
-def fetch_events(*, refresh: bool = False) -> tuple[list[dict], str | None]:
-    path = _cache_day() / "events.json"
-    if path.is_file() and path.stat().st_size > 2 and not refresh:
-        return json.loads(path.read_text(encoding="utf-8")), None
-    url = ODDS_EVENTS + "?" + urllib.parse.urlencode({"apiKey": _key()})
-    try:
-        payload, hdrs = http_json(url)
-    except HttpError as e:
-        raise PropsError(f"Odds events {e}") from e
-    if not isinstance(payload, list):
-        raise PropsError("Odds events did not return an array")
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    return payload, hdrs.get("x-requests-remaining")
-
-
-def fetch_event_props(event_id: str, *, refresh: bool = False) -> tuple[dict, str | None]:
-    path = _cache_day() / f"{event_id}.json"
-    if path.is_file() and path.stat().st_size > 2 and not refresh:
-        return json.loads(path.read_text(encoding="utf-8")), None
-    params = {
-        "apiKey": _key(),
-        "regions": "us",
-        "markets": ",".join(MARKETS),
-        "oddsFormat": "american",
-        "bookmakers": "fanduel,draftkings,betmgm,bovada",
-    }
-    url = ODDS_EVENT_ODDS.format(eid=event_id) + "?" + urllib.parse.urlencode(params)
-    try:
-        payload, hdrs = http_json(url)
-    except HttpError as e:
-        raise PropsError(f"Odds event {event_id}: {e}") from e
-    if not isinstance(payload, dict):
-        raise PropsError(f"Odds event {event_id} did not return an object")
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    return payload, hdrs.get("x-requests-remaining")
-
-
-def _median_over(points: list[float]) -> float | None:
-    if not points:
+def _as_line(value: object) -> float | None:
+    if value is None or value == "":
         return None
-    return float(statistics.median(points))
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
-def _collect_overs(book: dict) -> dict[str, dict[str, float]]:
-    out: dict[str, dict[str, float]] = {}
-    for market in book.get("markets") or []:
-        field = MARKET_FIELD.get(str(market.get("key") or ""))
-        if not field:
+def _scraped_at(row: dict) -> str:
+    return str(row.get("scraped_at") or "")
+
+
+def rows_to_props(rows: list[dict]) -> tuple[dict[str, PlayerProp], dict]:
+    """Collapse board rows into one PlayerProp per match_key.
+
+    Newer scraped_at wins for the same player and field. Same timestamp and a
+    different line keeps the first value and records a conflict. Unknown prop
+    strings are counted under their exact text.
+    """
+    # match_key -> field -> (line, scraped_at, display_name)
+    acc: dict[str, dict[str, tuple[float, str, str]]] = {}
+    unmapped: dict[str, int] = {}
+    skipped = 0
+    conflicts: list[dict] = []
+    mapped = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            skipped += 1
             continue
-        for o in market.get("outcomes") or []:
-            if str(o.get("name") or "").casefold() != "over":
-                continue
-            desc = (o.get("description") or "").strip()
-            pt = o.get("point")
-            if not desc or pt is None:
-                continue
-            try:
-                val = float(pt)
-            except (TypeError, ValueError):
-                continue
-            out.setdefault(match_key(desc), {})[field] = val
-    return out
-
-
-def parse_event_props(payload: dict) -> list[PlayerProp]:
-    books = list(payload.get("bookmakers") or [])
-    fd = next((b for b in books if b.get("key") == "fanduel"), None)
-    fd_map = _collect_overs(fd) if fd else {}
-    others = [_collect_overs(b) for b in books if b.get("key") != "fanduel"]
-    names = set(fd_map) | {n for m in others for n in m}
-    out: list[PlayerProp] = []
-    for mk in names:
-        fields: dict[str, float] = {}
-        for field in MARKET_FIELD.values():
-            if mk in fd_map and field in fd_map[mk]:
-                fields[field] = fd_map[mk][field]
-                continue
-            pts = [m[mk][field] for m in others if mk in m and field in m[mk]]
-            med = _median_over(pts)
-            if med is not None:
-                fields[field] = med
-        if not fields:
+        name = str(row.get("player_name") or "").strip()
+        raw_prop = row.get("prop")
+        line = _as_line(row.get("line"))
+        if not name or raw_prop is None or line is None:
+            skipped += 1
             continue
-        prop = PlayerProp(
-            name=mk,
-            pass_yds=fields.get("pass_yds"),
-            pass_tds=fields.get("pass_tds"),
-            rush_yds=fields.get("rush_yds"),
-            rec_yds=fields.get("rec_yds"),
-            receptions=fields.get("receptions"),
-            book="fanduel" if mk in fd_map else "median",
-        )
+        field = prop_field(str(raw_prop))
+        if field is None:
+            exact = str(raw_prop)
+            unmapped[exact] = unmapped.get(exact, 0) + 1
+            continue
+        mapped += 1
+        key = match_key(name)
+        stamp = _scraped_at(row)
+        slot = acc.setdefault(key, {})
+        prev = slot.get(field)
+        if prev is None or stamp > prev[1]:
+            slot[field] = (line, stamp, name)
+            continue
+        if stamp == prev[1] and line != prev[0]:
+            conflicts.append(
+                {
+                    "player": name,
+                    "prop": str(raw_prop),
+                    "kept": prev[0],
+                    "dropped": line,
+                }
+            )
+    props: dict[str, PlayerProp] = {}
+    for key, fields in acc.items():
+        display = next(iter(fields.values()))[2]
+        kwargs = {field: fields[field][0] for field in fields}
+        prop = PlayerProp(name=display, book="gangstash", **kwargs)
         if prop.has_volume() or prop.pass_tds is not None:
-            out.append(prop)
-    return out
-
-
-def _match_event(events: list[dict], away_fd: str, home_fd: str) -> dict | None:
-    for ev in events:
-        home = lookup_odds(str(ev.get("home_team") or ""))
-        away = lookup_odds(str(ev.get("away_team") or ""))
-        if home is None or away is None:
-            continue
-        if home.fd == home_fd and away.fd == away_fd:
-            return ev
-    return None
-
-
-def _join_prop(
-    prop: PlayerProp,
-    pool: list[Player],
-    home_fd: str,
-    away_fd: str,
-) -> Player | None:
-    teams = {home_fd, away_fd}
-    want = match_key(prop.name)
-    hits = [p for p in pool if p.team in teams and match_key(p.name) == want]
-    if len(hits) == 1:
-        return hits[0]
-    last = want.split()[-1] if want else ""
-    if last:
-        last_hits = [
-            p
-            for p in pool
-            if p.team in teams and match_key(p.name).split()[-1] == last
-        ]
-        if len(last_hits) == 1:
-            return last_hits[0]
-    return None
+            props[key] = prop
+    meta = {
+        "mapped_rows": mapped,
+        "skipped_rows": skipped,
+        "unmapped_props": unmapped,
+        "conflicts": conflicts,
+    }
+    return props, meta
 
 
 def ingest_slate_props(
@@ -250,58 +215,61 @@ def ingest_slate_props(
     refresh: bool = False,
     slate_day: date | None = None,
 ) -> tuple[dict[str, PlayerProp], dict]:
-    events, remaining = fetch_events(refresh=refresh)
-    day = slate_day or infer_slate_date()
-    start, end = slate_window(day)
-    events = filter_commence(events, start, end)
-    slate = slate_from_players(pool)
+    day = slate_day or date.today()
+    try:
+        rows, fetch_meta = fetch_props(refresh=refresh, cache_day=day)
+    except GangstashKeyMissing as e:
+        raise PropsKeyMissing(str(e)) from e
+    except GangstashError as e:
+        raise PropsError(str(e)) from e
+    by_key, map_meta = rows_to_props(rows)
+    buckets: dict[str, list[Player]] = defaultdict(list)
+    for pl in pool:
+        if pl.position == "D":
+            continue
+        buckets[match_key(pl.name)].append(pl)
     joined: dict[str, PlayerProp] = {}
     unmatched: list[dict] = []
+    for key, prop in by_key.items():
+        hits = buckets.get(key) or []
+        pids = {pl.pid: pl for pl in hits}
+        if len(pids) == 1:
+            joined[next(iter(pids))] = prop
+            continue
+        if len(pids) > 1:
+            unmatched.append({"name": prop.name, "reason": "ambiguous"})
+    joined_teams = {pl.team for pl in pool if pl.pid in joined}
     games_hit = 0
     games_miss = 0
-    last_remaining = remaining
-    for _game, away_fd, home_fd in slate:
-        ev = _match_event(events, away_fd, home_fd)
-        if ev is None:
+    for _game, away_fd, home_fd in slate_from_players(pool):
+        if away_fd in joined_teams or home_fd in joined_teams:
+            games_hit += 1
+        else:
             games_miss += 1
-            continue
-        payload, rem = fetch_event_props(str(ev["id"]), refresh=refresh)
-        if rem is not None:
-            last_remaining = rem
-        games_hit += 1
-        for prop in parse_event_props(payload):
-            pl = _join_prop(prop, pool, home_fd, away_fd)
-            if pl is None:
-                unmatched.append(
-                    {"name": prop.name, "home": home_fd, "away": away_fd}
-                )
-                continue
-            joined[pl.pid] = prop
     stats = {
+        "source": "gangstash",
         "games_with_props": games_hit,
         "games_unmatched": games_miss,
         "players_with_props": len(joined),
-        "credits_remaining": last_remaining,
-        "markets": list(MARKETS),
+        "rows": len(rows),
+        "markets": ["pass_yds", "pass_tds", "rush_yds", "rec_yds", "receptions"],
         "unmatched": unmatched,
+        **fetch_meta,
+        **map_meta,
     }
     return joined, stats
 
 
-def _unmatched_lasts(unmatched: list, team: str) -> set[str]:
+def _unmatched_keys(unmatched: list) -> set[str]:
     out: set[str] = set()
     for u in unmatched:
         if isinstance(u, dict):
             name = str(u.get("name") or "")
-            home, away = u.get("home"), u.get("away")
-            if home or away:
-                if team not in {home, away}:
-                    continue
         else:
             name = getattr(u, "name", "") or ""
-        last = match_key(name).split()[-1] if name else ""
-        if last:
-            out.add(last)
+        key = match_key(name)
+        if key:
+            out.add(key)
     return out
 
 
@@ -310,7 +278,7 @@ def attach_props(
     by_pid: dict[str, PlayerProp],
     unmatched: list | None = None,
 ) -> list[Player]:
-    um = unmatched or []
+    ambiguous = _unmatched_keys(unmatched or [])
     out: list[Player] = []
     for pl in players:
         prop = by_pid.get(pl.pid)
@@ -333,11 +301,8 @@ def attach_props(
             status = "props"
             fd = prop.fd_points()
         else:
-            lasts = _unmatched_lasts(um, pl.team)
-            last = match_key(pl.name).split()[-1] if pl.name else ""
-            status = "unmatched" if last and last in lasts else "no_market"
+            status = "unmatched" if match_key(pl.name) in ambiguous else "no_market"
             fd = None
-        # volume props join → prop_fd (week1_score tilts ±20%, does not override)
         use_fd = fd if (prop is not None and prop.has_volume()) else None
         obj = week1_score(
             pl.implied_total or 0.0,

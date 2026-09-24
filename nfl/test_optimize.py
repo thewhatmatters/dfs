@@ -129,11 +129,12 @@ class Week1ScoreTest(unittest.TestCase):
             depth_rank=1,
             prop_fd=18.5,
             prop_pass_yds=250.5,
-            prop_book="fanduel",
+            prop_book="gangstash",
         )
         info = explain_player(pl)
         self.assertEqual(info["prop_status"], "props")
-        self.assertEqual(info["sources"], "ourlads/odds-props")
+        self.assertEqual(info["sources"], "ourlads/gangstash")
+        self.assertIn("Gangstash", info["note"])
         self.assertIn("±20% tilt on implied", info["note"])
         self.assertIn("250.5 pass yds", info["note"])
 

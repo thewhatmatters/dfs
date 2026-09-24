@@ -18,7 +18,11 @@ from nfl.rules import (
     pass_stack_players,
 )
 
-BOOK_LABEL = {"fanduel": "FanDuel", "median": "median books"}
+BOOK_LABEL = {
+    "fanduel": "FanDuel",
+    "median": "median books",
+    "gangstash": "Gangstash",
+}
 
 
 def picker_name(name: str, starter: bool) -> str:
@@ -85,6 +89,7 @@ def player_source_fields(player: Player, *, prop_status: str | None) -> dict:
                 "prop_rush_yds": player.prop_rush_yds,
                 "prop_rec_yds": player.prop_rec_yds,
                 "prop_receptions": player.prop_receptions,
+                "prop_book": player.prop_book,
                 "injury": player.injury,
                 "implied_opp": player.implied_opp,
             }
@@ -113,7 +118,7 @@ def explain_player(player: Player, *, slot_key: str | None = None) -> dict:
         bits = _prop_line_bits(player)
         lines = ", ".join(bits) if bits else f"{_g(player.prop_fd)} FD pts"
         note = (
-            f"Odds props ({_book_label(player)}): {lines} "
+            f"Props ({_book_label(player)}): {lines} "
             "— ±20% tilt on implied."
         )
         info = {"note": note, "starter": starter, "prop_status": "props"}
