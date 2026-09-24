@@ -1,27 +1,23 @@
 ---
-description: Dispatch implementation to Grok CLI; do not spend Cursor turns writing code in this repo.
+description: Grok CLI is an optional worker. Cursor cloud agents implement directly.
 alwaysApply: true
 ---
 
-# Grok CLI is the worker
+# Implementation
 
-This repo’s implementation agent is **Grok CLI**, not the in-session Cursor model. Cursor’s job is pack a prompt, run the dispatcher, and report. Do not edit `ncaaf/`, `nfl/`, `docs/`, or skills in-session except to fix the dispatcher itself.
+Cursor cloud agents implement code in this repo directly, including `ncaaf/`, `nfl/`, `docs/`, and skills.
 
-## Do this
-
-1. Write the user request plus any file paths into `results/grok-prompt.md` (gitignored).
-2. Shell (permissions `all` — Grok needs `~/.grok/auth.json` and network):
+Grok CLI remains an allowed option when it is installed and authenticated (`~/.grok/bin/grok`, `$GROK_BIN`, or `grok` on `PATH`). To use it, write the request to `results/grok-prompt.md` and run:
 
 ```bash
 bash scripts/dispatch-grok.sh results/grok-prompt.md
 ```
 
-3. Summarize Grok’s stdout. If the CLI is missing or unauthenticated, stop and say so (`grok login`); do not fall back to implementing here.
+If the CLI is missing or unauthenticated, implement the change in-session. Do not stop for `grok login`.
 
-## Do not
+When using the dispatcher:
 
-- Implement features, refactors, or lineup-logic changes with Cursor tools.
-- Pass `-m` / `--model` or set `GROK_MODEL` (the dispatcher refuses both; reported ids are not launch ids).
-- Use Claude/Codex CLIs for this repo.
+- Do not pass `-m` / `--model` or set `GROK_MODEL` (the dispatcher refuses both; reported ids are not launch ids).
+- Do not use Claude/Codex CLIs for this repo.
 
-Trivial answers that need no repo edits (e.g. “what’s the salary cap?”) may be answered from `ncaaf/docs/sites/fanduel-ncaaf.md` without dispatching.
+Trivial answers that need no repo edits (e.g. “what’s the salary cap?”) may be answered from `ncaaf/docs/sites/fanduel-ncaaf.md` without either path.

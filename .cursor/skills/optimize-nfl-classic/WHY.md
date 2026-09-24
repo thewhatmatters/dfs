@@ -96,7 +96,8 @@ NFL path is flags-only.
   — do not invent an alias; he stays unmatched / usage 1.0.
 - 2026-09-24: **NFL player props use the Gangstash HTTP API.**
   `GANGSTASH_API_KEY`, header `x-api-key`, cache
-  `nfl/data/gangstash-props/`. Game lines stay on `ODDS_API_KEY`.
+  `nfl/data/gangstash-props/`. Game lines default to `ODDS_API_KEY`
+  (`--lines-source=gangstash` optional; see `nfl/docs/data/gangstash.md`).
   Unmapped `prop` strings print and are not scored. Picker tag is
   `gangstash` when `prop_book` is gangstash. See
   `nfl/docs/data/player-props.md`.
@@ -116,4 +117,4 @@ See `skill-architecture.md` §B; this skill targets every PASS that applies.
 ## 6. Notes
 
 Hard dep: repo `nfl` package (same git tree). Soft: `pulp` (gated, greedy degrade).
-Vegas game lines: `ODDS_API_KEY` (hard gate `LINES_KEY`). Player props: `GANGSTASH_API_KEY` (degrade `PROPS_GANGSTASH_KEY` when no cache). Choke ids: `nfl/docs/data/sources.md`.
+Vegas game lines: `ODDS_API_KEY` by default (hard gate `LINES_KEY`). `--lines-source=gangstash` uses `GANGSTASH_API_KEY` (`LINES_GANGSTASH_KEY`). Player props: `GANGSTASH_API_KEY` (degrade `PROPS_GANGSTASH_KEY` when no cache). Targets default to Lineups. Choke ids: `nfl/docs/data/sources.md`.

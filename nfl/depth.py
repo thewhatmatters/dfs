@@ -1,20 +1,23 @@
-"""Join OurLads (default) or ESPN NFL depth to FanDuel Nickname+Team.
+"""Join OurLads (default), ESPN, or gangstash depth to FanDuel Nickname+Team.
 
 Default path is authorized OurLads HTML → nfl/data/depth.csv.
 `--depth-source=espn` is an optional fallback (ESPN site.api often 403).
-
-Rank 1 is a role prior (starter at that alignment), not 100% snaps.
+`--depth-source=gangstash` reads `dataset=depth_charts` (field names still
+to confirm). Rank 1 is a role prior (starter at that alignment), not 100% snaps.
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import sys
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
+from nfl.gangstash import GangstashDataError, GangstashDataKeyMissing, GangstashTruncated
+from nfl.gangstash_data import fetch_depth_charts, parse_depth_slot
 from nfl.http import HttpError, http_json
 from nfl.names import match_key
 from nfl.ourlads import (
@@ -23,9 +26,11 @@ from nfl.ourlads import (
     DepthRow,
     ingest_slate_depth as ingest_ourlads_depth,
     match_key as ourlads_match_key,
+    skill_pos,
 )
+from nfl.ourlads import _dedupe as dedupe_depth_rows
 from nfl.players import Player, load_fanduel_csv
-from nfl.teams import TeamRef, require_mapped
+from nfl.teams import ALIASES, TeamRef, require_mapped
 
 ESPN_DEPTH = (
     "https://site.api.espn.com/apis/site/v2/sports/football/nfl/teams/{id}/depthcharts"
@@ -57,6 +62,10 @@ NAME_OVERRIDES: dict[tuple[str, str], str] = {}
 
 class EspnDepthError(DepthError):
     """Fatal ESPN depth ingest (optional --depth-source=espn)."""
+
+
+class GangstashDepthError(DepthError):
+    """Fatal gangstash depth ingest (optional --depth-source=gangstash)."""
 
 
 def _override_lookup(team: str, ourlads_norm: str) -> str | None:
@@ -149,6 +158,90 @@ def ingest_espn_slate_depth(
     return rows
 
 
+def _write_depth_csv(rows: list[DepthRow], dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with dest.open("w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(
+            fh,
+            fieldnames=["team", "pos", "rank", "name", "source_url", "fetched_at"],
+        )
+        w.writeheader()
+        for r in rows:
+            w.writerow(
+                {
+                    "team": r.team,
+                    "pos": r.pos,
+                    "rank": r.rank,
+                    "name": r.name,
+                    "source_url": r.source_url,
+                    "fetched_at": r.fetched_at,
+                }
+            )
+
+
+def ingest_gangstash_slate_depth(
+    slate_teams: set[str],
+    *,
+    refresh: bool = False,
+    out_csv: Path | None = None,
+    cache_day: date | None = None,
+) -> list[DepthRow]:
+    """Map gangstash depth_charts onto slate FanDuel teams.
+
+    Missing skill rows for a slate team is fatal. Non-skill positions are
+    skipped. `out_csv` is written only when the caller passes a path so an
+    optimize run does not replace the OurLads `depth.csv`.
+    """
+    canon = {
+        ALIASES.get(t.strip().upper(), t.strip().upper())
+        for t in slate_teams
+        if t
+    }
+    try:
+        raw, _meta = fetch_depth_charts(refresh=refresh, cache_day=cache_day)
+    except GangstashDataKeyMissing as e:
+        raise GangstashDepthError(str(e)) from e
+    except (GangstashTruncated, GangstashDataError) as e:
+        raise GangstashDepthError(str(e)) from e
+
+    fetched_at = datetime.now(timezone.utc).isoformat()
+    src = "https://vmzgpslqoeuqmdchdekm.supabase.co/functions/v1/data?dataset=depth_charts"
+    rows: list[DepthRow] = []
+    seen: set[str] = set()
+    for item in raw:
+        try:
+            slot = parse_depth_slot(item)
+        except GangstashDataError as e:
+            raise GangstashDepthError(str(e)) from e
+        if slot is None:
+            continue
+        if slot.team_fd not in canon:
+            continue
+        pos = skill_pos(slot.position)
+        if pos is None:
+            continue
+        seen.add(slot.team_fd)
+        rows.append(
+            DepthRow(
+                team=slot.team_fd,
+                pos=pos,
+                rank=slot.rank,
+                name=slot.player_name,
+                source_url=src,
+                fetched_at=fetched_at,
+            )
+        )
+    missing = sorted(canon - seen)
+    if missing:
+        raise GangstashDepthError(
+            "gangstash depth has no skill rows for " + ", ".join(missing)
+        )
+    rows = dedupe_depth_rows(rows)
+    if out_csv is not None:
+        _write_depth_csv(rows, out_csv)
+    return rows
+
+
 def ingest_slate_depth(
     slate_teams: set[str],
     *,
@@ -156,12 +249,18 @@ def ingest_slate_depth(
     source: str = "ourlads",
     out_csv: Path | None = None,
 ) -> list[DepthRow]:
-    """Default OurLads. `source=espn` is the documented optional fallback."""
+    """Default OurLads. `espn` and `gangstash` are optional sources."""
     src = (source or "ourlads").strip().lower()
     if src == "espn":
         return ingest_espn_slate_depth(slate_teams, refresh=refresh)
+    if src == "gangstash":
+        return ingest_gangstash_slate_depth(
+            slate_teams, refresh=refresh, out_csv=out_csv
+        )
     if src != "ourlads":
-        raise DepthError(f"unknown --depth-source {source!r} (ourlads|espn)")
+        raise DepthError(
+            f"unknown --depth-source {source!r} (ourlads|espn|gangstash)"
+        )
     return ingest_ourlads_depth(slate_teams, refresh=refresh, out_csv=out_csv)
 
 
@@ -267,9 +366,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--refresh", action="store_true", help="bypass OurLads HTML cache")
     ap.add_argument(
         "--depth-source",
-        choices=("ourlads", "espn"),
+        choices=("ourlads", "espn", "gangstash"),
         default="ourlads",
-        help="ourlads (default) or espn fallback",
+        help="ourlads (default), espn fallback, or gangstash depth_charts",
     )
     ap.add_argument("--agent", action="store_true")
     args = ap.parse_args(argv)

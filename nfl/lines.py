@@ -1,8 +1,13 @@
-"""Ingest NFL spread/total from The Odds API and derive implied team totals.
+"""Ingest NFL spread/total and derive implied team totals.
 
-Sport dump is the whole season (~272 games). Filter `commence_time` to this
-slate's weekend (CSV date / 2026-09-13 kickoffs), then join by Odds full name.
+Default source is The Odds API (`--lines-source=oddsapi`). Sport dump is the
+whole season (~272 games). Filter `commence_time` to this slate's weekend
+(CSV date / 2026-09-13 kickoffs), then join by Odds full name.
 JAC↔JAX, WAS↔WSH. FanDuel book else median of US books.
+
+`--lines-source=gangstash` reads `dataset=game_lines` (BettingPros consensus)
+and maps `home_team_fd` / `away_team_fd` through the same FanDuel abbrevs.
+`--lines-json` still replays a file and ignores the live source.
 
 implied_home = (total - home_spread) / 2
 implied_away = (total + home_spread) / 2
@@ -21,6 +26,8 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from nfl import env as envmod
+from nfl.gangstash import GangstashDataError, GangstashDataKeyMissing, GangstashTruncated
+from nfl.gangstash_data import GangstashGameLine, fetch_game_lines, map_game_lines
 from nfl.http import HttpAuthError, HttpError, http_json
 from nfl.teams import lookup_odds, require_fd, require_mapped
 
@@ -52,6 +59,14 @@ class LinesKeyMissing(LinesError):
 
 class LinesAuthError(LinesError):
     gate = "LINES_AUTH"
+
+
+class LinesGangstashError(LinesError):
+    """Gangstash game-lines HTTP or payload failure."""
+
+
+class LinesGangstashKeyMissing(LinesKeyMissing):
+    gate = "LINES_GANGSTASH_KEY"
 
 
 @dataclass(frozen=True)
@@ -439,14 +454,78 @@ def fetch_odds(*, refresh: bool = False) -> list[dict]:
     return payload
 
 
+def team_lines_from_gangstash(
+    games: list[GangstashGameLine],
+    slate: list[tuple[str, str, str]],
+    *,
+    start: datetime,
+    end: datetime,
+) -> dict[str, TeamLine]:
+    """Join gangstash rows onto the FanDuel slate. Home spread sign matches Odds."""
+    index: dict[tuple[str, str], GangstashGameLine] = {}
+    for game in games:
+        if game.commence_time and not in_window(game.commence_time, start, end):
+            continue
+        index[(game.away_fd, game.home_fd)] = game
+    out: dict[str, TeamLine] = {}
+    missing: list[str] = []
+    for game, away_fd, home_fd in slate:
+        row = index.get((away_fd, home_fd))
+        if row is None:
+            missing.append(game)
+            continue
+        out[home_fd] = _team_line(
+            game=game,
+            home_fd=home_fd,
+            away_fd=away_fd,
+            home_spread=row.spread,
+            total=row.total,
+            home_ml=row.home_moneyline,
+            away_ml=row.away_moneyline,
+            provider="bettingpros",
+            source="gangstash",
+            commence_time=row.commence_time,
+        )
+        out[away_fd] = out[home_fd]
+    if missing:
+        raise LinesGangstashError(
+            "no gangstash line for slate game(s): " + ", ".join(missing)
+        )
+    return {fd: out[fd] for fd in {h for _, _, h in slate} | {a for _, a, _ in slate}}
+
+
+def _ingest_gangstash_lines(
+    slate: list[tuple[str, str, str]],
+    *,
+    slate_day: date,
+    refresh: bool,
+) -> dict[str, TeamLine]:
+    start, end = slate_window(slate_day)
+    try:
+        raw, _meta = fetch_game_lines(on_date=slate_day, refresh=refresh)
+    except GangstashDataKeyMissing as e:
+        raise LinesGangstashKeyMissing(
+            "GANGSTASH_API_KEY is not set and no gangstash game-lines cache exists"
+        ) from e
+    except (GangstashTruncated, GangstashDataError) as e:
+        raise LinesGangstashError(str(e)) from e
+    return team_lines_from_gangstash(
+        map_game_lines(raw), slate, start=start, end=end
+    )
+
+
 def ingest_slate_lines(
     players,
     *,
     lines_json: Path | None = None,
     slate_day: date | None = None,
     refresh: bool = False,
+    source: str = "oddsapi",
 ) -> dict[str, TeamLine]:
-    """Return TeamLine keyed by FanDuel abbrev for every slate team."""
+    """Return TeamLine keyed by FanDuel abbrev for every slate team.
+
+    `source` is `oddsapi` (default) or `gangstash`. `--lines-json` wins.
+    """
     slate = slate_from_players(players)
     fd_teams = {a for _, a, _ in slate} | {h for _, _, h in slate}
     require_mapped(fd_teams)
@@ -455,6 +534,12 @@ def ingest_slate_lines(
 
     if lines_json is not None:
         return load_lines_json(lines_json, slate, start=start, end=end)
+
+    src = (source or "oddsapi").strip().lower()
+    if src == "gangstash":
+        return _ingest_gangstash_lines(slate, slate_day=day, refresh=refresh)
+    if src != "oddsapi":
+        raise LinesError(f"unknown --lines-source {source!r} (oddsapi|gangstash)")
 
     payload = fetch_odds(refresh=refresh)
     return parse_odds_games(payload, slate, start=start, end=end)

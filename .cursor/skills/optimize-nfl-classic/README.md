@@ -25,7 +25,7 @@ Repo-root `scripts/optimize.py` is NCAAF — do not use it for NFL.
 ## What it needs
 
 Python 3, a FanDuel NFL classic CSV, `pulp` for the exact solve, and
-**`ODDS_API_KEY`** (game lines) and **`GANGSTASH_API_KEY`** (player props). See repo `.env.example`. Cached OurLads depth, ESPN
+**`ODDS_API_KEY`** (game lines, default) and **`GANGSTASH_API_KEY`** (player props; optional `--lines-source=gangstash`, `--targets-source=gangstash`, `--depth-source=gangstash`). See repo `.env.example`. Cached OurLads depth, ESPN
 injuries, and Gangstash props; do not `--refresh-props` unless asked.
 `python3 -m nfl.depth --csv …` refreshes `nfl/data/depth.csv`.
 

@@ -16,12 +16,15 @@ Skill pointer: `.cursor/skills/optimize-nfl-classic/references/sources.md`.
 | `LINES_AUTH` | lines HTTP 401/403 | `nfl/lines.py` | same key | **stop** | — |
 | `LINES_ODDS` | Odds API game odds | `nfl/lines.py` | `ODDS_API_KEY` (query param is their contract; do not log it) | **stop** | `--lines-json` |
 | `LINES_JSON` | replay `--lines-json` missing/bad | `nfl/lines.py` | — | **stop** | — |
-| `LINES_JOIN` | FanDuel abbrev ↔ Odds name | `nfl/teams.py` | — | **stop** | add a `TEAMS` row |
+| `LINES_GANGSTASH_KEY` | `--lines-source=gangstash` and no key / no cache | `nfl/lines.py`, `nfl/gangstash.py` | `GANGSTASH_API_KEY` (`x-api-key`; never a service-role key) | **stop** (no silent FPPG) | `--lines-source=oddsapi` or `--lines-json` |
+| `LINES_GANGSTASH` | gangstash `dataset=game_lines` HTTP, truncated board, bad fields, or missing slate game | `nfl/gangstash_data.py`, `nfl/lines.py` | cache `nfl/data/gangstash-data/` | **stop** | `--lines-source=oddsapi` |
+| `LINES_JOIN` | FanDuel abbrev ↔ Odds / gangstash team code | `nfl/teams.py` | — | **stop** | add a `TEAMS` row (`JAX`→`JAC`, `WSH`→`WAS`) |
 | `LINES_ATTACH` | no pool left after implied totals | `nfl/projections.py` | — | **stop** | — |
 | `INJ_ESPN` | ESPN injury dump (`site.web.api`; `site.api` often 403) | `nfl/injuries.py` | none (public ESPN) | **stop** | `--skip-injuries` |
 | `DEPTH_OURLADS` | OurLads NFL HTML, slate teams only | `nfl/ourlads.py` | grant: [`ourlads-authorization.md`](ourlads-authorization.md) | **stop** | `--skip-depth` (unlisted prior) |
 | `DEPTH_ESPN` | ESPN depth charts (optional `--depth-source=espn`) | `nfl/depth.py` | none (public ESPN; often 403) | **stop** | `--skip-depth` or default OurLads |
-| `DEPTH_JOIN` | OurLads/ESPN team/name map | `nfl/ourlads.py`, `nfl/depth.py`, `nfl/teams.py` | — | **stop** if unmapped team; unmatched **names** print on the board, not fatal | `NAME_OVERRIDES`; JAC→JAX, ARI→ARZ; WAS is WAS not WSH |
+| `DEPTH_GANGSTASH` | gangstash `dataset=depth_charts` (optional `--depth-source=gangstash`) | `nfl/depth.py`, `nfl/gangstash_data.py` | `GANGSTASH_API_KEY`; cache `nfl/data/gangstash-data/` | **stop** | `--skip-depth` or `--depth-source=ourlads` |
+| `DEPTH_JOIN` | OurLads/ESPN/gangstash team/name map | `nfl/ourlads.py`, `nfl/depth.py`, `nfl/teams.py` | — | **stop** if unmapped team; unmatched **names** print on the board, not fatal | `NAME_OVERRIDES`; JAC→JAX, ARI→ARZ; WAS is WAS not WSH |
 | `PROPS_GANGSTASH_KEY` | no Gangstash key and no props cache | `nfl/props.py`, `nfl/gangstash.py` | `GANGSTASH_API_KEY` | **degrade** — skip overlay, keep implied×depth | `--skip-props` |
 | `PROPS_GANGSTASH` | gangstash props HTTP, truncated board, or bad payload | `nfl/gangstash.py` | cache `nfl/data/gangstash-props/`; header `x-api-key` (do not log it) | **stop** | `--skip-props` |
 | `PROPS_JOIN` | book name unmatched | `nfl/props.py` | — | **not a stop** — `prop_status=unmatched` on the note | — |
@@ -30,7 +33,10 @@ Skill pointer: `.cursor/skills/optimize-nfl-classic/references/sources.md`.
 | `SALARY_BOUNDS` | `--min-salary` vs cap | `nfl/rules.py` | — | **stop** | — |
 | `TARGETS_LINEUPS` | Lineups.com RB/WR/TE target pages (public HTML + SSR JSON) | `nfl/targets.py` | grant: [`lineups-authorization.md`](lineups-authorization.md) | **stop** | omit targets refresh |
 | `TARGETS_CSV` | local `nfl/data/targets.csv` (or `--targets-csv`) missing/empty/bad | `nfl/targets.py` | none — produced by `python3 -m nfl.targets --refresh` | **degrade** — usage uses snaps or 1.0 | `--skip-targets` |
-| `TARGETS_JOIN` | Lineups full team name ↔ FanDuel abbrev (refresh) | `nfl/targets.py`, `nfl/teams.py` | — | **stop** on unmapped **team**; unmatched **names** print on stderr / JSON `targets`, not fatal | add Odds full name to `TEAMS`; do not invent player aliases (week-1 BAL: Devontez Walker is absent — see [`targets.md`](targets.md)) |
+| `TARGETS_GANGSTASH_KEY` | `--targets-source=gangstash` and no key / no cache | `nfl/targets.py`, `nfl/gangstash.py` | `GANGSTASH_API_KEY` | **degrade** — usage 1.0 | `--skip-targets` or `--targets-source=lineups` |
+| `TARGETS_GANGSTASH` | gangstash `dataset=targets` HTTP, truncated board, or bad fields | `nfl/gangstash_data.py`, `nfl/targets.py` | cache `nfl/data/gangstash-data/` | **stop** | `--targets-source=lineups` |
+| `TARGETS_SOURCE` | unknown `--targets-source` | `nfl/targets.py` | — | **stop** | `lineups` or `gangstash` |
+| `TARGETS_JOIN` | team code ↔ FanDuel abbrev (Lineups refresh or gangstash `team_fd`) | `nfl/targets.py`, `nfl/teams.py` | — | **stop** on unmapped **team**; unmatched **names** print on stderr / JSON `targets`, not fatal | add the abbrev to `TEAMS`; do not invent player aliases (week-1 BAL: Devontez Walker is absent — see [`targets.md`](targets.md)) |
 | `SNAPS_LINEUPS` | Lineups.com RB/WR/TE snap-count pages (public HTML + SSR JSON) | `nfl/snaps.py` | grant: [`lineups-authorization.md`](lineups-authorization.md) | **stop** | omit snaps refresh |
 | `SNAPS_CSV` | local `nfl/data/snaps.csv` (or `--snaps-csv`) missing/empty/bad | `nfl/snaps.py` | none — produced by `python3 -m nfl.snaps --refresh` | **degrade** — RB usage uses targets or 1.0 | `--skip-snaps` |
 | `SNAPS_JOIN` | Lineups full team name ↔ FanDuel abbrev (snaps refresh) | `nfl/snaps.py`, `nfl/teams.py` | — | **stop** on unmapped **team**; unmatched **names** print on stderr / JSON `snaps`, not fatal | add Odds full name to `TEAMS`; do not invent player aliases |
@@ -45,14 +51,15 @@ Skill pointer: `.cursor/skills/optimize-nfl-classic/references/sources.md`.
 | `PFF_PRO` | PFF Pro API | not wired |
 | `ANYTIME_TD` | anytime-TD prop strings | not scored; counted in `unmapped_props` (`nfl/props.py`) |
 | `PROPS_LINEUPS` | Lineups player-prop pages | inventoried only: `https://www.lineups.com/nfl/player-prop-bets/` — Gangstash is the overlay |
+| `TEAM_STATS` | gangstash `team_stats` / `team_stats_weekly` | fetch/cache only (`python3 -m nfl.gangstash_data`). Not an ILP input. Field names unconfirmed. CLI chokes: `TEAM_STATS_GANGSTASH_KEY`, `TEAM_STATS_GANGSTASH` |
 
 Do not scrape FanDuel. Do not `--refresh-props` unless asked (refetches the Gangstash board).
 
 ## Stop vs degrade (quick)
 
-- **Must have to score the slate:** CSV, lines key + fetch + join.
-- **May skip:** ESPN injuries (`--skip-injuries`), OurLads depth (`--skip-depth`), Lineups RB/WR/TE targets (`--skip-targets` or missing CSV), Lineups snaps (`--skip-snaps` or missing CSV), props (`--skip-props` or missing Gangstash key and no cache).
-- **Optional depth fallback:** `--depth-source=espn` (`DEPTH_ESPN`; often 403).
+- **Must have to score the slate:** CSV, lines key + fetch + join. Default lines key is `ODDS_API_KEY` (`LINES_KEY`). `--lines-source=gangstash` uses `GANGSTASH_API_KEY` (`LINES_GANGSTASH_KEY`).
+- **May skip:** ESPN injuries (`--skip-injuries`), OurLads depth (`--skip-depth`), Lineups RB/WR/TE targets (`--skip-targets`, missing CSV, or gangstash targets with no key and no cache), Lineups snaps (`--skip-snaps` or missing CSV), props (`--skip-props` or missing Gangstash key and no cache).
+- **Optional depth:** `--depth-source=espn` (`DEPTH_ESPN`; often 403) or `--depth-source=gangstash` (`DEPTH_GANGSTASH`). Default remains OurLads.
 
 Depth: [`ourlads-depth.md`](ourlads-depth.md).
 - **May degrade:** PuLP → greedy (label the lineup).
