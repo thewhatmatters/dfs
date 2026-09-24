@@ -33,6 +33,9 @@ ENDPOINT = "https://vmzgpslqoeuqmdchdekm.supabase.co/functions/v1/props"
 FUNCTIONS_BASE = "https://vmzgpslqoeuqmdchdekm.supabase.co/functions/v1"
 CACHE_DIR = Path(__file__).resolve().parent / "data" / "gangstash-props"
 DATA_CACHE_DIR = Path(__file__).resolve().parent / "data" / "gangstash-data"
+# /data pages are 1,000 rows. The server caps a result at 20,000.
+PAGE_SIZE = 1000
+MAX_ROWS = 20_000
 
 # Logical dataset → env override. Defaults are the live `dataset=` values.
 DATASET_ENV = {
@@ -281,9 +284,16 @@ def _newest_dataset_cache(
     return None
 
 
-def _live_dataset(dataset: str, params: dict[str, str]) -> dict:
+def _page_url(dataset: str, params: dict[str, str], offset: int) -> str:
     query = {"dataset": dataset, **params}
-    url = data_endpoint() + "?" + urllib.parse.urlencode(query, safe=",")
+    if offset:
+        query["offset"] = str(offset)
+    return data_endpoint() + "?" + urllib.parse.urlencode(query, safe=",")
+
+
+def _live_dataset_page(dataset: str, params: dict[str, str], offset: int) -> dict:
+    """One page. First page omits offset. Later pages send offset=1000, 2000, …"""
+    url = _page_url(dataset, params, offset)
     try:
         payload, _hdrs = http_json(url, headers={"x-api-key": _data_key()})
     except GangstashDataKeyMissing:
@@ -293,6 +303,28 @@ def _live_dataset(dataset: str, params: dict[str, str]) -> dict:
     if not isinstance(payload, dict) or not isinstance(payload.get("data"), list):
         raise GangstashDataError(f"gangstash {dataset} response is not {{data: [...]}}")
     return payload
+
+
+def _live_dataset(dataset: str, params: dict[str, str]) -> dict:
+    """Follow truncated pages of PAGE_SIZE up to MAX_ROWS. Cache the full board."""
+    rows: list[dict] = []
+    offset = 0
+    max_pages = max(1, MAX_ROWS // PAGE_SIZE)
+    for page in range(max_pages):
+        payload = _live_dataset_page(dataset, params, offset)
+        chunk = list(payload["data"])
+        rows.extend(chunk)
+        if not payload.get("truncated"):
+            return {"data": rows, "truncated": False}
+        if page + 1 >= max_pages or len(rows) >= MAX_ROWS:
+            raise GangstashTruncated(
+                f"gangstash {dataset} truncated=true after {len(rows)} rows "
+                f"(page size {PAGE_SIZE}, cap {MAX_ROWS}); refusing a partial board"
+            )
+        offset += PAGE_SIZE
+    raise GangstashTruncated(
+        f"gangstash {dataset} truncated=true after {len(rows)} rows"
+    )
 
 
 def fetch_dataset(

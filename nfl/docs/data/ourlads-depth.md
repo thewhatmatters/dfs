@@ -10,8 +10,8 @@ missing from the raw HTML, fail loud — do not auto-switch to a browser.
 
 Default depth path for `nfl.optimize` is OurLads. ESPN
 `site.api.../depthcharts` is optional (`--depth-source=espn`) and often 403.
-`--depth-source=gangstash` reads `dataset=depth_charts` (field names still
-to confirm; see [`gangstash.md`](gangstash.md)).
+`--depth-source=gangstash` reads `dataset=depth_charts` for base offense
+`pos_grp` `3WR 1TE` (`pos_rank` is the depth rank). See [`gangstash.md`](gangstash.md).
 
 ## Join
 

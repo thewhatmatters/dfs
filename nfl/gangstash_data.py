@@ -1,13 +1,14 @@
 """Gangstash `/data` datasets: targets, game lines, depth, team stats.
 
-Field names live here so a live payload can be confirmed in one place.
-Fetch/cache is `nfl.gangstash.fetch_dataset`. This module does not score.
+Field names match the live Edge Function. Fetch/cache is
+`nfl.gangstash.fetch_dataset` (pages of 1,000, cap 20,000). This module
+does not score.
 
 RB snap share is not on these datasets. The RB usage blend still reads
 Lineups snap share.
 
 Do not send a Supabase service-role key. Auth is `GANGSTASH_API_KEY`
-(`x-api-key`) inside `nfl.gangstash`.
+(`x-api-key`). The server also accepts Bearer; this client sends `x-api-key`.
 """
 
 from __future__ import annotations
@@ -28,22 +29,9 @@ from nfl.names import match_key
 from nfl.teams import require_fd
 
 TARGET_POSITIONS = frozenset({"RB", "WR", "TE"})
-
-# Canonical keys are first. Later names are aliases if the live payload differs.
-# Confirm the canonical set once the endpoint is live — see nfl/docs/data/gangstash.md.
-
-
-def _pick(row: dict, *keys: str):
-    for key in keys:
-        if key not in row:
-            continue
-        val = row[key]
-        if val is None:
-            continue
-        if isinstance(val, str) and not val.strip():
-            continue
-        return val
-    return None
+BASE_OFFENSE_POS_GRP = "3WR 1TE"
+TEAM_STATS_SIDES = frozenset({"offense", "defense"})
+DEFAULT_SEASON_TYPE = "REG"
 
 
 def _str(val) -> str:
@@ -98,32 +86,32 @@ def fetch_targets(
 
 
 def parse_target_row(row: dict) -> dict | None:
-    """One player-week. None when the position is not RB/WR/TE.
+    """One player-week. None when position is not RB/WR/TE.
 
-    Assumed fields: player_name, team_fd, position, week, targets,
-    target_share (0–1), team_targets, targets_total, targets_avg,
-    gsis_id, player_id.
+    Live fields: season, week, position, player_name, team_fd, targets,
+    target_share, air_yards_share, wopr, receptions, rec_yards, team_targets,
+    team_pass_attempts, gsis_id, player_id. No targets_total or targets_avg.
     """
     if not isinstance(row, dict):
         return None
-    name = _str(_pick(row, "player_name", "name", "player"))
+    name = _str(row.get("player_name"))
     if not name:
         raise GangstashDataError(
             "gangstash targets row missing player_name "
-            f"(keys {sorted(row)}; confirm field names)"
+            f"(keys {sorted(row)})"
         )
-    team_raw = _str(_pick(row, "team_fd", "team"))
+    team_raw = _str(row.get("team_fd"))
     if not team_raw:
         raise GangstashDataError(f"gangstash targets row missing team_fd for {name}")
-    pos = _str(_pick(row, "position", "pos")).upper()
+    pos = _str(row.get("position")).upper()
     if not pos:
         raise GangstashDataError(f"gangstash targets row missing position for {name}")
     if pos not in TARGET_POSITIONS:
         return None
-    week = _int(_pick(row, "week"))
+    week = _int(row.get("week"))
     if week is None or week < 1:
         raise GangstashDataError(f"gangstash targets row missing week for {name}")
-    targets = _int(_pick(row, "targets"))
+    targets = _int(row.get("targets"))
     if targets is None:
         raise GangstashDataError(f"gangstash targets row missing targets for {name}")
     team = require_fd(team_raw)
@@ -132,13 +120,17 @@ def parse_target_row(row: dict) -> dict | None:
         "team_fd": team.fd,
         "position": pos,
         "week": week,
+        "season": _int(row.get("season")),
         "targets": targets,
-        "target_share": _float(_pick(row, "target_share", "targetShare")),
-        "team_targets": _int(_pick(row, "team_targets", "teamTargets")),
-        "targets_total": _int(_pick(row, "targets_total", "targetsTotal")),
-        "targets_avg": _float(_pick(row, "targets_avg", "targetsAvg")),
-        "gsis_id": _str(_pick(row, "gsis_id", "gsisId")) or None,
-        "player_id": _str(_pick(row, "player_id", "playerId")) or None,
+        "target_share": _float(row.get("target_share")),
+        "team_targets": _int(row.get("team_targets")),
+        "team_pass_attempts": _int(row.get("team_pass_attempts")),
+        "air_yards_share": _float(row.get("air_yards_share")),
+        "wopr": _float(row.get("wopr")),
+        "receptions": _int(row.get("receptions")),
+        "rec_yards": _int(row.get("rec_yards")),
+        "gsis_id": _str(row.get("gsis_id")) or None,
+        "player_id": _str(row.get("player_id")) or None,
     }
 
 
@@ -202,18 +194,13 @@ def aggregate_target_window(
             raise GangstashDataError(
                 "gangstash targets window needs team_targets on each row to compute "
                 "sum(targets)/sum(team_targets); field missing for "
-                f"{name} (confirm team_targets)"
+                f"{name}"
             )
         else:
             raise GangstashDataError(
                 f"gangstash targets team_targets sum is 0 for {name}"
             )
-        latest = max(items, key=lambda i: int(i["week"]))
         n_weeks = len(items)
-        totals = [i["targets_total"] for i in items if i["targets_total"] is not None]
-        avg = latest["targets_avg"]
-        if avg is None:
-            avg = tgt_sum / n_weeks
 
         def _keep(key: str):
             found = None
@@ -232,8 +219,8 @@ def aggregate_target_window(
                 "targets": tgt_sum,
                 "target_share": float(share),
                 "team_targets": team_sum,
-                "targets_total": max(int(v) for v in totals) if totals else tgt_sum,
-                "targets_avg": float(avg),
+                "targets_total": tgt_sum,
+                "targets_avg": tgt_sum / n_weeks,
                 "gsis_id": _keep("gsis_id"),
                 "player_id": _keep("player_id"),
             }
@@ -254,57 +241,39 @@ class GangstashGameLine:
     commence_time: str | None
 
 
-def _moneylines(row: dict) -> tuple[float | None, float | None]:
-    block = row.get("moneylines")
-    if block is None:
-        block = row.get("moneyline")
-    if isinstance(block, dict):
-        return (
-            _float(_pick(block, "home", "home_moneyline", "home_ml")),
-            _float(_pick(block, "away", "away_moneyline", "away_ml")),
-        )
-    return (
-        _float(_pick(row, "home_moneyline", "moneyline_home")),
-        _float(_pick(row, "away_moneyline", "moneyline_away")),
-    )
-
-
 def parse_game_line(row: dict) -> GangstashGameLine | None:
-    """Assumed fields: home_team_fd, away_team_fd, spread, total, moneylines, commence_time.
-
-    `spread` is the home spread. `moneylines` is assumed `{home, away}`.
-    Flat home_moneyline / away_moneyline are accepted when that object is absent.
+    """Live fields: game_id, season, week, commence_time, home_team_fd,
+    away_team_fd, spread (home line, negative = home favored), total,
+    home_moneyline, away_moneyline, updated_at.
     """
     if not isinstance(row, dict):
         return None
-    home_raw = _str(_pick(row, "home_team_fd", "home_fd", "home"))
-    away_raw = _str(_pick(row, "away_team_fd", "away_fd", "away"))
-    spread = _float(_pick(row, "spread", "home_spread", "spread_home"))
-    total = _float(_pick(row, "total", "game_total"))
+    home_raw = _str(row.get("home_team_fd"))
+    away_raw = _str(row.get("away_team_fd"))
+    spread = _float(row.get("spread"))
+    total = _float(row.get("total"))
     if not home_raw and not away_raw and spread is None and total is None:
         return None
     if not home_raw or not away_raw:
         raise GangstashDataError(
             "gangstash game_lines row missing home_team_fd/away_team_fd "
-            f"(keys {sorted(row)}; confirm field names)"
+            f"(keys {sorted(row)})"
         )
     if spread is None or total is None:
         raise GangstashDataError(
             f"gangstash game_lines row {away_raw}@{home_raw} missing spread/total "
-            f"(keys {sorted(row)}; confirm field names)"
+            f"(keys {sorted(row)})"
         )
     home = require_fd(home_raw)
     away = require_fd(away_raw)
-    home_ml, away_ml = _moneylines(row)
-    commence = _str(_pick(row, "commence_time", "commence", "kickoff")) or None
     return GangstashGameLine(
         home_fd=home.fd,
         away_fd=away.fd,
         spread=spread,
         total=total,
-        home_moneyline=home_ml,
-        away_moneyline=away_ml,
-        commence_time=commence,
+        home_moneyline=_float(row.get("home_moneyline")),
+        away_moneyline=_float(row.get("away_moneyline")),
+        commence_time=_str(row.get("commence_time")) or None,
     )
 
 
@@ -349,27 +318,36 @@ class GangstashDepthSlot:
 
 
 def parse_depth_slot(row: dict) -> GangstashDepthSlot | None:
-    """Assumed fields: player_name, team_fd, position, depth_rank (1 = starter)."""
+    """One base-offense skill row. Other `pos_grp` values are skipped.
+
+    Live fields: team, team_fd, pos_grp, pos_abb, pos_name, pos_slot, pos_rank,
+    player_name, gsis_id, espn_id, player_id, snapshot_at.
+    `pos_rank` is the depth rank (WR2 = pos_abb WR, pos_rank 2). Rank does
+    not reset inside an alignment.
+    """
     if not isinstance(row, dict):
         return None
-    name = _str(_pick(row, "player_name", "name", "player"))
-    team_raw = _str(_pick(row, "team_fd", "team"))
-    pos = _str(_pick(row, "position", "pos"))
-    rank_raw = _pick(row, "depth_rank", "rank", "depth_chart_rank")
+    grp = _str(row.get("pos_grp"))
+    if grp != BASE_OFFENSE_POS_GRP:
+        return None
+    name = _str(row.get("player_name"))
+    team_raw = _str(row.get("team_fd"))
+    pos = _str(row.get("pos_abb")).upper()
+    rank_raw = row.get("pos_rank")
     if not name and not team_raw and not pos and rank_raw is None:
         return None
     if not name or not team_raw or not pos or rank_raw is None:
         raise GangstashDataError(
-            "gangstash depth_charts row missing player_name, team_fd, position, "
-            f"or depth_rank (keys {sorted(row)}; confirm field names)"
+            "gangstash depth_charts row missing player_name, team_fd, pos_abb, "
+            f"or pos_rank (keys {sorted(row)})"
         )
     rank = _int(rank_raw)
     if rank is None or rank < 1:
-        raise GangstashDataError(f"gangstash depth_rank {rank_raw!r} for {name}")
+        raise GangstashDataError(f"gangstash pos_rank {rank_raw!r} for {name}")
     team = require_fd(team_raw)
     return GangstashDepthSlot(
         team_fd=team.fd,
-        position=pos.upper(),
+        position=pos,
         rank=rank,
         player_name=name,
     )
@@ -379,15 +357,18 @@ def fetch_depth_charts(
     *,
     team: str | None = None,
     position: str | None = None,
+    pos_grp: str | None = BASE_OFFENSE_POS_GRP,
     refresh: bool = False,
     cache_day: date | None = None,
 ) -> tuple[list[dict], dict]:
-    """`dataset=depth_charts`. `team` and `position` are optional filters."""
+    """`dataset=depth_charts`. `position` is pos_abb. Default pos_grp is 3WR 1TE."""
     params: dict[str, str] = {}
     if team:
         params["team"] = team.strip().upper()
     if position:
         params["position"] = position.strip().upper()
+    if pos_grp:
+        params["pos_grp"] = pos_grp.strip()
     return fetch_dataset(
         dataset_id("depth_charts"),
         params,
@@ -396,20 +377,39 @@ def fetch_depth_charts(
     )
 
 
+def _side_param(side: str | None) -> str | None:
+    if side is None or not str(side).strip():
+        return None
+    value = str(side).strip().lower()
+    if value not in TEAM_STATS_SIDES:
+        raise GangstashDataError(
+            f"gangstash team_stats side must be offense or defense, got {side!r}"
+        )
+    return value
+
+
 def fetch_team_stats(
     *,
     season: int,
     side: str | None = None,
     team: str | None = None,
+    season_type: str = DEFAULT_SEASON_TYPE,
     refresh: bool = False,
     cache_day: date | None = None,
 ) -> tuple[list[dict], dict]:
-    """Season team stats. Cached only — not an optimizer input."""
+    """Season team stats. Cached only — not an optimizer input.
+
+    Sends `season_type=REG` unless overridden. Rows stay raw.
+    """
     if int(season) < 1:
         raise GangstashDataError("gangstash team_stats requires season")
-    params: dict[str, str] = {"season": str(int(season))}
-    if side:
-        params["side"] = side.strip()
+    params: dict[str, str] = {
+        "season": str(int(season)),
+        "season_type": (season_type or DEFAULT_SEASON_TYPE).strip() or DEFAULT_SEASON_TYPE,
+    }
+    side_value = _side_param(side)
+    if side_value:
+        params["side"] = side_value
     if team:
         params["team"] = team.strip().upper()
     return fetch_dataset(
@@ -424,20 +424,24 @@ def fetch_team_stats_weekly(
     *,
     season: int,
     week: int | None = None,
+    weeks: list[int] | None = None,
     team: str | None = None,
     refresh: bool = False,
     cache_day: date | None = None,
 ) -> tuple[list[dict], dict]:
     """Weekly team stats. Cached only — not an optimizer input.
 
-    This client always sends `season`. Confirm whether the live weekly
-    dataset requires it.
+    `week` is one week or a comma list (`weeks=[1, 2]`). Rows stay raw.
     """
     if int(season) < 1:
         raise GangstashDataError("gangstash team_stats_weekly requires season")
-    params: dict[str, str] = {"season": str(int(season))}
-    if week is not None:
-        params["week"] = str(int(week))
+    week_list = list(weeks) if weeks else ([int(week)] if week is not None else [])
+    if not week_list:
+        raise GangstashDataError("gangstash team_stats_weekly requires week")
+    params: dict[str, str] = {
+        "season": str(int(season)),
+        "week": ",".join(str(int(w)) for w in week_list),
+    }
     if team:
         params["team"] = team.strip().upper()
     return fetch_dataset(
@@ -446,6 +450,18 @@ def fetch_team_stats_weekly(
         refresh=refresh,
         cache_day=cache_day,
     )
+
+
+def _parse_week_arg(raw: str | None) -> list[int] | None:
+    if raw is None or not str(raw).strip():
+        return None
+    out: list[int] = []
+    for part in str(raw).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        out.append(int(part))
+    return out or None
 
 
 def _print_fetch(kind: str, rows: list[dict], meta: dict) -> None:
@@ -462,12 +478,13 @@ def main(argv: list[str] | None = None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     ts = sub.add_parser("team-stats", help="cache dataset=team_stats")
     ts.add_argument("--season", type=int, required=True)
-    ts.add_argument("--side", default=None)
+    ts.add_argument("--side", default=None, help="offense or defense")
     ts.add_argument("--team", default=None)
+    ts.add_argument("--season-type", default=DEFAULT_SEASON_TYPE)
     ts.add_argument("--refresh", action="store_true")
     tw = sub.add_parser("team-stats-weekly", help="cache dataset=team_stats_weekly")
     tw.add_argument("--season", type=int, required=True)
-    tw.add_argument("--week", type=int, default=None)
+    tw.add_argument("--week", default=None, help="one week or a comma list, e.g. 1,2")
     tw.add_argument("--team", default=None)
     tw.add_argument("--refresh", action="store_true")
     args = ap.parse_args(argv)
@@ -477,13 +494,15 @@ def main(argv: list[str] | None = None) -> int:
                 season=args.season,
                 side=args.side,
                 team=args.team,
+                season_type=args.season_type,
                 refresh=args.refresh,
             )
             _print_fetch("team_stats", rows, meta)
         else:
+            week_list = _parse_week_arg(args.week)
             rows, meta = fetch_team_stats_weekly(
                 season=args.season,
-                week=args.week,
+                weeks=week_list,
                 team=args.team,
                 refresh=args.refresh,
             )

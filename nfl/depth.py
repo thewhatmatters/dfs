@@ -2,8 +2,9 @@
 
 Default path is authorized OurLads HTML → nfl/data/depth.csv.
 `--depth-source=espn` is an optional fallback (ESPN site.api often 403).
-`--depth-source=gangstash` reads `dataset=depth_charts` (field names still
-to confirm). Rank 1 is a role prior (starter at that alignment), not 100% snaps.
+`--depth-source=gangstash` reads `dataset=depth_charts`, base offense
+`pos_grp` `3WR 1TE`. `pos_rank` is the depth rank (WR2 = pos_abb WR,
+pos_rank 2). Rank 1 is a role prior, not 100% snaps.
 """
 
 from __future__ import annotations
@@ -188,8 +189,10 @@ def ingest_gangstash_slate_depth(
 ) -> list[DepthRow]:
     """Map gangstash depth_charts onto slate FanDuel teams.
 
-    Missing skill rows for a slate team is fatal. Non-skill positions are
-    skipped. `out_csv` is written only when the caller passes a path so an
+    Keeps `pos_grp` 3WR 1TE. Players who also appear in other groups are
+    dropped with those rows, then the best `pos_rank` wins per player.
+    Missing skill rows for a slate team is fatal. Non-skill `pos_abb` values
+    are skipped. `out_csv` is written only when the caller passes a path so an
     optimize run does not replace the OurLads `depth.csv`.
     """
     canon = {

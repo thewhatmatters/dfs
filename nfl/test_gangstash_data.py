@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from datetime import date
@@ -11,11 +12,13 @@ from unittest.mock import patch
 
 from nfl.depth import GangstashDepthError, ingest_slate_depth
 from nfl.gangstash import (
+    GangstashDataError,
     GangstashDataKeyMissing,
     GangstashTruncated,
     dataset_cache_file,
     fetch_dataset,
 )
+from nfl.http import HttpAuthError, HttpError
 from nfl.gangstash_data import (
     aggregate_target_window,
     fetch_game_lines,
@@ -152,8 +155,11 @@ class TargetWindowTest(unittest.TestCase):
                     "targets": 8,
                     "target_share": 8 / 30,
                     "team_targets": 30,
-                    "targets_total": 8,
-                    "targets_avg": 8,
+                    "team_pass_attempts": 32,
+                    "air_yards_share": 0.4,
+                    "wopr": 0.55,
+                    "receptions": 6,
+                    "rec_yards": 80,
                     "gsis_id": "00-0035676",
                     "player_id": "brown",
                 },
@@ -165,14 +171,15 @@ class TargetWindowTest(unittest.TestCase):
                     "targets": 4,
                     "target_share": 4 / 20,
                     "team_targets": 20,
-                    "targets_total": 12,
-                    "targets_avg": 6,
+                    "team_pass_attempts": 28,
                 },
             ]
         )
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["week"], 2)
         self.assertEqual(rows[0]["targets"], 12)
+        self.assertEqual(rows[0]["targets_total"], 12)
+        self.assertAlmostEqual(rows[0]["targets_avg"], 6.0)
         self.assertAlmostEqual(rows[0]["target_share"], 12 / 50)
         self.assertEqual(rows[0]["team_fd"], "PHI")
         self.assertEqual(rows[0]["gsis_id"], "00-0035676")
@@ -342,16 +349,20 @@ class TargetWindowTest(unittest.TestCase):
 
 
 class GameLinesTest(unittest.TestCase):
-    def test_alias_moneylines_and_spread_names(self) -> None:
+    def test_flat_moneylines_and_home_spread(self) -> None:
         row = parse_game_line(
             {
-                "home_fd": "JAX",
-                "away_fd": "WSH",
-                "home_spread": -2.5,
-                "game_total": 44,
+                "game_id": "2026_03_WAS_JAC",
+                "season": 2026,
+                "week": 3,
+                "home_team_fd": "JAX",
+                "away_team_fd": "WSH",
+                "spread": -2.5,
+                "total": 44,
                 "home_moneyline": -130,
                 "away_moneyline": 110,
-                "kickoff": "2026-09-13T17:00:00Z",
+                "commence_time": "2026-09-24T00:15:00Z",
+                "updated_at": "2026-09-23T12:00:00Z",
             }
         )
         self.assertIsNotNone(row)
@@ -366,10 +377,15 @@ class GameLinesTest(unittest.TestCase):
             {
                 "home_team_fd": "PHI",
                 "away_team_fd": "DAL",
+                "game_id": "2026_01_DAL_PHI",
+                "season": 2026,
+                "week": 1,
                 "spread": -3.5,
                 "total": 45.5,
-                "moneylines": {"home": -170, "away": 145},
+                "home_moneyline": -170,
+                "away_moneyline": 145,
                 "commence_time": "2026-09-13T17:00:00Z",
+                "updated_at": "2026-09-12T18:00:00Z",
             }
         ]
         players = [_pl()]
@@ -433,36 +449,75 @@ class DepthSourceTest(unittest.TestCase):
             {
                 "player_name": "A.J. Brown",
                 "team_fd": "PHI",
-                "position": "WR",
-                "depth_rank": 1,
+                "team": "PHI",
+                "pos_grp": "3WR 1TE",
+                "pos_abb": "WR",
+                "pos_name": "Wide Receiver",
+                "pos_slot": "WR",
+                "pos_rank": 1,
+                "gsis_id": "00-0035676",
+                "espn_id": "404",
+                "player_id": "brown",
+                "snapshot_at": "2026-09-24T00:00:00Z",
+            },
+            {
+                "player_name": "A.J. Brown",
+                "team_fd": "PHI",
+                "pos_grp": "2WR 2TE",
+                "pos_abb": "WR",
+                "pos_rank": 1,
+            },
+            {
+                "player_name": "A.J. Brown",
+                "team_fd": "PHI",
+                "pos_grp": "3WR 1TE",
+                "pos_abb": "WR",
+                "pos_rank": 5,
+            },
+            {
+                "player_name": "DeVonta Smith",
+                "team_fd": "PHI",
+                "pos_grp": "3WR 1TE",
+                "pos_abb": "WR",
+                "pos_rank": 2,
             },
             {
                 "player_name": "Lane Johnson",
                 "team_fd": "PHI",
-                "position": "LT",
-                "depth_rank": 1,
+                "pos_grp": "3WR 1TE",
+                "pos_abb": "LT",
+                "pos_rank": 1,
             },
             {
                 "player_name": "Travis Etienne",
                 "team_fd": "JAX",
-                "position": "RB",
-                "depth_rank": 1,
+                "pos_grp": "3WR 1TE",
+                "pos_abb": "RB",
+                "pos_rank": 1,
             },
         ]
         with patch("nfl.depth.fetch_depth_charts", return_value=(raw, {"live": True})):
             rows = ingest_slate_depth({"PHI", "JAC"}, source="gangstash")
         by_name = {r.name: r for r in rows}
-        self.assertEqual(set(by_name), {"A.J. Brown", "Travis Etienne"})
+        self.assertEqual(set(by_name), {"A.J. Brown", "DeVonta Smith", "Travis Etienne"})
         self.assertEqual(by_name["A.J. Brown"].pos, "WR")
         self.assertEqual(by_name["A.J. Brown"].rank, 1)
+        self.assertEqual(by_name["DeVonta Smith"].rank, 2)
         self.assertEqual(by_name["Travis Etienne"].team, "JAC")
 
-    def test_missing_depth_rank_is_fatal(self) -> None:
-        raw = [{"player_name": "A.J. Brown", "team_fd": "PHI", "position": "WR"}]
+    def test_missing_pos_rank_is_fatal(self) -> None:
+        raw = [
+            {
+                "player_name": "A.J. Brown",
+                "team_fd": "PHI",
+                "pos_grp": "3WR 1TE",
+                "pos_abb": "WR",
+            }
+        ]
         with patch("nfl.depth.fetch_depth_charts", return_value=(raw, {})):
             with self.assertRaises(GangstashDepthError) as ctx:
                 ingest_slate_depth({"PHI"}, source="gangstash")
-        self.assertIn("depth_rank", str(ctx.exception))
+        self.assertIn("pos_rank", str(ctx.exception))
 
     def test_ourlads_source_does_not_call_gangstash(self) -> None:
         with patch("nfl.depth.ingest_ourlads_depth", return_value=[]) as ol, patch(
@@ -479,7 +534,21 @@ class TeamStatsTest(unittest.TestCase):
 
         def fake_http(url, headers=None, timeout=30):
             calls.append(url)
-            return {"data": [{"team": "PHI", "pass_rate": 0.61}], "truncated": False}, {}
+            return {
+                "data": [
+                    {
+                        "team": "PHI",
+                        "team_fd": "PHI",
+                        "side": "offense",
+                        "pass_rate": 0.61,
+                        "neutral_pass_rate": 0.55,
+                        "proe": 0.02,
+                        "success_rate": 0.47,
+                        "epa_per_play": 0.08,
+                    }
+                ],
+                "truncated": False,
+            }, {}
 
         with tempfile.TemporaryDirectory() as tmp, patch(
             "nfl.gangstash.DATA_CACHE_DIR", Path(tmp)
@@ -498,8 +567,10 @@ class TeamStatsTest(unittest.TestCase):
         self.assertEqual(weekly, rows)
         self.assertIn("dataset=team_stats", calls[0])
         self.assertIn("season=2026", calls[0])
+        self.assertIn("season_type=REG", calls[0])
         self.assertIn("side=offense", calls[0])
         self.assertIn("team=PHI", calls[0])
+        self.assertEqual(rows[0]["pass_rate"], 0.61)
         self.assertIn("dataset=team_stats_weekly", calls[1])
         self.assertIn("week=2", calls[1])
         self.assertNotIn("secret-key", calls[0])
@@ -521,6 +592,158 @@ class FlagDefaultTest(unittest.TestCase):
         )
         self.assertEqual(args.targets_source, "gangstash")
         self.assertEqual(args.targets_weeks, [1, 2])
+
+
+class PagingTest(unittest.TestCase):
+    def test_truncated_pages_join_and_cache_the_full_board(self) -> None:
+        day = date(2026, 9, 24)
+        calls: list[str] = []
+
+        def fake_http(url, headers=None, timeout=30):
+            calls.append(url)
+            if "offset=" not in url:
+                return {"data": [{"player_name": "A"}], "truncated": True}, {}
+            return {"data": [{"player_name": "B"}], "truncated": False}, {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("nfl.gangstash.envmod.get", side_effect=_env_get), patch(
+                "nfl.gangstash.http_json", side_effect=fake_http
+            ):
+                rows, meta = fetch_dataset(
+                    "targets",
+                    {"season": "2026"},
+                    cache_day=day,
+                    cache_root=root,
+                    refresh=True,
+                )
+            self.assertEqual([r["player_name"] for r in rows], ["A", "B"])
+            self.assertFalse(meta["truncated"])
+            self.assertTrue(meta["live"])
+            cached = json.loads(Path(meta["cache"]).read_text(encoding="utf-8"))
+            self.assertEqual(len(cached["data"]), 2)
+            self.assertFalse(cached["truncated"])
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn("offset=", calls[0])
+        self.assertIn("offset=1000", calls[1])
+        self.assertNotIn("secret-key", calls[0])
+
+    def test_cap_refuses_a_partial_board(self) -> None:
+        def fake_http(url, headers=None, timeout=30):
+            return {"data": [{"player_name": "A"}], "truncated": True}, {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("nfl.gangstash.PAGE_SIZE", 1000), patch(
+                "nfl.gangstash.MAX_ROWS", 2000
+            ), patch("nfl.gangstash.envmod.get", side_effect=_env_get), patch(
+                "nfl.gangstash.http_json", side_effect=fake_http
+            ):
+                with self.assertRaises(GangstashTruncated):
+                    fetch_dataset(
+                        "targets",
+                        {"season": "2026"},
+                        cache_day=date(2026, 9, 24),
+                        cache_root=root,
+                        refresh=True,
+                    )
+            self.assertEqual(list(root.rglob("*.json")), [])
+
+    def test_http_400_and_401_are_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("nfl.gangstash.envmod.get", side_effect=_env_get), patch(
+                "nfl.gangstash.http_json",
+                side_effect=HttpError("HTTP 400: unknown dataset"),
+            ):
+                with self.assertRaises(GangstashDataError) as ctx:
+                    fetch_dataset(
+                        "nope",
+                        {},
+                        cache_day=date(2026, 9, 24),
+                        cache_root=root,
+                        refresh=True,
+                    )
+            self.assertIn("400", str(ctx.exception))
+            with patch("nfl.gangstash.envmod.get", side_effect=_env_get), patch(
+                "nfl.gangstash.http_json",
+                side_effect=HttpAuthError("HTTP 401 (key rejected)."),
+            ):
+                with self.assertRaises(GangstashDataError) as ctx:
+                    fetch_dataset(
+                        "targets",
+                        {"season": "2026"},
+                        cache_day=date(2026, 9, 24),
+                        cache_root=root,
+                        refresh=True,
+                    )
+            self.assertIn("401", str(ctx.exception))
+            self.assertEqual(list(root.rglob("*.json")), [])
+
+
+@unittest.skipUnless(
+    os.environ.get("GANGSTASH_API_KEY") and os.environ.get("GANGSTASH_LIVE_SMOKE") == "1",
+    "set GANGSTASH_API_KEY and GANGSTASH_LIVE_SMOKE=1 to hit gangstash",
+)
+class LiveSmokeTest(unittest.TestCase):
+    """Optional live check. Skipped unless both the key and the flag are set."""
+
+    def test_live_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            targets, tmeta = fetch_dataset(
+                "targets",
+                {"season": "2026", "week": "1,2"},
+                refresh=True,
+                cache_root=root,
+                cache_day=date.today(),
+            )
+            self.assertTrue(tmeta["live"])
+            self.assertFalse(tmeta["truncated"])
+            self.assertGreaterEqual(len(targets), 1)
+            row = targets[0]
+            for key in (
+                "season",
+                "week",
+                "position",
+                "player_name",
+                "team_fd",
+                "targets",
+                "target_share",
+                "team_targets",
+                "gsis_id",
+                "player_id",
+            ):
+                self.assertIn(key, row)
+            self.assertNotIn("targets_total", row)
+            self.assertNotIn("targets_avg", row)
+            self.assertIn(row["position"], {"WR", "TE", "RB"})
+
+            lines, lmeta = fetch_dataset(
+                "game_lines",
+                {"season": "2026", "week": "3"},
+                refresh=True,
+                cache_root=root,
+                cache_day=date.today(),
+            )
+            self.assertTrue(lmeta["live"])
+            self.assertEqual(len(lines), 16)
+            game = lines[0]
+            for key in (
+                "game_id",
+                "season",
+                "week",
+                "commence_time",
+                "home_team_fd",
+                "away_team_fd",
+                "spread",
+                "total",
+                "home_moneyline",
+                "away_moneyline",
+                "updated_at",
+            ):
+                self.assertIn(key, game)
+            self.assertNotIn("moneylines", game)
 
 
 if __name__ == "__main__":

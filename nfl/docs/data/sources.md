@@ -51,7 +51,7 @@ Skill pointer: `.cursor/skills/optimize-nfl-classic/references/sources.md`.
 | `PFF_PRO` | PFF Pro API | not wired |
 | `ANYTIME_TD` | anytime-TD prop strings | not scored; counted in `unmapped_props` (`nfl/props.py`) |
 | `PROPS_LINEUPS` | Lineups player-prop pages | inventoried only: `https://www.lineups.com/nfl/player-prop-bets/` — Gangstash is the overlay |
-| `TEAM_STATS` | gangstash `team_stats` / `team_stats_weekly` | fetch/cache only (`python3 -m nfl.gangstash_data`). Not an ILP input. Field names unconfirmed. CLI chokes: `TEAM_STATS_GANGSTASH_KEY`, `TEAM_STATS_GANGSTASH` |
+| `TEAM_STATS` | gangstash `team_stats` / `team_stats_weekly` | fetch/cache only (`python3 -m nfl.gangstash_data`). Not an ILP input. CLI chokes: `TEAM_STATS_GANGSTASH_KEY`, `TEAM_STATS_GANGSTASH` |
 
 Do not scrape FanDuel. Do not `--refresh-props` unless asked (refetches the Gangstash board).
 
