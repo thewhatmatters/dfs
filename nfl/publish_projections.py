@@ -77,6 +77,9 @@ CHUNK_SIZE = 5000
 OUT_DIR = Path(__file__).resolve().parent / "data" / "projections"
 ET = ZoneInfo("America/New_York")
 SKILL_POSITIONS = ("QB", "RB", "WR", "TE")
+# Same-rank tie for a player listed at two positions. Lower sorts first.
+# A QB1 row is chosen before this order and is never replaced.
+_DEPTH_POS_TIE = {"TE": 0, "RB": 1, "WR": 2, "QB": 3}
 ROW_FIELDS = (
     "season",
     "week",
@@ -489,10 +492,115 @@ def _merge_ids(*indexes: dict[tuple[str, str], tuple[str | None, str | None]]):
     return merged
 
 
+def _depth_row_identity(
+    item: dict,
+    ids: dict[tuple[str, str], tuple[str | None, str | None]],
+) -> tuple[str | None, str | None, str | None]:
+    """``(gsis, player_id, shared)``. ``shared`` is the id that would collide."""
+    team = item["team"]
+    gsis, pid = ids.get((team, match_key(item["name"])), (None, None))
+    row = item["row"]
+    gsis = gsis or _opt_str(row.get("gsis_id"))
+    pid = pid or _opt_str(row.get("player_id"))
+    return gsis, pid, gsis or pid
+
+
+def _fanduel_skill_positions(
+    players: list[Player] | None,
+) -> dict[tuple[str, str], str]:
+    """``(team, match_key) → FanDuel skill position``. The first skill row wins."""
+    out: dict[tuple[str, str], str] = {}
+    for pl in players or []:
+        try:
+            team = require_fd(pl.team).fd
+        except UnmappedTeam:
+            continue
+        pos = (pl.position or "").upper()
+        if pos not in SKILL_POSITIONS:
+            continue
+        key = (team, match_key(pl.name))
+        if key not in out:
+            out[key] = pos
+    return out
+
+
+def _choose_depth_item(group: list[dict], fd_pos: str | None) -> dict:
+    """One chart row for a player listed at more than one position.
+
+    A QB1 row is kept even when the FanDuel CSV or a same-rank tie would
+    pick something else. Otherwise the CSV position wins when that
+    position is on the chart. With no CSV hit, the lower depth rank wins,
+    and equal ranks break TE > RB > WR > QB.
+    """
+    qb1 = [item for item in group if item["pos"] == "QB" and item["rank"] == 1]
+    if qb1:
+        return qb1[0]
+    if fd_pos:
+        matched = [item for item in group if item["pos"] == fd_pos]
+        if matched:
+            return matched[0]
+    return min(
+        group,
+        key=lambda item: (
+            item["rank"],
+            _DEPTH_POS_TIE.get(item["pos"], 9),
+            item["name"],
+        ),
+    )
+
+
+def _collapse_depth_best(
+    items: list[dict],
+    slate: dict[str, tuple[TeamLine, str | None]],
+    ids: dict[tuple[str, str], tuple[str | None, str | None]],
+    csv_players: list[Player] | None,
+) -> list[dict]:
+    """Drop extra positions for one player id in one game.
+
+    The kept row is the only usage profile. Target and snap shares are
+    joined later, once, onto that player. They are not summed across the
+    dropped position.
+    """
+    fd = _fanduel_skill_positions(csv_players)
+    groups: dict[tuple[str, str], list[dict]] = {}
+    order: list[tuple[str, str]] = []
+    for item in items:
+        _gsis, _pid, shared = _depth_row_identity(item, ids)
+        if not shared:
+            continue
+        game = slate[item["team"]][0].game
+        key = (game, shared)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(item)
+    drop: set[int] = set()
+    for key in order:
+        group = groups[key]
+        if len(group) < 2:
+            continue
+        fd_pos = None
+        for item in group:
+            fd_pos = fd.get((item["team"], match_key(item["name"])))
+            if fd_pos:
+                break
+        picked = _choose_depth_item(group, fd_pos)
+        positions = ",".join(item["pos"] for item in group)
+        print(
+            f"depth collapse {key[1]} positions={positions} chose={picked['pos']}",
+            file=sys.stderr,
+        )
+        for item in group:
+            if item is not picked:
+                drop.add(id(item))
+    return [item for item in items if id(item) not in drop]
+
+
 def _depth_players(
     rows: list[dict],
     slate: dict[str, tuple[TeamLine, str | None]],
     ids: dict[tuple[str, str], tuple[str | None, str | None]],
+    csv_players: list[Player] | None = None,
 ) -> list[tuple[Player, str | None, str | None, str | None]]:
     best: dict[tuple[str, str, str], dict] = {}
     for row in rows:
@@ -517,8 +625,9 @@ def _depth_players(
         prev = best.get(key)
         if prev is None or rank < prev["rank"]:
             best[key] = {"name": name, "team": team, "pos": pos, "rank": rank, "row": row}
+    chosen = _collapse_depth_best(list(best.values()), slate, ids, csv_players)
     built: list[tuple[Player, str | None, str | None, str | None]] = []
-    for item in best.values():
+    for item in chosen:
         team = item["team"]
         line, game_id = slate[team]
         opponent = line.away_fd if team == line.home_fd else line.home_fd
@@ -649,7 +758,7 @@ def build_entries(
     if not slate:
         raise StaleInputs("no game_lines for the target week")
     ids = _merge_ids(_id_index(depth_rows), _id_index(extra_id_rows or []))
-    skill = _depth_players(depth_rows, slate, ids)
+    skill = _depth_players(depth_rows, slate, ids, csv_players=csv_players)
     players = [p for p, *_r in skill]
     side = {(p.pid): (gsis, pid, gid) for p, gsis, pid, gid in skill}
     if target_rows:
