@@ -11,11 +11,11 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from nfl.backtest import _depth_table
+from nfl.backtest import _depth_table, index_actual_rows
 from nfl.gangstash import (
     GangstashDataError,
     capture_pulls,
@@ -28,18 +28,23 @@ from nfl.gangstash_data import (
     parse_depth_slot,
     uniquify_depth_ranks,
 )
+
 from nfl.holdout import (
     HoldoutMetricsError,
     WeekLoad,
     _calibration_block,
+    _excluded_out,
+    _fmt,
     _game_actuals,
     _pair_roles,
+    _resolve_actual,
     _scale_pace,
     _scale_rz,
     closing_prop_points,
     draw_percentile,
     fetch_prop_rows,
     format_report,
+    index_actual_ids,
     index_prop_lines,
     is_pregame_starter,
     _pack_draws,
@@ -638,6 +643,218 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(len(sim.draws["a"]), 5)
         self.assertEqual(sim.game_draws[0][1], "NO")
         self.assertEqual(sim.game_draws[0][2], "DET")
+
+
+class ActualJoinTest(unittest.TestCase):
+    def test_gsis_id_wins_over_a_different_name(self) -> None:
+        rows = [
+            {
+                "player_name": "Joshua Palmer",
+                "team_fd": "LAC",
+                "fd_points": 14.5,
+                "gsis_id": "00-PALMER",
+                "targets": 6,
+            }
+        ]
+        player = _pl(pid="00-PALMER", name="Josh Palmer", team="LAC", opponent="DEN")
+        found = _resolve_actual(player, index_actual_rows(rows), index_actual_ids(rows), {})
+        self.assertIsNotNone(found)
+        assert found is not None
+        actual, _row, how = found
+        self.assertEqual(how, "id")
+        self.assertEqual(actual, 14.5)
+
+    def test_name_is_the_fallback_when_the_id_misses(self) -> None:
+        rows = [
+            {
+                "player_name": "Josh Palmer",
+                "team_fd": "LAC",
+                "fd_points": 9.0,
+                "targets": 4,
+            }
+        ]
+        player = _pl(pid="fd-1", name="Josh Palmer", team="LAC", opponent="DEN")
+        found = _resolve_actual(player, index_actual_rows(rows), index_actual_ids(rows), {})
+        self.assertIsNotNone(found)
+        assert found is not None
+        _points, _row, how = found
+        self.assertEqual(how, "name")
+
+    def test_out_before_kickoff_excludes_and_a_later_stamp_does_not(self) -> None:
+        player = _pl(pid="00-1", name="Silent WR", position="WR", team="DET")
+        kickoff = datetime(2024, 10, 6, 17, 0, tzinfo=timezone.utc)
+        early = [{"gsis_id": "00-1", "status": "Out", "date_modified": "2024-10-06T12:00:00Z"}]
+        late = [{"gsis_id": "00-1", "status": "Out", "date_modified": "2024-10-06T23:00:00Z"}]
+        weekly = [{"player_name": "Silent WR", "team": "DET", "status": "IR"}]
+        questionable = [{"gsis_id": "00-1", "status": "Questionable"}]
+        self.assertTrue(_excluded_out(player, early, kickoff))
+        self.assertFalse(_excluded_out(player, late, kickoff))
+        self.assertTrue(_excluded_out(player, weekly, None))
+        self.assertFalse(_excluded_out(player, questionable, None))
+
+    def _slate(self, *, extra_actual=True, injury_rows=None, kickoff=None):
+        def load(season, week, *, seed_prior=False):
+            players = [
+                _pl(pid="qb", name="Home QB", position="QB", team="DET", opponent="NO"),
+                _pl(pid="wr", name="Home WR", position="WR", team="DET", opponent="NO"),
+                _pl(
+                    pid="ghost",
+                    name="Silent WR",
+                    position="WR",
+                    team="DET",
+                    opponent="NO",
+                    depth_rank=2,
+                ),
+                _pl(pid="oqb", name="Away QB", position="QB", team="NO", opponent="DET", spread=3.0),
+                _pl(pid="owr", name="Away WR", position="WR", team="NO", opponent="DET", spread=3.0),
+                _pl(pid="def", name="Lions", position="D", team="DET", opponent="NO"),
+            ]
+            actuals = [
+                _actual("Home QB", "DET", 18.0),
+                _actual("Away QB", "NO", 14.0),
+                _actual("Away WR", "NO", 9.0),
+                _dst("DET", 8.0, 17.0),
+                _dst("NO", 6.0, 24.0),
+            ]
+            if extra_actual:
+                actuals.append(_actual("Home WR", "DET", 12.0))
+            return WeekLoad(
+                players,
+                actuals,
+                SimInputs(),
+                [],
+                ["pool: depth charts"],
+                injury_rows=list(injury_rows or []),
+                kickoff=kickoff,
+            )
+
+        return load
+
+    def test_pregame_keeps_a_starter_with_no_box_score(self) -> None:
+        common = dict(
+            n=4,
+            seed=1,
+            run_sensitivity=False,
+            prop_fetch=lambda season: ([], "props_closing: no rows"),
+        )
+        pre = run_holdout(
+            [2025], [2], population="pregame", load=self._slate(extra_actual=False), **common
+        )
+        played = run_holdout(
+            [2025], [2], population="played", load=self._slate(extra_actual=False), **common
+        )
+        self.assertEqual(pre["join"]["kept_as_zero"], 2)
+        self.assertEqual(pre["join"]["kept_as_zero_by_pos"]["WR"], 2)
+        self.assertEqual(pre["join"]["excluded_as_out"], 0)
+        self.assertGreater(
+            pre["errors"]["starters"]["board"]["WR"]["n"],
+            played["errors"]["starters"]["board"]["WR"]["n"],
+        )
+        self.assertEqual(played["join"]["kept_as_zero"], 0)
+        text = format_report(pre)
+        self.assertIn("kept-as-zero 2", text)
+        self.assertIn("id-matched", text)
+
+    def test_weekly_out_is_excluded_and_a_post_kickoff_stamp_is_kept(self) -> None:
+        kickoff = datetime(2024, 10, 6, 17, 0, tzinfo=timezone.utc)
+        out_row = {
+            "gsis_id": "ghost",
+            "status": "Out",
+            "player_name": "Silent WR",
+            "team": "DET",
+        }
+        excluded = run_holdout(
+            [2025],
+            [2],
+            n=4,
+            seed=1,
+            population="pregame",
+            run_sensitivity=False,
+            load=self._slate(extra_actual=True, injury_rows=[out_row]),
+            prop_fetch=lambda season: ([], "props_closing: no rows"),
+        )
+        self.assertEqual(excluded["join"]["excluded_as_out"], 1)
+        self.assertEqual(excluded["join"]["kept_as_zero"], 0)
+        late = {**out_row, "date_modified": "2024-10-06T23:00:00Z"}
+        kept = run_holdout(
+            [2025],
+            [2],
+            n=4,
+            seed=1,
+            population="pregame",
+            run_sensitivity=False,
+            load=self._slate(extra_actual=True, injury_rows=[late], kickoff=kickoff),
+            prop_fetch=lambda season: ([], "props_closing: no rows"),
+        )
+        self.assertEqual(kept["join"]["excluded_as_out"], 0)
+        self.assertEqual(kept["join"]["kept_as_zero"], 1)
+        self.assertEqual(kept["join"]["kept_as_zero_by_pos"]["WR"], 1)
+
+    @unittest.skipUnless(_has_scoring(), "numpy and scipy are required")
+    def test_duplicate_pid_is_skipped_and_named(self) -> None:
+        def load(season, week, *, seed_prior=False):
+            players = [
+                _pl(pid="tay", name="Taysom Hill", position="QB", team="DET", opponent="NO"),
+                _pl(
+                    pid="tay",
+                    name="Taysom Hill",
+                    position="TE",
+                    team="DET",
+                    opponent="NO",
+                    depth_rank=2,
+                ),
+                _pl(pid="wr", name="Home WR", position="WR", team="DET", opponent="NO"),
+                _pl(pid="oqb", name="Away QB", position="QB", team="NO", opponent="DET", spread=3.0),
+                _pl(pid="owr", name="Away WR", position="WR", team="NO", opponent="DET", spread=3.0),
+                _pl(pid="def", name="Lions", position="D", team="DET", opponent="NO"),
+            ]
+            actuals = [
+                {**_actual("Taysom Hill", "DET", 8.0), "gsis_id": "tay", "targets": 1},
+                _actual("Home WR", "DET", 12.0),
+                _actual("Away QB", "NO", 14.0),
+                _actual("Away WR", "NO", 9.0),
+                _dst("DET", 8.0, 17.0),
+                _dst("NO", 6.0, 24.0),
+            ]
+            return WeekLoad(players, actuals, SimInputs(), [], ["pool: depth charts"])
+
+        report = run_holdout(
+            [2025],
+            [2],
+            n=6,
+            seed=1,
+            metrics=True,
+            population="pregame",
+            run_sensitivity=False,
+            load=load,
+            prop_fetch=lambda season: ([], "props_closing: no rows"),
+        )
+        skips = report["draw_skips"]
+        self.assertEqual(skips["n"], 2)
+        self.assertEqual(skips["n_draws"], 6)
+        self.assertEqual({row["position"] for row in skips["rows"]}, {"QB", "TE"})
+        self.assertTrue(all(row["got"] == 12 for row in skips["rows"]))
+        self.assertTrue(all(row["name"] == "Taysom Hill" for row in skips["rows"]))
+        text = format_report(report)
+        self.assertIn("draw skips 2", text)
+        self.assertIn("Taysom Hill", text)
+
+    @unittest.skipUnless(_has_scoring(), "numpy and scipy are required")
+    def test_monte_carlo_columns_keep_three_or_more_decimals(self) -> None:
+        self.assertEqual(_fmt(0.0042, 9, 4).strip(), "0.0042")
+        report = run_holdout(
+            [2025],
+            [2],
+            n=5,
+            seeds=[1, 2],
+            population="played",
+            run_sensitivity=False,
+            load=self._slate(extra_actual=True),
+            prop_fetch=lambda season: ([], "props_closing: no rows"),
+        )
+        text = format_report(report)
+        self.assertRegex(text, r"se\s+-?\d+\.\d{4}")
+        self.assertRegex(text, r"half\s+-?\d+\.\d{4}")
 
 
 class MeasurementHarnessTest(unittest.TestCase):

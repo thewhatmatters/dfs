@@ -13,8 +13,14 @@ no season-to-date board. ``--seed-prior-season`` (default off) replaces
 week 1 sim inputs with the prior season's week 18.
 
 ``--population pregame`` (default) keeps depth-chart starters even when the
-box score is a zero. ``--population played`` restores the legacy starter
-filter. The report above does not import NumPy or SciPy.
+box score is a zero or missing. A missing row scores 0 unless that week's
+injuries list the player Out or IR before kickoff (``date_modified`` when
+the row has one, otherwise the weekly status). Actuals match ``gsis_id``
+first and the name second. ``--population played`` restores the legacy
+starter filter. The report above does not import NumPy or SciPy.
+
+A pool row whose sim draws are not length ``n`` (the same pid listed twice)
+is skipped and named on stderr. The depth pool itself is not deduped.
 
 ``--metrics``, more than one ``--seeds`` value, or ``--draws-out`` adds
 PIT, CRPS, coverage, Brier and log score, paired tests, residual Fisher z,
@@ -41,7 +47,8 @@ import platform
 import subprocess
 import sys
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 
 from nfl.backtest import (
@@ -49,9 +56,11 @@ from nfl.backtest import (
     _STARTER_RANKS,
     _load_live,
     _position,
+    earliest_kickoff,
     index_actual_rows,
     index_dst_rows,
     is_starter,
+    rows_for_season_week,
 )
 from nfl.gangstash import (
     GangstashDataError,
@@ -61,12 +70,18 @@ from nfl.gangstash import (
     GangstashTruncated,
     capture_pulls,
 )
-from nfl.gangstash_data import fetch_props_closing
+from nfl.gangstash_data import (
+    fetch_closing_lines,
+    fetch_props_closing,
+    fetch_week_injuries,
+    parse_player_stat_row,
+)
+from nfl.injuries import injury_code
 from nfl.lines import LinesError
 from nfl.names import match_key
 from nfl.players import Player
 from nfl.projections import score_player
-from nfl.props import norm_prop, prop_field
+from nfl.props import norm_prop, parse_stamp, prop_field
 from nfl.rules import FANDUEL_NFL
 from nfl.sim import GameSim, simulate_games
 from nfl.sim_efficiency import DataEfficiency, build_efficiency, resolve_run_efficiency
@@ -140,6 +155,8 @@ class WeekLoad:
     sim_inputs: SimInputs | None
     missing: list[str]
     notes: list[str]
+    injury_rows: list[dict] = field(default_factory=list)
+    kickoff: datetime | None = None
 
 
 def parse_weeks(raw: str) -> list[int]:
@@ -259,13 +276,47 @@ def load_week(season: int, week: int, *, seed_prior: bool = False) -> WeekLoad:
             notes.append(
                 "seed-prior-season: no prior-season rows; week 1 inputs unchanged"
             )
+    injury_rows, kickoff = _injury_context(int(season), int(week))
     return WeekLoad(
         players=players,
         actual_rows=list(actual_rows or []),
         sim_inputs=sim_inputs,
         missing=list(missing),
         notes=notes,
+        injury_rows=injury_rows,
+        kickoff=kickoff,
     )
+
+
+def _injury_context(season: int, week: int) -> tuple[list[dict], datetime | None]:
+    """Cached injuries and the earliest kickoff. A missing key leaves both empty."""
+    rows: list[dict] = []
+    kickoff = None
+    try:
+        fetched, _meta = fetch_week_injuries(season=int(season), week=int(week))
+        rows = [row for row in (fetched or []) if isinstance(row, dict)]
+    except (
+        GangstashDataKeyMissing,
+        GangstashKeyMissing,
+        GangstashTruncated,
+        GangstashDataError,
+        GangstashError,
+    ):
+        rows = []
+    try:
+        closing, _meta = fetch_closing_lines(season=int(season), week=int(week))
+        kickoff = earliest_kickoff(
+            rows_for_season_week(list(closing or []), int(season), int(week))
+        )
+    except (
+        GangstashDataKeyMissing,
+        GangstashKeyMissing,
+        GangstashTruncated,
+        GangstashDataError,
+        GangstashError,
+    ):
+        kickoff = None
+    return rows, kickoff
 
 
 def draw_percentile(draws: tuple[float, ...] | list[float], actual: float) -> float:
@@ -807,13 +858,105 @@ def _actual_fd(
     indexed: dict,
     dst_by_team: dict,
 ) -> tuple[float, dict] | None:
-    key = ((player.team or "").upper(), match_key(player.name))
-    info = indexed.get(key)
-    if info is None and _position(player.position) == "DEF":
-        info = dst_by_team.get((player.team or "").upper())
-    if info is None:
+    found = _resolve_actual(player, indexed, {}, dst_by_team)
+    if found is None:
         return None
-    return float(info["fd_points"]), info["row"]
+    actual, row, _how = found
+    return actual, row
+
+
+def index_actual_ids(rows: list[dict]) -> dict[str, dict]:
+    """``gsis_id → {fd_points, row}``. Later rows overwrite. Name is not required."""
+    out: dict[str, dict] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        gsis = str(row.get("gsis_id") or "").strip()
+        fd = row.get("fd_points")
+        item = row
+        if not gsis or fd is None:
+            parsed = parse_player_stat_row(row)
+            if parsed is None:
+                continue
+            gsis = gsis or str(parsed.get("gsis_id") or "").strip()
+            if fd is None:
+                fd = parsed.get("fd_points")
+        if not gsis or fd is None:
+            continue
+        out[gsis] = {"fd_points": float(fd), "row": item}
+    return out
+
+
+def _resolve_actual(
+    player: Player,
+    by_name: dict,
+    by_id: dict,
+    dst_by_team: dict,
+) -> tuple[float, dict, str] | None:
+    """Box score for one pool row. Id first, then name, then team DST."""
+    pid = (player.pid or "").strip()
+    if pid and pid in by_id:
+        info = by_id[pid]
+        return float(info["fd_points"]), info["row"], "id"
+    key = ((player.team or "").upper(), match_key(player.name))
+    info = by_name.get(key)
+    if info is not None:
+        return float(info["fd_points"]), info["row"], "name"
+    if _position(player.position) == "DEF":
+        info = dst_by_team.get((player.team or "").upper())
+        if info is not None:
+            return float(info["fd_points"]), info["row"], "team"
+    return None
+
+
+_OUT_CODES = frozenset({"O", "IR"})
+
+
+def _injury_hit(player: Player, rows: list[dict]) -> dict | None:
+    """Out/IR row for this player. Id wins over the name."""
+    pid = (player.pid or "").strip()
+    name_key = ((player.team or "").upper(), match_key(player.name))
+    by_name = None
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        gsis = str(row.get("gsis_id") or "").strip()
+        player_id = str(row.get("player_id") or "").strip()
+        if pid and pid in {gsis, player_id}:
+            return row
+        team = str(row.get("team_fd") or row.get("team") or "").strip().upper()
+        name = str(row.get("player_name") or row.get("name") or "")
+        if name and (team, match_key(name)) == name_key and by_name is None:
+            by_name = row
+    return by_name
+
+
+def _excluded_out(player: Player, rows: list[dict], kickoff: datetime | None) -> bool:
+    """Pre-kickoff Out or IR. A ``date_modified`` must be before kickoff.
+
+    Rows with no ``date_modified`` are the weekly report (2025) and count
+    as pre-game. A timestamp we cannot place before kickoff does not exclude.
+    """
+    row = _injury_hit(player, rows)
+    if row is None:
+        return False
+    if injury_code(str(row.get("status") or "")) not in _OUT_CODES:
+        return False
+    raw = row.get("date_modified")
+    if raw in (None, ""):
+        return True
+    stamp = parse_stamp(raw)
+    if stamp is None or kickoff is None:
+        return False
+    return stamp < kickoff
+
+
+def _draw_length(sim: GameSim, pid: str) -> int:
+    return len(sim.draws.get(pid) or ())
+
+
+def _draws_aligned(sims: dict, pid: str, n_draws: int) -> bool:
+    return all(_draw_length(sim, pid) == int(n_draws) for sim in sims.values())
 
 
 def _new_seed_bag() -> dict:
@@ -913,6 +1056,7 @@ def _absorb_seed(
     season: int,
     week: int,
     seed_i: int,
+    n_draws: int,
 ) -> None:
     """One seed's headline pieces. ``row_sink`` is the primary seed only."""
     np, calibration = require_scoring()
@@ -923,6 +1067,8 @@ def _absorb_seed(
     shared: list[dict] = []
     for item in joined_rows:
         pl = item["player"]
+        if not _draws_aligned(sims, pl.pid, n_draws):
+            continue
         actual = float(item["actual"])
         pos = item["position"]
         board = float(item["board"])
@@ -939,7 +1085,7 @@ def _absorb_seed(
             sim = sims[mode]
             stats = sim.by_pid.get(pl.pid)
             arr = np.asarray(sim.draws.get(pl.pid) or (), dtype=float)
-            if stats is None or arr.size == 0:
+            if stats is None or int(arr.size) != int(n_draws):
                 ready = False
                 break
             series[mode] = arr
@@ -1430,6 +1576,8 @@ def run_holdout(
     prop_notes: list[str] = []
     failed: list[dict] = []
     scored: list[dict] = []
+    join_counts = _empty_join()
+    draw_skip_rows: list[dict] = []
     sens_payload = None
     sens_target = None
     week_set = set(weeks)
@@ -1515,12 +1663,35 @@ def run_holdout(
                 )
             sims = sims_by_seed[0]
             data_sim = sims["sim_data"]
+            by_id = index_actual_ids(loaded.actual_rows)
             joined_rows = []
+            week_skips: list[dict] = []
+            injury_rows = list(getattr(loaded, "injury_rows", None) or [])
+            kickoff = getattr(loaded, "kickoff", None)
             for pl in players:
-                found = _actual_fd(pl, indexed, dst_by_team)
+                found = _resolve_actual(pl, indexed, by_id, dst_by_team)
                 if found is None:
+                    if population != "pregame" or not is_pregame_starter(pl):
+                        continue
+                    if _excluded_out(pl, injury_rows, kickoff):
+                        _bump_join(join_counts, "excluded_as_out", _position(pl.position))
+                        continue
+                    actual, row, how = 0.0, {}, "zero"
+                else:
+                    actual, row, how = found
+                if not _draws_aligned(sims, pl.pid, draws_n):
+                    week_skips.append(
+                        {
+                            "season": int(season),
+                            "week": int(week),
+                            "pid": pl.pid,
+                            "name": pl.name,
+                            "position": _position(pl.position),
+                            "n_draws": int(draws_n),
+                            "got": _draw_length(sims["sim_data"], pl.pid),
+                        }
+                    )
                     continue
-                actual, row = found
                 board = float(score_player(pl))
                 means = {}
                 pcts = {}
@@ -1535,6 +1706,12 @@ def run_holdout(
                     covers[mode] = covers_p10_p90(series, actual)
                 if "sim_data" not in means or "sim_placeholder" not in means:
                     continue
+                if how == "id":
+                    join_counts["id_matched"] += 1
+                elif how == "name":
+                    join_counts["name_matched"] += 1
+                elif how == "zero":
+                    _bump_join(join_counts, "kept_as_zero", _position(pl.position))
                 pos = _position(pl.position)
                 starter = _in_population(pl, row, population)
                 item = {
@@ -1557,6 +1734,17 @@ def run_holdout(
                         calibration[mode][pool].append(
                             (pos, pcts[mode], covers[mode])
                         )
+            if week_skips:
+                who = ", ".join(
+                    f"{row['name']} ({row['position']} {row['pid']}, got {row['got']})"
+                    for row in week_skips
+                )
+                print(
+                    f"holdout skip draws {season} week {week}: "
+                    f"{len(week_skips)} rows length != {draws_n}: {who}",
+                    file=sys.stderr,
+                )
+                draw_skip_rows.extend(week_skips)
             by_pos: dict[str, dict[str, list[tuple[float, float]]]] = {
                 mode: defaultdict(list)
                 for mode in ("board", "sim_placeholder", "sim_data")
@@ -1686,6 +1874,7 @@ def run_holdout(
                         season=int(season),
                         week=int(week),
                         seed_i=int(seed_i),
+                        n_draws=draws_n,
                     )
 
     prop_by_pos: dict[str, list[tuple[float, float]]] = defaultdict(list)
@@ -1712,6 +1901,12 @@ def run_holdout(
         "seed": int(primary),
         "seeds": [int(item) for item in seed_list],
         "population": population,
+        "join": join_counts,
+        "draw_skips": {
+            "n": len(draw_skip_rows),
+            "n_draws": int(draws_n),
+            "rows": draw_skip_rows,
+        },
         "seed_prior_season": bool(seed_prior_season),
         "prior_weeks_rule": "weeks 1..W-1 only; week 1 is empty unless --seed-prior-season",
         "scored": scored,
@@ -1953,6 +2148,40 @@ def format_report(report: dict) -> str:
         note = "; ".join(props["notes"]) if props["notes"] else "no rows"
         lines.append(f"props_closing: skipped ({note})")
     lines.append(f"population: {report.get('population', 'pregame')}")
+    join = report.get("join") or {}
+    if join:
+        zero_bits = " ".join(
+            f"{pos} {(join.get('kept_as_zero_by_pos') or {}).get(pos, 0)}"
+            for pos in _POS_ORDER
+            if (join.get("kept_as_zero_by_pos") or {}).get(pos, 0)
+        )
+        out_bits = " ".join(
+            f"{pos} {(join.get('excluded_as_out_by_pos') or {}).get(pos, 0)}"
+            for pos in _POS_ORDER
+            if (join.get("excluded_as_out_by_pos") or {}).get(pos, 0)
+        )
+        lines.append(
+            "join  id-matched {id_n}  name-matched {name_n}  "
+            "kept-as-zero {zero}  excluded-as-Out {out}".format(
+                id_n=join.get("id_matched", 0),
+                name_n=join.get("name_matched", 0),
+                zero=join.get("kept_as_zero", 0),
+                out=join.get("excluded_as_out", 0),
+            )
+        )
+        if zero_bits:
+            lines.append(f"  kept-as-zero by pos  {zero_bits}")
+        if out_bits:
+            lines.append(f"  excluded-as-Out by pos  {out_bits}")
+    skips = report.get("draw_skips") or {}
+    if int(skips.get("n") or 0):
+        who = ", ".join(
+            f"{row.get('name')} ({row.get('position')} {row.get('pid')})"
+            for row in (skips.get("rows") or [])
+        )
+        lines.append(
+            f"draw skips {skips.get('n')} rows length != {skips.get('n_draws')}: {who}"
+        )
     seeds = report.get("seeds") or [report.get("seed")]
     lines.append("seeds: " + ",".join(str(item) for item in seeds))
     scores = report.get("scores") or {}
@@ -1999,7 +2228,7 @@ def format_report(report: dict) -> str:
                 flag = "excludes 0" if row.get("excludes_zero") else "includes 0"
                 lines.append(
                     f"  {key} {loss_name} {_fmt(row.get('estimate'), 7)} "
-                    f"CI {_fmt(ci[0], 7)} {_fmt(ci[1], 7)} {flag}"
+                    f"CI {_fmt(ci[0], 9, 4)} {_fmt(ci[1], 9, 4)} {flag}"
                 )
     residual = report.get("residual_correlations") or {}
     if residual:
@@ -2038,8 +2267,8 @@ def format_report(report: dict) -> str:
                 continue
             lines.append(
                 f"  {key} mean {_fmt(row.get('mean'), 7)} "
-                f"se {_fmt(row.get('se'), 7)} "
-                f"half {_fmt(row.get('half_width_95'), 7)}"
+                f"se {_fmt(row.get('se'), 9, 4)} "
+                f"half {_fmt(row.get('half_width_95'), 9, 4)}"
             )
     return "\n".join(lines)
 
@@ -2054,11 +2283,29 @@ def _weeks_text(weeks: list[int]) -> str:
     return ",".join(str(week) for week in weeks)
 
 
-def _fmt(value, width: int = 9) -> str:
+def _empty_join() -> dict:
+    return {
+        "id_matched": 0,
+        "name_matched": 0,
+        "kept_as_zero": 0,
+        "excluded_as_out": 0,
+        "kept_as_zero_by_pos": {pos: 0 for pos in _POS_ORDER},
+        "excluded_as_out_by_pos": {pos: 0 for pos in _POS_ORDER},
+    }
+
+
+def _bump_join(counts: dict, key: str, pos: str) -> None:
+    counts[key] += 1
+    by_pos = counts.get(f"{key}_by_pos") or {}
+    if pos in by_pos:
+        by_pos[pos] += 1
+
+
+def _fmt(value, width: int = 9, digits: int = 2) -> str:
     if value is None:
         text = "n/a"
     else:
-        text = f"{float(value):.2f}"
+        text = f"{float(value):.{int(digits)}f}"
     return f"{text:>{width}}"
 
 
