@@ -30,7 +30,10 @@ Every successful run also writes
 `nfl/reports/<season>-w<week>-<date>.manifest.json` (git sha, dirty
 flag, seed, draws, as_of, CLI args, per-dataset freshness, input run
 ids, Python version). `--as-of` defaults to the run start and keeps
-the current reads. An explicit `--as-of` reads snapshot datasets.
+the current reads. An explicit `--as-of` reads snapshot datasets and
+writes the manifest, report, and games sidecar under an `asof-` name
+so it does not replace the nightly files. A failed `collector_runs`
+read warns and continues with empty `input_run_ids`.
 """
 
 from __future__ import annotations
@@ -139,6 +142,18 @@ FEED_COLLECTORS = (
 )
 MAX_INPUT_RUN_IDS = 100
 STALE_HOURS = 36
+# collector_runs is a log, not a scored board. A bounded window keeps the
+# nightly read off the 20,000-row cap. Provenance must not fail the post.
+COLLECTOR_LOOKBACK_HOURS = 48
+# These datasets reject as_of. An explicit --as-of run still reads them live.
+CURRENT_READS = (
+    "targets",
+    "snaps",
+    "team_stats",
+    "player_usage",
+    "player_stats_weekly",
+)
+NO_PIT_INJURIES = "no point-in-time injuries at as_of; injuries NOT applied"
 
 
 class PublishError(Exception):
@@ -170,6 +185,7 @@ class RunCapture:
         self.line_rows = []
         self.input_run_ids = []
         self.point_in_time = False
+        self.notes = []
 
 
 @dataclass(frozen=True)
@@ -487,22 +503,39 @@ def canonical_sha256(rows: list) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def dataset_manifest(capture: RunCapture) -> dict:
+def dataset_manifest(capture: RunCapture, *, as_of: str | None = None) -> dict:
+    cutoff = _parse_utc(as_of) if capture.point_in_time else None
     out = {}
     for name in sorted(capture.datasets):
         record = capture.datasets[name]
-        out[name] = {
+        item = {
             "row_count": len(record.rows),
             "observed_at": record.observed_at,
             "sha256": canonical_sha256(record.rows),
             "untimestamped": bool(record.untimestamped),
         }
+        if capture.point_in_time:
+            item["point_in_time"] = name not in CURRENT_READS
+            observed = _parse_utc(record.observed_at)
+            item["after_as_of"] = bool(cutoff is not None and observed is not None and observed > cutoff)
+        out[name] = item
     return out
 
 
-def freshness_warnings(capture: RunCapture, *, now: datetime) -> list[str]:
-    """Datasets whose capture time is older than 36h, or legacy untimestamped rows."""
-    moment = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+def freshness_warnings(
+    capture: RunCapture,
+    *,
+    now: datetime,
+    as_of: datetime | None = None,
+) -> list[str]:
+    """Datasets older than 36h, legacy untimestamped rows, or newer than ``as_of``.
+
+    When ``as_of`` is set, 36h is measured from that time. Otherwise it is
+    measured from ``now`` (the run start).
+    """
+    moment = as_of if as_of is not None else now
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
     moment = moment.astimezone(timezone.utc)
     lines: list[str] = []
     for name in sorted(capture.datasets):
@@ -512,9 +545,36 @@ def freshness_warnings(capture: RunCapture, *, now: datetime) -> list[str]:
         observed = _parse_utc(record.observed_at)
         if observed is None:
             continue
+        if as_of is not None and observed > moment:
+            lines.append(f"{name} observed_at {record.observed_at} is after as_of")
         age = moment - observed
         if age > timedelta(hours=STALE_HOURS):
             lines.append(f"{name} observed_at {record.observed_at} is older than 36h")
+    return lines
+
+
+def provenance_warnings(
+    capture: RunCapture,
+    *,
+    now: datetime,
+    as_of: datetime | None = None,
+) -> list[str]:
+    """Stderr, report footer, and manifest warnings for one publish."""
+    lines = [str(note) for note in capture.notes]
+    if capture.point_in_time:
+        injury = capture.datasets.get("injury_snapshots")
+        if injury is not None and len(injury.rows) == 0 and NO_PIT_INJURIES not in lines:
+            lines.append(NO_PIT_INJURIES)
+        current = [name for name in CURRENT_READS if name in capture.datasets]
+        if current:
+            lines.append("current reads (not point-in-time): " + ", ".join(current))
+    lines.extend(
+        freshness_warnings(
+            capture,
+            now=now,
+            as_of=as_of if capture.point_in_time else None,
+        )
+    )
     return lines
 
 
@@ -583,8 +643,10 @@ def build_manifest(
     draws: int,
     as_of: str,
     cli_args: list,
+    warnings: list | None = None,
 ) -> dict:
     sha, dirty = git_state()
+    current = [name for name in CURRENT_READS if name in capture.datasets] if capture.point_in_time else []
     return {
         "git_sha": sha,
         "dirty": dirty,
@@ -592,18 +654,59 @@ def build_manifest(
         "draws": int(draws),
         "as_of": as_of,
         "cli_args": list(cli_args),
-        "datasets": dataset_manifest(capture),
+        "datasets": dataset_manifest(capture, as_of=as_of),
         "input_run_ids": list(capture.input_run_ids),
         "python": platform.python_version(),
         "point_in_time": bool(capture.point_in_time),
+        "current_reads": current,
+        "warnings": list(capture.notes if warnings is None else warnings),
     }
 
 
-def manifest_path(season: int, week: int, run_at: str, root: Path | None = None) -> Path:
-    from nfl.report import REPORTS_DIR, report_day
+def asof_file_stamp(as_of: str) -> str:
+    """Compact UTC stamp for an explicit ``--as-of`` artifact name."""
+    stamp = _parse_utc(as_of)
+    if stamp is None:
+        return "unknown"
+    return stamp.astimezone(timezone.utc).strftime("%Y%m%dT%H%MZ")
+
+
+def publish_artifact_names(
+    season: int,
+    week: int,
+    run_at: str,
+    as_of: str | None = None,
+) -> dict:
+    """Report filenames. An explicit ``as_of`` does not reuse the nightly names."""
+    if as_of:
+        stem = f"{int(season)}-w{int(week)}-asof-{asof_file_stamp(as_of)}"
+        return {
+            "manifest": f"{stem}.manifest.json",
+            "report": f"{stem}.md",
+            "sidecar": f"{stem}-games.json",
+        }
+    from nfl.report import report_day
+
+    day = report_day(run_at)
+    return {
+        "manifest": f"{int(season)}-w{int(week)}-{day}.manifest.json",
+        "report": f"{int(season)}-w{int(week)}-{day}.md",
+        "sidecar": f"{int(season)}-w{int(week)}-games.json",
+    }
+
+
+def manifest_path(
+    season: int,
+    week: int,
+    run_at: str,
+    root: Path | None = None,
+    filename: str | None = None,
+) -> Path:
+    from nfl.report import REPORTS_DIR
 
     dest = root or REPORTS_DIR
-    return dest / f"{int(season)}-w{int(week)}-{report_day(run_at)}.manifest.json"
+    name = filename or publish_artifact_names(season, week, run_at)["manifest"]
+    return dest / name
 
 
 def write_manifest(
@@ -613,8 +716,9 @@ def write_manifest(
     week: int,
     run_at: str,
     dest: Path | None = None,
+    filename: str | None = None,
 ) -> Path:
-    path = manifest_path(season, week, run_at, dest)
+    path = manifest_path(season, week, run_at, dest, filename)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return path
@@ -1640,14 +1744,46 @@ def _load_snaps(season: int, refresh: bool) -> tuple[list[SnapWeekRow], list[dic
     return rows, raw, meta
 
 
-def _load_input_run_ids(as_of: datetime, *, refresh: bool) -> tuple[list[str], dict]:
-    """One ``collector_runs`` read through ``as_of``'s UTC day."""
-    rows, meta = fetch_collector_runs(
-        date_to=as_of.astimezone(timezone.utc).date().isoformat(),
-        refresh=refresh,
-    )
-    _stale(meta, "collector_runs")
-    return select_input_run_ids(rows, as_of=as_of), meta
+def collector_run_window(as_of: datetime) -> tuple[str, str]:
+    """Inclusive UTC days covering the last ``COLLECTOR_LOOKBACK_HOURS`` before ``as_of``."""
+    moment = as_of if as_of.tzinfo else as_of.replace(tzinfo=timezone.utc)
+    moment = moment.astimezone(timezone.utc)
+    start = moment - timedelta(hours=COLLECTOR_LOOKBACK_HOURS)
+    return start.date().isoformat(), moment.date().isoformat()
+
+
+def _load_input_run_ids(as_of: datetime, *, refresh: bool) -> tuple[list[str], dict, str | None]:
+    """Bounded ``collector_runs`` read. A failure is a warning, not a failed publish.
+
+    Returns ``(ids, meta, warning)``. ``warning`` is set when the read
+    fails or times out; ``ids`` is then empty.
+    """
+    date_from, date_to = collector_run_window(as_of)
+    try:
+        rows, meta = fetch_collector_runs(
+            date_from=date_from,
+            date_to=date_to,
+            refresh=refresh,
+        )
+    except Exception as e:
+        return [], {}, f"collector_runs unavailable ({e}); input_run_ids empty"
+    return select_input_run_ids(rows, as_of=as_of), meta, None
+
+
+def _max_row_stamp(rows: list, keys: tuple) -> str | None:
+    """Latest parseable timestamp among ``keys`` on each row."""
+    stamps = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for key in keys:
+            stamp = _parse_utc(row.get(key))
+            if stamp is not None:
+                stamps.append(stamp)
+                break
+    if not stamps:
+        return None
+    return max(stamps).replace(microsecond=0).isoformat()
 
 
 def _capture_sim_feeds(capture: RunCapture, season: int) -> None:
@@ -1803,7 +1939,20 @@ def load_slate(
         if prop_stats.get("cache_stale"):
             raise StaleInputs("props cache is stale")
         prop_rows = list(prop_stats.pop("_rows", []) or [])
-        _remember(capture, "props", prop_rows, prop_stats)
+        # /props has no response meta. Freshness is the newest scraped_at.
+        server = prop_stats.get("response_meta") if isinstance(prop_stats, dict) else None
+        server_obs = server.get("observed_at") if isinstance(server, dict) else None
+        if server_obs:
+            _remember(capture, "props", prop_rows, prop_stats)
+        else:
+            _remember(
+                capture,
+                "props",
+                prop_rows,
+                prop_stats,
+                observed_at=_max_row_stamp(prop_rows, ("scraped_at",)),
+                observed_set=True,
+            )
     scored = attach_props([e.player for e in entries], by_pid)
     by_scored = {pl.pid: pl for pl in scored}
     entries = [
@@ -1831,13 +1980,18 @@ def load_slate(
         f"injuries out {n_out}  rows {len(injury_rows)}",
         file=sys.stderr,
     )
-    run_ids, runs_meta = _load_input_run_ids(moment, refresh=refresh)
-    _remember(capture, "collector_runs", [], runs_meta)
-    # The run log is provenance, not a scored board. Drop it from the manifest
-    # dataset map so a missing timestamp on the log is not a stale-input warning
-    # about the lines themselves.
-    capture.datasets.pop("collector_runs", None)
-    capture.input_run_ids = run_ids
+    run_ids, runs_meta, runs_warning = _load_input_run_ids(moment, refresh=refresh)
+    if runs_warning:
+        print(f"publish projections: {runs_warning}", file=sys.stderr)
+        capture.notes.append(runs_warning)
+        capture.input_run_ids = []
+    else:
+        _remember(capture, "collector_runs", [], runs_meta)
+        # The run log is provenance, not a scored board. Drop it from the
+        # manifest dataset map so a missing timestamp on the log is not a
+        # stale-input warning about the lines themselves.
+        capture.datasets.pop("collector_runs", None)
+        capture.input_run_ids = run_ids
     return season, week, entries, capture
 
 
@@ -1904,7 +2058,10 @@ def emit_projection_report(
     week: int,
     run_at: str,
     notes: list | None = None,
+    extra: list | None = None,
     line_rows: list | None = None,
+    report_filename: str | None = None,
+    sidecar_filename: str | None = None,
 ) -> Path:
     """Write the markdown report and, when sim game draws exist, the sidecar."""
     from nfl.report import (
@@ -1918,7 +2075,13 @@ def emit_projection_report(
     summaries = summarize_game_draws(game_draws)
     if summaries:
         games: list[dict] = summaries
-        write_games_sidecar(season=season, week=week, run_at=run_at, games=summaries)
+        write_games_sidecar(
+            season=season,
+            week=week,
+            run_at=run_at,
+            games=summaries,
+            filename=sidecar_filename,
+        )
     else:
         games = []
         try:
@@ -1947,6 +2110,8 @@ def emit_projection_report(
             else efficiency_from_rows(used)
         ),
         notes=notes,
+        extra=extra,
+        filename=report_filename,
     )
 
 
@@ -1963,11 +2128,28 @@ def _publish_side_files(
     as_of_text: str,
     cli_args: list,
 ) -> int:
-    """Manifest, stale warning, and the optional markdown report."""
-    warnings = freshness_warnings(capture, now=started)
-    if warnings:
+    """Manifest, provenance warnings, and the optional markdown report.
+
+    An explicit ``--as-of`` uses a distinct filename for the manifest,
+    the report, and the games sidecar. The nightly names stay put.
+    """
+    explicit = args.as_of is not None
+    names = publish_artifact_names(season, week, run_at, as_of_text if explicit else None)
+    as_of_dt = _parse_utc(as_of_text) if explicit else None
+    warnings = provenance_warnings(capture, now=started, as_of=as_of_dt)
+    fresh = freshness_warnings(
+        capture,
+        now=started,
+        as_of=as_of_dt if capture.point_in_time else None,
+    )
+    other = [line for line in warnings if line not in fresh]
+    already = {str(note) for note in capture.notes}
+    for line in other:
+        if line not in already:
+            print(f"publish projections: {line}", file=sys.stderr)
+    if fresh:
         print(
-            "publish projections: stale inputs: " + "; ".join(warnings),
+            "publish projections: stale inputs: " + "; ".join(fresh),
             file=sys.stderr,
         )
     try:
@@ -1977,12 +2159,14 @@ def _publish_side_files(
             draws=int(args.sim),
             as_of=as_of_text,
             cli_args=cli_args,
+            warnings=warnings,
         )
         manifest_file = write_manifest(
             manifest,
             season=season,
             week=week,
             run_at=run_at,
+            filename=names["manifest"],
         )
     except OSError as e:
         print(f"publish projections: {e}", file=sys.stderr)
@@ -1998,8 +2182,11 @@ def _publish_side_files(
             season=season,
             week=week,
             run_at=run_at,
-            notes=warnings,
+            notes=fresh or None,
+            extra=other or None,
             line_rows=capture.line_rows or None,
+            report_filename=names["report"],
+            sidecar_filename=names["sidecar"],
         )
     except Exception as e:
         print(f"publish projections: {e}", file=sys.stderr)

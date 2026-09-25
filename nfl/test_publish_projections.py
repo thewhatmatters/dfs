@@ -16,19 +16,25 @@ from nfl.publish_projections import (
     CHUNK_SIZE,
     PROJECTIONS_URL,
     DatasetRecord,
+    NO_PIT_INJURIES,
     ProjectionsKeyMissing,
     PublishEntry,
     RunCapture,
+    SimResult,
     StaleInputs,
+    _load_input_run_ids,
     build_entries,
     build_manifest,
     chunk_rows,
+    collector_run_window,
     freshness_warnings,
     load_slate,
     main,
     maybe_sim,
     parse_args,
     post_projection_rows,
+    provenance_warnings,
+    publish_artifact_names,
     _team_lines,
     projection_rows,
     resolve_nfl_week,
@@ -1718,6 +1724,411 @@ class ProvenanceTest(unittest.TestCase):
                 dest=Path(tmp) / "again",
             )
             self.assertTrue(written.name.endswith(".manifest.json"))
+
+    def test_collector_runs_failure_still_publishes(self) -> None:
+        """A dead collector_runs read warns and still finishes the dry-run."""
+        import tempfile
+        from contextlib import redirect_stdout
+        from pathlib import Path
+
+        lines = [_line()]
+        depth = self._board()
+
+        def boom(**_kwargs):
+            raise TimeoutError("timed out")
+
+        args_ok = ["--dry-run", "--season", "2026", "--week", "3", "--sim", "0"]
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "nfl.publish_projections.fetch_game_lines",
+            return_value=(lines, self._meta()),
+        ), patch(
+            "nfl.publish_projections.fetch_depth_charts",
+            return_value=(depth, self._meta()),
+        ), patch(
+            "nfl.publish_projections.fetch_targets",
+            return_value=([], self._meta()),
+        ), patch(
+            "nfl.publish_projections.fetch_snaps",
+            return_value=([], self._meta()),
+        ), patch(
+            "nfl.sim_feed.load_week_injuries",
+            return_value=([], self._meta()),
+        ), patch(
+            "nfl.props.fetch_props",
+            return_value=(self._props(), self._meta()),
+        ), patch(
+            "nfl.publish_projections.fetch_collector_runs",
+            side_effect=boom,
+        ), patch("nfl.report.REPORTS_DIR", Path(tmp)):
+            err = io.StringIO()
+            out = io.StringIO()
+            with redirect_stderr(err), redirect_stdout(out):
+                rc = main(args_ok + ["--out-dir", tmp])
+            self.assertEqual(rc, 0)
+            text = err.getvalue()
+            self.assertIn("collector_runs unavailable (timed out); input_run_ids empty", text)
+            self.assertIn("dry-run wrote", text)
+            manifest = json.loads(next(Path(tmp).glob("*.manifest.json")).read_text(encoding="utf-8"))
+            self.assertEqual(manifest["input_run_ids"], [])
+            self.assertIn(
+                "collector_runs unavailable (timed out); input_run_ids empty",
+                manifest["warnings"],
+            )
+            self.assertFalse(manifest["point_in_time"])
+
+    def test_collector_runs_query_is_bounded(self) -> None:
+        as_of = datetime(2026, 9, 25, 10, 43, tzinfo=timezone.utc)
+        self.assertEqual(collector_run_window(as_of), ("2026-09-23", "2026-09-25"))
+        seen = {}
+
+        def fetch(**kwargs):
+            seen.update(kwargs)
+            return (
+                [
+                    {
+                        "run_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                        "collector": "bettingpros-odds",
+                        "finished_at": "2026-09-25T09:00:00Z",
+                        "status": "succeeded",
+                    },
+                    {
+                        "run_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                        "collector": "bettingpros-odds",
+                        "finished_at": "2026-09-25T12:00:00Z",
+                        "status": "succeeded",
+                    },
+                ],
+                {"cache_stale": True, "response_meta": {}},
+            )
+
+        args = parse_args(["--season", "2026", "--week", "3", "--sim", "0"])
+        with patch(
+            "nfl.publish_projections.fetch_game_lines",
+            return_value=([_line()], self._meta()),
+        ), patch(
+            "nfl.publish_projections.fetch_depth_charts",
+            return_value=(self._board(), self._meta()),
+        ), patch(
+            "nfl.publish_projections.fetch_targets",
+            return_value=([], self._meta()),
+        ), patch(
+            "nfl.publish_projections.fetch_snaps",
+            return_value=([], self._meta()),
+        ), patch(
+            "nfl.sim_feed.load_week_injuries",
+            return_value=([], self._meta()),
+        ), patch(
+            "nfl.props.fetch_props",
+            return_value=(self._props(), self._meta()),
+        ), patch("nfl.publish_projections.fetch_collector_runs", fetch):
+            _season, _week, _entries, capture = load_slate(
+                args,
+                date(2026, 9, 25),
+                as_of=as_of,
+                point_in_time=False,
+            )
+            self.assertEqual(seen["date_from"], "2026-09-23")
+            self.assertEqual(seen["date_to"], "2026-09-25")
+            self.assertNotIn("as_of", seen)
+            self.assertTrue(seen["refresh"])
+            self.assertEqual(capture.input_run_ids, ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"])
+            self.assertEqual(capture.notes, [])
+            ids, _meta, warning = _load_input_run_ids(as_of, refresh=False)
+        self.assertIsNone(warning)
+        self.assertEqual(ids, ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"])
+        self.assertFalse(seen["refresh"])
+
+    def test_explicit_as_of_does_not_overwrite_nightly_files(self) -> None:
+        import tempfile
+        from contextlib import redirect_stdout
+        from pathlib import Path
+
+        names = publish_artifact_names(
+            2026,
+            3,
+            "2026-09-25T15:43:00+00:00",
+            "2026-09-25T10:43:00+00:00",
+        )
+        self.assertEqual(names["manifest"], "2026-w3-asof-20260925T1043Z.manifest.json")
+        self.assertEqual(names["report"], "2026-w3-asof-20260925T1043Z.md")
+        self.assertEqual(names["sidecar"], "2026-w3-asof-20260925T1043Z-games.json")
+        nightly = publish_artifact_names(2026, 3, "2026-09-25T10:43:00+00:00", None)
+        self.assertEqual(nightly["manifest"], "2026-w3-2026-09-25.manifest.json")
+        self.assertEqual(nightly["sidecar"], "2026-w3-games.json")
+        self.assertNotIn("asof", nightly["report"])
+
+        entries = build_entries(
+            [_line()],
+            [
+                _depth("Patrick Mahomes", "KC", "QB", 1, "00-0033873"),
+                _depth("Josh Allen", "BUF", "QB", 1, "00-0034857"),
+            ],
+        )
+
+        def load(_args, _today, **kwargs):
+            capture = RunCapture()
+            capture.point_in_time = bool(kwargs.get("point_in_time"))
+            capture.line_rows = [_line()]
+            return 2026, 3, entries, capture
+
+        draws = (("KC@BUF", "KC", "BUF", 21.0, 24.0),)
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "nfl.publish_projections.load_slate", load
+        ), patch(
+            "nfl.publish_projections.maybe_sim",
+            return_value=SimResult(None, "data", draws),
+        ), patch(
+            "nfl.publish_projections.model_version", return_value="abc"
+        ), patch("nfl.report.REPORTS_DIR", Path(tmp)):
+            err = io.StringIO()
+            out = io.StringIO()
+            with redirect_stderr(err), redirect_stdout(out):
+                rc = main(
+                    [
+                        "--dry-run",
+                        "--report",
+                        "--sim",
+                        "0",
+                        "--out-dir",
+                        tmp,
+                        "--season",
+                        "2026",
+                        "--week",
+                        "3",
+                        "--as-of",
+                        "2026-09-25T10:43:00Z",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            root = Path(tmp)
+            manifest = root / "2026-w3-asof-20260925T1043Z.manifest.json"
+            report = root / "2026-w3-asof-20260925T1043Z.md"
+            sidecar = root / "2026-w3-asof-20260925T1043Z-games.json"
+            self.assertTrue(manifest.is_file())
+            self.assertTrue(report.is_file())
+            self.assertTrue(sidecar.is_file())
+            self.assertFalse((root / "2026-w3-games.json").exists())
+            self.assertFalse(any("asof" not in path.name for path in root.glob("*.manifest.json")))
+            before = manifest.read_bytes()
+            err2 = io.StringIO()
+            out2 = io.StringIO()
+            with redirect_stderr(err2), redirect_stdout(out2):
+                rc = main(
+                    [
+                        "--dry-run",
+                        "--report",
+                        "--sim",
+                        "0",
+                        "--out-dir",
+                        tmp,
+                        "--season",
+                        "2026",
+                        "--week",
+                        "3",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            self.assertEqual(manifest.read_bytes(), before)
+            nightly_manifests = [path for path in root.glob("*.manifest.json") if "asof" not in path.name]
+            self.assertEqual(len(nightly_manifests), 1)
+            self.assertRegex(nightly_manifests[0].name, r"^2026-w3-\d{4}-\d{2}-\d{2}\.manifest\.json$")
+            self.assertTrue((root / "2026-w3-games.json").is_file())
+            self.assertTrue(sidecar.is_file())
+
+    def test_as_of_warns_on_empty_injuries_current_reads_and_future_stamps(self) -> None:
+        import tempfile
+        from contextlib import redirect_stdout
+        from pathlib import Path
+
+        capture = RunCapture()
+        capture.point_in_time = True
+        capture.line_rows = [_line()]
+        capture.datasets["injury_snapshots"] = DatasetRecord(rows=[], observed_at=None, untimestamped=False)
+        capture.datasets["targets"] = DatasetRecord(
+            rows=[{"player_name": "A"}],
+            observed_at="2026-09-25T08:00:00+00:00",
+            untimestamped=False,
+        )
+        capture.datasets["snaps"] = DatasetRecord(
+            rows=[{"player_name": "A"}],
+            observed_at="2026-09-25T08:00:00+00:00",
+            untimestamped=False,
+        )
+        capture.datasets["game_line_snapshots"] = DatasetRecord(
+            rows=[{"game_id": "g"}],
+            observed_at="2026-09-25T18:00:00+00:00",
+            untimestamped=False,
+        )
+        entries = build_entries(
+            [_line()],
+            [
+                _depth("Patrick Mahomes", "KC", "QB", 1, "00-0033873"),
+                _depth("Josh Allen", "BUF", "QB", 1, "00-0034857"),
+            ],
+        )
+
+        def load(_args, _today, **_kwargs):
+            return 2026, 3, entries, capture
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "nfl.publish_projections.load_slate", load
+        ), patch(
+            "nfl.publish_projections.maybe_sim", return_value=(None, "data")
+        ), patch(
+            "nfl.publish_projections.model_version", return_value="abc"
+        ), patch("nfl.report.REPORTS_DIR", Path(tmp)):
+            err = io.StringIO()
+            with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                rc = main(
+                    [
+                        "--dry-run",
+                        "--report",
+                        "--sim",
+                        "0",
+                        "--out-dir",
+                        tmp,
+                        "--season",
+                        "2026",
+                        "--week",
+                        "3",
+                        "--as-of",
+                        "2026-09-25T10:43:00Z",
+                    ]
+                )
+            self.assertEqual(rc, 0)
+            text = err.getvalue()
+            self.assertIn(NO_PIT_INJURIES, text)
+            self.assertIn("current reads (not point-in-time): targets, snaps", text)
+            self.assertIn("game_line_snapshots observed_at 2026-09-25T18:00:00+00:00 is after as_of", text)
+            manifest = json.loads(
+                (Path(tmp) / "2026-w3-asof-20260925T1043Z.manifest.json").read_text(encoding="utf-8")
+            )
+            self.assertIn(NO_PIT_INJURIES, manifest["warnings"])
+            self.assertIn("current reads (not point-in-time): targets, snaps", manifest["warnings"])
+            self.assertEqual(manifest["current_reads"], ["targets", "snaps"])
+            self.assertFalse(manifest["datasets"]["targets"]["point_in_time"])
+            self.assertFalse(manifest["datasets"]["snaps"]["point_in_time"])
+            self.assertTrue(manifest["datasets"]["injury_snapshots"]["point_in_time"])
+            self.assertFalse(manifest["datasets"]["targets"]["after_as_of"])
+            self.assertTrue(manifest["datasets"]["game_line_snapshots"]["after_as_of"])
+            self.assertEqual(manifest["datasets"]["injury_snapshots"]["row_count"], 0)
+            report = (Path(tmp) / "2026-w3-asof-20260925T1043Z.md").read_text(encoding="utf-8")
+            self.assertIn(NO_PIT_INJURIES, report)
+
+    def test_staleness_uses_as_of_when_given(self) -> None:
+        now = datetime(2026, 9, 25, 16, 0, tzinfo=timezone.utc)
+        as_of = datetime(2026, 9, 24, 10, 0, tzinfo=timezone.utc)
+        observed = datetime(2026, 9, 24, 0, 0, tzinfo=timezone.utc)
+        capture = RunCapture()
+        capture.point_in_time = True
+        capture.datasets["game_line_snapshots"] = DatasetRecord(
+            rows=[{"game_id": "g"}],
+            observed_at=observed.replace(microsecond=0).isoformat(),
+            untimestamped=False,
+        )
+        versus_now = freshness_warnings(capture, now=now)
+        versus_as_of = provenance_warnings(capture, now=now, as_of=as_of)
+        self.assertTrue(any("36h" in line for line in versus_now))
+        self.assertFalse(any("36h" in line for line in versus_as_of))
+        later = RunCapture()
+        later.point_in_time = True
+        later.datasets["game_line_snapshots"] = DatasetRecord(
+            rows=[{"game_id": "g"}],
+            observed_at="2026-09-25T12:00:00+00:00",
+            untimestamped=False,
+        )
+        early = datetime(2026, 9, 25, 10, 0, tzinfo=timezone.utc)
+        after = freshness_warnings(later, now=now, as_of=early)
+        self.assertEqual(after, ["game_line_snapshots observed_at 2026-09-25T12:00:00+00:00 is after as_of"])
+
+    def test_props_observed_at_comes_from_max_scraped_at(self) -> None:
+        rows = [
+            {
+                "player_name": "Patrick Mahomes",
+                "prop": "Passing Yards",
+                "line": 275.5,
+                "scraped_at": "2026-09-25T08:00:00Z",
+            },
+            {
+                "player_name": "Patrick Mahomes",
+                "prop": "Passing TDs",
+                "line": 1.5,
+                "scraped_at": "2026-09-25T12:30:00Z",
+            },
+        ]
+        bare = {
+            "cache": None,
+            "cache_stale": False,
+            "truncated": False,
+            "live": True,
+            "response_meta": {},
+        }
+        args = parse_args(["--season", "2026", "--week", "3", "--sim", "0"])
+        as_of = datetime(2026, 9, 25, 13, 0, tzinfo=timezone.utc)
+        with patch(
+            "nfl.publish_projections.fetch_game_lines",
+            return_value=([_line()], self._meta()),
+        ), patch(
+            "nfl.publish_projections.fetch_depth_charts",
+            return_value=(self._board(), self._meta()),
+        ), patch(
+            "nfl.publish_projections.fetch_targets",
+            return_value=([], self._meta()),
+        ), patch(
+            "nfl.publish_projections.fetch_snaps",
+            return_value=([], self._meta()),
+        ), patch(
+            "nfl.sim_feed.load_week_injuries",
+            return_value=([], self._meta()),
+        ), patch(
+            "nfl.props.fetch_props",
+            return_value=(rows, bare),
+        ), patch(
+            "nfl.publish_projections.fetch_collector_runs",
+            return_value=([], self._meta()),
+        ):
+            _season, _week, _entries, capture = load_slate(
+                args,
+                date(2026, 9, 25),
+                as_of=as_of,
+                point_in_time=False,
+            )
+        self.assertEqual(capture.datasets["props"].observed_at, "2026-09-25T12:30:00+00:00")
+        later = datetime(2026, 9, 27, 5, 0, tzinfo=timezone.utc)
+        stale = freshness_warnings(capture, now=later)
+        self.assertTrue(any(line.startswith("props ") and "36h" in line for line in stale))
+
+        stamped = dict(bare)
+        stamped["response_meta"] = {"observed_at": "2026-09-25T09:00:00+00:00"}
+        with patch(
+            "nfl.publish_projections.fetch_game_lines",
+            return_value=([_line()], self._meta()),
+        ), patch(
+            "nfl.publish_projections.fetch_depth_charts",
+            return_value=(self._board(), self._meta()),
+        ), patch(
+            "nfl.publish_projections.fetch_targets",
+            return_value=([], self._meta()),
+        ), patch(
+            "nfl.publish_projections.fetch_snaps",
+            return_value=([], self._meta()),
+        ), patch(
+            "nfl.sim_feed.load_week_injuries",
+            return_value=([], self._meta()),
+        ), patch(
+            "nfl.props.fetch_props",
+            return_value=(rows, stamped),
+        ), patch(
+            "nfl.publish_projections.fetch_collector_runs",
+            return_value=([], self._meta()),
+        ):
+            _season, _week, _entries, kept = load_slate(
+                args,
+                date(2026, 9, 25),
+                as_of=as_of,
+                point_in_time=False,
+            )
+        self.assertEqual(kept.datasets["props"].observed_at, "2026-09-25T09:00:00+00:00")
 
 
 if __name__ == "__main__":
