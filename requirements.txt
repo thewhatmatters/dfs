@@ -1,4 +1,6 @@
 pulp>=2.8
-scrapling[fetchers]>=0.4.15
-numpy>=1.24
-scipy>=1.11
+# scrapling 0.4 requires Python >= 3.10. OurLads fetch imports it lazily.
+scrapling[fetchers]>=0.4.15; python_version >= "3.10"
+# Python 3.9: NumPy 2.1+ and SciPy 1.14+ require 3.10.
+numpy>=1.24,<2.1
+scipy>=1.11,<1.14

@@ -8,6 +8,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import Optional
 
 MARK = {"ready": "✅", "degraded": "⚠ ", "gated": "🔒", "down": "⛔"}
 RANK = {"ready": 0, "degraded": 1, "gated": 2, "down": 3}
@@ -36,7 +37,7 @@ def check_pulp():
     return ("ready", None, "pulp importable")
 
 
-def check_csv(path: str | None):
+def check_csv(path: Optional[str]):
     if not path:
         return ("degraded", None, "no --csv yet (pass when solving)")
     p = Path(path).expanduser()
@@ -45,7 +46,7 @@ def check_csv(path: str | None):
     return ("ready", None, p.name)
 
 
-def check_lines(lines_json: str | None):
+def check_lines(lines_json: Optional[str]):
     if lines_json:
         p = Path(lines_json).expanduser()
         if not p.is_file():
