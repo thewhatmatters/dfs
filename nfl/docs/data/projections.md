@@ -10,9 +10,11 @@ python3 -m nfl.publish_projections --refresh --sim 10000
 
 That is the nightly command. `--refresh` skips the same-day cache so a dead
 read cannot fall back onto an older file. `--sim 10000` also posts
-`model=sim` when `nfl.sim.simulate_games` imports (it does on current main,
-and on the layered-sim branch when `inputs` is left unset). If that function
-is missing, the same command still posts the board and prints one line.
+`model=sim`. Those rows use `resolve_sim_inputs` and `simulate_games`
+the same way `python3 -m nfl.optimize --projection-source sim` does.
+`mean` is the simulated mean; `p10` / `p50` / `p90` are the same draws.
+If `simulate_games` does not import, the command still posts the board
+and prints one line. A sim-input cache marked stale exits non-zero.
 
 `--dry-run` writes `nfl/data/projections/` (gitignored) and does not POST.
 It does not need `GANGSTASH_PROJECTIONS_WRITER_KEY`.
@@ -66,7 +68,8 @@ summary counts those.
 `vegas-dst`), implied total, depth rank, usage factor, and prop factor.
 
 Board rows: `mean` = `week1_score`, `p10` / `p50` / `p90` null.
-Sim rows: `mean` / `p10` / `p50` / `p90` from `simulate_games`.
+Sim rows: `mean` / `p10` / `p50` / `p90` from the layered Monte Carlo.
+`mean` matches `apply_ilp_objective(..., projection_source="sim")`.
 
 ## Loud failures
 
@@ -76,6 +79,7 @@ Exit status is non-zero and stderr starts with `publish projections:`.
 - no `game_lines` for the target week, or that cache is stale
 - a slate team has no skill depth
 - read key missing, HTTP error, or a stale cache for lines, depth, targets, snaps, or props
+- sim inputs come back with a stale cache when `--sim` is set
 
 ## Read back
 

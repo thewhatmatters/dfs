@@ -10,9 +10,10 @@ props. A FanDuel players CSV is optional (salary and FanDuel id only).
 Write key: GANGSTASH_PROJECTIONS_WRITER_KEY, header `x-api-key` only.
 Read key: GANGSTASH_API_KEY (existing /data and /props clients).
 
-`--sim N` also posts model=sim when `nfl.sim.simulate_games` imports.
-That call is the same on current main and on the layered-sim branch
-(`inputs` stays unset). Missing sim publishes the board and says so.
+`--sim N` also posts model=sim. Draws and percentiles come from
+`simulate_games` with the same gangstash `SimInputs` the optimizer
+builds for `--projection-source sim`. `mean` is that simulated mean.
+Missing sim publishes the board and says so.
 """
 
 from __future__ import annotations
@@ -202,8 +203,17 @@ def maybe_sim(
     entries: list[PublishEntry],
     n: int,
     seed: int,
+    *,
+    season: int,
+    refresh: bool,
 ) -> dict | None:
-    """pid → SimStats when `--sim N` and simulate_games imports."""
+    """pid → SimStats for model=sim.
+
+    Same call as the optimizer's `--projection-source sim` path:
+    `resolve_sim_inputs` then `simulate_games(..., inputs=)`.
+    `mean` on the published row is that draw's mean (the ILP mean
+    when projection source is sim). p10/p50/p90 are the same draws.
+    """
     if n <= 0:
         return None
     fn = load_simulate_games()
@@ -213,7 +223,34 @@ def maybe_sim(
             file=sys.stderr,
         )
         return None
-    result = fn([e.player for e in entries], n=int(n), seed=int(seed))
+    try:
+        from nfl.sim_feed import resolve_sim_inputs
+        from nfl.sim_inputs import SimInputError
+    except ImportError:
+        print(
+            "sim inputs unavailable; publishing board only",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        sim_inputs, note = resolve_sim_inputs(
+            path=None,
+            season=int(season),
+            weeks=None,
+            refresh_targets=bool(refresh),
+            refresh_snaps=bool(refresh),
+        )
+    except SimInputError as e:
+        raise PublishError(str(e)) from e
+    print(note, file=sys.stderr)
+    if "stale cache" in note:
+        raise StaleInputs("sim inputs cache is stale")
+    result = fn(
+        [e.player for e in entries],
+        n=int(n),
+        seed=int(seed),
+        inputs=sim_inputs,
+    )
     by_pid = getattr(result, "by_pid", None)
     if not isinstance(by_pid, dict):
         raise PublishError("simulate_games did not return by_pid")
@@ -862,7 +899,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--sim",
         type=int,
         default=0,
-        help="Also publish model=sim with N draws when nfl.sim.simulate_games imports (0 off)",
+        help="Also publish model=sim with N draws (0 off). "
+        "mean/p10/p50/p90 from simulate_games with the optimizer's "
+        "--projection-source sim inputs.",
     )
     ap.add_argument("--sim-seed", type=int, default=1)
     ap.add_argument(
@@ -895,7 +934,13 @@ def main(argv: list[str] | None = None) -> int:
     today = datetime.now(ET).date()
     try:
         season, week, entries = load_slate(args, today)
-        sim_by_pid = maybe_sim(entries, args.sim, args.sim_seed)
+        sim_by_pid = maybe_sim(
+            entries,
+            args.sim,
+            args.sim_seed,
+            season=season,
+            refresh=bool(args.refresh),
+        )
     except StaleInputs as e:
         print(f"publish projections: {e}", file=sys.stderr)
         return 1

@@ -250,7 +250,9 @@ class SimGuardTest(unittest.TestCase):
             ],
         )[0]
         with patch("nfl.publish_projections.load_simulate_games", return_value=None):
-            self.assertIsNone(maybe_sim([entry], 10, 1))
+            self.assertIsNone(
+                maybe_sim([entry], 10, 1, season=2026, refresh=True)
+            )
 
     def test_present_sim_is_called_with_draws(self) -> None:
         entries = build_entries(
@@ -267,16 +269,94 @@ class SimGuardTest(unittest.TestCase):
 
         seen: dict = {}
 
-        def fake(players, n, seed):
+        bundle = object()
+
+        def fake(players, n, seed, inputs=None):
             seen["n"] = n
             seen["seed"] = seed
             seen["count"] = len(players)
+            seen["inputs"] = inputs
             return Result()
 
-        with patch("nfl.publish_projections.load_simulate_games", return_value=fake):
-            out = maybe_sim(entries, 25, 3)
+        with patch("nfl.publish_projections.load_simulate_games", return_value=fake), patch(
+            "nfl.sim_feed.resolve_sim_inputs",
+            return_value=(bundle, "sim inputs: test"),
+        ):
+            out = maybe_sim(entries, 25, 3, season=2026, refresh=True)
         self.assertEqual(out, {})
-        self.assertEqual(seen, {"n": 25, "seed": 3, "count": len(entries)})
+        self.assertIs(seen["inputs"], bundle)
+        self.assertEqual(seen["n"], 25)
+        self.assertEqual(seen["seed"], 3)
+        self.assertEqual(seen["count"], len(entries))
+
+    def test_stale_sim_inputs_exit(self) -> None:
+        entries = build_entries(
+            [_line()],
+            [
+                _depth("Patrick Mahomes", "KC", "QB", 1, "00-0033873"),
+                _depth("Josh Allen", "BUF", "QB", 1, "00-0034857"),
+            ],
+        )
+        with patch(
+            "nfl.publish_projections.load_simulate_games",
+            return_value=lambda *a, **k: None,
+        ), patch(
+            "nfl.sim_feed.resolve_sim_inputs",
+            return_value=(object(), "sim inputs: gangstash  stale cache"),
+        ):
+            with self.assertRaises(StaleInputs):
+                maybe_sim(entries, 10, 1, season=2026, refresh=True)
+
+    def test_sim_mean_matches_projection_source(self) -> None:
+        from nfl.sim import apply_ilp_objective, simulate_games
+        from nfl.sim_inputs import SimInputs
+
+        entries = build_entries(
+            [_line()],
+            [
+                _depth("Patrick Mahomes", "KC", "QB", 1, "00-0033873"),
+                _depth("Josh Allen", "BUF", "QB", 1, "00-0034857"),
+            ],
+        )
+        bundle = SimInputs()
+        players = [e.player for e in entries]
+        with patch(
+            "nfl.sim_feed.resolve_sim_inputs",
+            return_value=(bundle, "sim inputs: test"),
+        ):
+            by_pid = maybe_sim(entries, 40, 1, season=2026, refresh=True)
+        direct = simulate_games(players, n=40, seed=1, inputs=bundle).by_pid
+        adjusted = {
+            pl.pid: pl
+            for pl in apply_ilp_objective(
+                players,
+                "mean",
+                sim_by_pid=by_pid,
+                projection_source="sim",
+            )
+        }
+        rows = projection_rows(
+            entries,
+            season=2026,
+            week=3,
+            season_type="REG",
+            run_at="2026-09-25T04:00:00+00:00",
+            model_version="abc",
+            sim_by_pid=by_pid,
+        )
+        sims = {r["player_name"]: r for r in rows if r["model"] == "sim"}
+        boards = {r["player_name"]: r for r in rows if r["model"] == "board"}
+        self.assertEqual(set(sims), set(boards))
+        for entry in entries:
+            row = sims[entry.player.name]
+            stats = direct[entry.player.pid]
+            self.assertEqual(row["mean"], round(adjusted[entry.player.pid].objective, 4))
+            self.assertEqual(row["mean"], round(stats.mean, 4))
+            self.assertEqual(row["p10"], round(stats.p10, 4))
+            self.assertEqual(row["p50"], round(stats.p50, 4))
+            self.assertEqual(row["p90"], round(stats.p90, 4))
+            self.assertIsNotNone(boards[entry.player.name]["mean"])
+            self.assertIsNone(boards[entry.player.name]["p10"])
 
 
 class ExitTest(unittest.TestCase):
