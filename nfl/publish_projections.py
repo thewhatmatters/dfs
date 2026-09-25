@@ -869,10 +869,17 @@ def _inputs(
         tags.append("gs-depth")
     elif player.depth_rank is not None:
         tags.append("ourlads")
-    if player.target_share is not None:
+    inherited = False
+    if player.targets_source == "inherited":
+        inherited = True
+    elif player.target_share is not None:
         tags.append("gs-tgt" if player.targets_source == "gangstash" else "lineups-tgt")
-    if player.snap_share is not None:
+    if player.snaps_source == "inherited":
+        inherited = True
+    elif player.snap_share is not None:
         tags.append("gs-snap" if player.snaps_source == "gangstash" else "lineups-snap")
+    if inherited:
+        tags.append("inherited")
     if player.prop_fd is not None:
         tags.append("gs-props")
     if dst and player.implied_opp is not None:

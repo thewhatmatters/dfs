@@ -301,13 +301,23 @@ def _zero_out(player: Player) -> Player:
     )
 
 
+def _higher_share(own: float | None, other: float | None) -> float | None:
+    """Keep the larger share. A missing side does not pull the other down."""
+    if own is None:
+        return other
+    if other is None:
+        return own
+    return own if own >= other else other
+
+
 def promote_out_chart(players: list[Player]) -> list[Player]:
     """Fill an Out/IR/NA/SUSP depth slot with the next player at that position.
 
-    Ranks are rewritten inside each team and position. The player who
-    steps into a vacated slot inherits that slot's target and snap share
-    when the vacated player had one, then the objective is rescored.
-    That is the starter role coefficient and usage share. Doubtful and
+    Ranks are rewritten only inside a team and position that lost a
+    charted player. A group with no removal keeps its ranks, including
+    gaps. The player who steps into an Out player's slot keeps
+    ``max(own share, that slot's share)`` for targets and snaps. A
+    healthy player's share stays on that player. Doubtful and
     Questionable keep their rank, share, and objective. An out player's
     objective is 0.
     """
@@ -327,19 +337,45 @@ def promote_out_chart(players: list[Player]) -> list[Player]:
                 pl.pid,
             )
         )
+        removed = [pl for pl in charted if is_pool_out(pl)]
+        if not removed:
+            for pl in group:
+                if is_pool_out(pl):
+                    updates[pl.pid] = _zero_out(pl)
+            continue
         healthy = [pl for pl in charted if not is_pool_out(pl)]
         for index, pl in enumerate(healthy):
             role = charted[index]
             rank = index + 1
-            if role.pid == pl.pid:
-                target = pl.target_share
-                snap = pl.snap_share
-            else:
-                target = role.target_share if role.target_share is not None else pl.target_share
-                snap = role.snap_share if role.snap_share is not None else pl.snap_share
-            if rank == pl.depth_rank and target == pl.target_share and snap == pl.snap_share:
+            target = pl.target_share
+            snap = pl.snap_share
+            tgt_source = pl.targets_source
+            snap_source = pl.snaps_source
+            # Only the vacated Out slot moves. The next player never
+            # inherits a healthy teammate's larger share.
+            if role.pid != pl.pid and is_pool_out(role):
+                if pl.target_share is None and role.target_share is not None:
+                    tgt_source = "inherited"
+                if pl.snap_share is None and role.snap_share is not None:
+                    snap_source = "inherited"
+                target = _higher_share(pl.target_share, role.target_share)
+                snap = _higher_share(pl.snap_share, role.snap_share)
+            if (
+                rank == pl.depth_rank
+                and target == pl.target_share
+                and snap == pl.snap_share
+                and tgt_source == pl.targets_source
+                and snap_source == pl.snaps_source
+            ):
                 continue
-            patched = replace(pl, depth_rank=rank, target_share=target, snap_share=snap)
+            patched = replace(
+                pl,
+                depth_rank=rank,
+                target_share=target,
+                snap_share=snap,
+                targets_source=tgt_source,
+                snaps_source=snap_source,
+            )
             updates[pl.pid] = replace(patched, objective=score_player(patched))
         for pl in group:
             if is_pool_out(pl):

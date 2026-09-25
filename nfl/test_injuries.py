@@ -9,9 +9,10 @@ from pathlib import Path
 from nfl.injuries import injury_code, injury_rows_from_records, stamp_injuries
 from nfl.players import Player
 from nfl.projections import depth_prior, usage_factor, week1_score
-from nfl.publish_projections import build_entries
+from nfl.publish_projections import build_entries, projection_rows
 from nfl.sim import simulate_games
 from nfl.sim_feed import sim_pool
+from nfl.snaps import SnapWeekRow
 from nfl.targets import TargetWeekRow
 
 FIXTURE = Path(__file__).resolve().parent / "testdata" / "gangstash_injuries.json"
@@ -24,6 +25,18 @@ def _line() -> dict:
         "week": 3,
         "home_team_fd": "BUF",
         "away_team_fd": "KC",
+        "spread": -3.5,
+        "total": 47.5,
+    }
+
+
+def _gb_line() -> dict:
+    return {
+        "game_id": "2026_03_GB_BUF",
+        "season": 2026,
+        "week": 3,
+        "home_team_fd": "BUF",
+        "away_team_fd": "GB",
         "spread": -3.5,
         "total": 47.5,
     }
@@ -63,6 +76,22 @@ def _slate_depth() -> list[dict]:
         _depth("Patrick Mahomes", "KC", "QB", 1, "00-0033873"),
         _depth("Josh Allen", "BUF", "QB", 1, "00-0034857"),
     ]
+
+
+def _snap(name: str, team: str, pos: str, share: float) -> SnapWeekRow:
+    return SnapWeekRow(
+        player=name,
+        team=team,
+        position=pos,
+        week=2,
+        snaps=40,
+        snap_share=share,
+        snaps_avg=40.0,
+        snaps_total=40,
+        team_snap_pct=None,
+        source="gangstash",
+        asof="2026-09-20",
+    )
 
 
 def _shares() -> list[TargetWeekRow]:
@@ -225,7 +254,7 @@ class ProjectionInjuryTest(unittest.TestCase):
         )
         self.assertGreater(backup.objective, before["00-0037001"].objective)
         self.assertEqual(third.depth_rank, 2)
-        self.assertEqual(third.target_share, before["00-0037001"].target_share)
+        self.assertEqual(third.target_share, before["00-0037002"].target_share)
         self.assertAlmostEqual(
             backup.objective - before["00-0037001"].objective,
             before["00-0036322"].objective - before["00-0037001"].objective,
@@ -332,6 +361,150 @@ class ProjectionInjuryTest(unittest.TestCase):
         self.assertEqual(backup.target_share, 0.30)
         self.assertAlmostEqual(_role(backup), _role(before["00-0036322"]))
         self.assertNotIn("00-0036322", {pl.pid for pl in sim_pool(list(after.values()))})
+
+    def test_promotion_keeps_the_higher_share_and_does_not_cascade(self) -> None:
+        """WR2's snap is larger than the Out WR1 slot. WR3 must not receive it."""
+        depth = [
+            _depth("Jayden Reed", "GB", "WR", 1, "wr1"),
+            _depth("Matthew Golden", "GB", "WR", 2, "wr2"),
+            _depth("Skyy Moore", "GB", "WR", 3, "wr3"),
+            _depth("Jordan Love", "GB", "QB", 1, "qb-gb"),
+            _depth("Josh Allen", "BUF", "QB", 1, "qb-buf"),
+        ]
+        targets = [
+            _target("Jayden Reed", "GB", "WR", 0.116),
+            _target("Matthew Golden", "GB", "WR", 0.261),
+            _target("Skyy Moore", "GB", "WR", 0.058),
+        ]
+        snaps = [
+            _snap("Jayden Reed", "GB", "WR", 0.30),
+            _snap("Matthew Golden", "GB", "WR", 0.84),
+            _snap("Skyy Moore", "GB", "WR", 0.20),
+        ]
+        injuries = [
+            {
+                "full_name": "Jayden Reed",
+                "report_status": "Out",
+                "gsis_id": "wr1",
+                "player_key": "wr1",
+                "team": "GB",
+                "season": 2026,
+                "week": 3,
+            }
+        ]
+        before = _by_pid(
+            build_entries([_gb_line()], depth, target_rows=targets, snap_rows=snaps)
+        )
+        after = _by_pid(
+            build_entries(
+                [_gb_line()],
+                depth,
+                target_rows=targets,
+                snap_rows=snaps,
+                injury_rows=injuries,
+            )
+        )
+        golden = after["wr2"]
+        moore = after["wr3"]
+        self.assertEqual(after["wr1"].objective, 0.0)
+        self.assertEqual(golden.depth_rank, 1)
+        self.assertGreaterEqual(golden.target_share, before["wr2"].target_share)
+        self.assertGreaterEqual(golden.snap_share, before["wr2"].snap_share)
+        self.assertEqual(golden.target_share, 0.261)
+        self.assertEqual(golden.snap_share, 0.84)
+        self.assertEqual(moore.depth_rank, 2)
+        self.assertEqual(moore.target_share, before["wr3"].target_share)
+        self.assertEqual(moore.snap_share, before["wr3"].snap_share)
+        self.assertLessEqual(moore.snap_share, golden.snap_share)
+        self.assertLessEqual(moore.target_share, golden.target_share)
+        self.assertNotEqual(moore.snap_share, before["wr2"].snap_share)
+        self.assertNotEqual(moore.target_share, before["wr2"].target_share)
+
+    def test_rank_gap_without_an_out_is_unchanged(self) -> None:
+        depth = [
+            _depth("Starter TE", "NYG", "TE", 1, "te1"),
+            _depth("Second TE", "NYG", "TE", 2, "te2"),
+            _depth("Thomas Fidone", "NYG", "TE", 4, "te4"),
+            _depth("Jaxson Dart", "NYG", "QB", 1, "qb-nyg"),
+            _depth("Dak Prescott", "DAL", "QB", 1, "qb-dal"),
+            _depth("Out WR", "NYG", "WR", 1, "wr-out"),
+            _depth("Next WR", "NYG", "WR", 2, "wr-next"),
+        ]
+        line = {
+            "game_id": "2026_03_NYG_DAL",
+            "season": 2026,
+            "week": 3,
+            "home_team_fd": "DAL",
+            "away_team_fd": "NYG",
+            "spread": -3.0,
+            "total": 44.0,
+        }
+        injuries = [
+            {
+                "full_name": "Out WR",
+                "report_status": "Out",
+                "gsis_id": "wr-out",
+                "player_key": "wr-out",
+                "team": "NYG",
+                "season": 2026,
+                "week": 3,
+            }
+        ]
+        before = _by_pid(build_entries([line], depth))
+        after = _by_pid(build_entries([line], depth, injury_rows=injuries))
+        for pid in ("te1", "te2", "te4"):
+            self.assertEqual(after[pid].depth_rank, before[pid].depth_rank)
+            self.assertEqual(after[pid].target_share, before[pid].target_share)
+            self.assertEqual(after[pid].snap_share, before[pid].snap_share)
+            self.assertEqual(after[pid].objective, before[pid].objective)
+        self.assertEqual(after["te4"].depth_rank, 4)
+        self.assertEqual(after["wr-next"].depth_rank, 1)
+        self.assertEqual(after["wr-out"].objective, 0.0)
+
+    def test_inherited_share_is_not_labeled_lineups(self) -> None:
+        depth = [
+            _depth("Jayden Reed", "GB", "WR", 1, "wr1"),
+            _depth("Savion Williams", "GB", "WR", 2, "wr2"),
+            _depth("Jordan Love", "GB", "QB", 1, "qb-gb"),
+            _depth("Josh Allen", "BUF", "QB", 1, "qb-buf"),
+        ]
+        targets = [_target("Jayden Reed", "GB", "WR", 0.22)]
+        snaps = [_snap("Jayden Reed", "GB", "WR", 0.70)]
+        injuries = [
+            {
+                "full_name": "Jayden Reed",
+                "report_status": "Out",
+                "gsis_id": "wr1",
+                "player_key": "wr1",
+                "team": "GB",
+                "season": 2026,
+                "week": 3,
+            }
+        ]
+        entries = build_entries(
+            [_gb_line()],
+            depth,
+            target_rows=targets,
+            snap_rows=snaps,
+            injury_rows=injuries,
+        )
+        williams = next(entry for entry in entries if entry.player.pid == "wr2")
+        self.assertEqual(williams.player.target_share, 0.22)
+        self.assertEqual(williams.player.snap_share, 0.70)
+        self.assertEqual(williams.player.targets_source, "inherited")
+        self.assertEqual(williams.player.snaps_source, "inherited")
+        rows = projection_rows(
+            [williams],
+            season=2026,
+            week=3,
+            season_type="REG",
+            run_at="2026-09-25T04:00:00+00:00",
+            model_version="test",
+        )
+        sources = rows[0]["inputs"]["sources"]
+        self.assertIn("inherited", sources)
+        self.assertNotIn("lineups-tgt", sources)
+        self.assertNotIn("lineups-snap", sources)
 
 
 if __name__ == "__main__":
