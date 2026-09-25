@@ -9,6 +9,7 @@ import csv
 import json
 import sys
 from pathlib import Path
+from typing import Optional
 
 MARK = {"ready": "✅", "degraded": "⚠ ", "gated": "🔒", "down": "⛔"}
 RANK = {"ready": 0, "degraded": 1, "gated": 2, "down": 3}
@@ -37,7 +38,7 @@ def check_pulp():
     return ("ready", None, "pulp importable")
 
 
-def check_csv(path: str | None):
+def check_csv(path: Optional[str]):
     if not path:
         return ("degraded", None, "no --csv yet (pass when solving)")
     p = Path(path).expanduser()
@@ -46,7 +47,7 @@ def check_csv(path: str | None):
     return ("ready", None, p.name)
 
 
-def check_join(path: str | None):
+def check_join(path: Optional[str]):
     """CSV Team/Opponent vs ncaaf.teams.TEAMS. Skip when there is no file yet."""
     if not path:
         return ("ready", None, "no --csv yet (join skipped)")
@@ -73,7 +74,7 @@ def check_join(path: str | None):
     return ("ready", None, f"{len(abbrevs)} teams mapped")
 
 
-def check_lines(use_fppg: bool, lines_json: str | None):
+def check_lines(use_fppg: bool, lines_json: Optional[str]):
     if use_fppg:
         return ("ready", None, "FPPG opt-in (prior season, not this slate)")
     if lines_json:
