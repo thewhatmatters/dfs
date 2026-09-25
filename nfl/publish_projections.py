@@ -14,9 +14,15 @@ Read key: GANGSTASH_API_KEY (existing /data and /props clients).
 `simulate_games` with the same gangstash `SimInputs` the optimizer
 builds for `--projection-source sim`. `mean` is that simulated mean.
 `--sim-efficiency` matches the optimizer (default `data`).
-The run log prints that mode, and each sim row stores it on
-`inputs.sim_efficiency`. Missing sim inputs fall back to placeholder
-and the board, and the log says so. The nightly publish still posts.
+The run log prints the effective mode after any fallback, and each sim
+row stores that mode on `inputs.sim_efficiency`. Missing sim inputs
+fall back to placeholder and the board, and the log says so. The
+nightly publish still posts the board.
+
+`GANGSTASH_API_KEY` is required to read game lines, depth, targets,
+snaps, and props. If it is unset the command exits 1 before posting.
+There is no other read source. `--refresh` (the default) does not
+fall back to a cache when the key is missing.
 """
 
 from __future__ import annotations
@@ -202,6 +208,23 @@ def load_simulate_games():
     return fn if callable(fn) else None
 
 
+def missing_read_key_message(detail: str) -> str:
+    """Why publish stopped when the gangstash read key is missing.
+
+    The nightly job has no second data source. ``--refresh`` (the default)
+    does not read a cache when the key is unset.
+    """
+    text = (detail or "GANGSTASH_API_KEY is not set").strip()
+    if "GANGSTASH_API_KEY" not in text:
+        text = f"GANGSTASH_API_KEY is not set ({text})"
+    return (
+        f"{text}. publish_projections reads game lines, depth, targets, "
+        "snaps, and props from gangstash and exits without posting. "
+        "Set GANGSTASH_API_KEY. The default --refresh does not switch to "
+        "another data source or a cache."
+    )
+
+
 def maybe_sim(
     entries: list[PublishEntry],
     n: int,
@@ -211,25 +234,27 @@ def maybe_sim(
     refresh: bool,
     week: int | None = None,
     sim_efficiency: str = "data",
-) -> dict | None:
-    """pid → SimStats for model=sim.
+) -> tuple[dict | None, str]:
+    """``(pid → SimStats, effective efficiency mode)``.
 
     Same call as the optimizer's `--projection-source sim` path:
     `resolve_sim_inputs` then `simulate_games(..., inputs=, efficiency=)`.
     `before_week` drops the slate week and later, so a nightly publish
     uses completed weeks only. `mean` on the published row is that draw's
     mean (the ILP mean when projection source is sim). p10/p50/p90 are
-    the same draws.
+    the same draws. The mode is the one actually used, including a
+    placeholder fallback when sim inputs are missing.
     """
+    requested = (sim_efficiency or "data").strip().lower()
     if n <= 0:
-        return None
+        return None, requested
     fn = load_simulate_games()
     if fn is None:
         print(
             "sim unavailable (nfl.sim.simulate_games); publishing board only",
             file=sys.stderr,
         )
-        return None
+        return None, requested
     try:
         from nfl.sim_feed import resolve_sim_inputs
         from nfl.sim_inputs import SimInputError
@@ -238,7 +263,7 @@ def maybe_sim(
             "sim inputs unavailable; publishing board only",
             file=sys.stderr,
         )
-        return None
+        return None, requested
     try:
         sim_inputs, note = resolve_sim_inputs(
             path=None,
@@ -254,7 +279,7 @@ def maybe_sim(
         raise StaleInputs("sim inputs cache is stale")
     from nfl.sim_efficiency import resolve_run_efficiency
 
-    efficiency, _used, efficiency_note = resolve_run_efficiency(
+    efficiency, used, efficiency_note = resolve_run_efficiency(
         sim_efficiency,
         sim_inputs,
         before_week=week,
@@ -266,7 +291,7 @@ def maybe_sim(
             "sim inputs missing; sim fell back to board; publishing board only",
             file=sys.stderr,
         )
-        return None
+        return None, used
     try:
         result = fn(
             [e.player for e in entries],
@@ -280,15 +305,15 @@ def maybe_sim(
             f"sim failed ({e}); sim fell back to board; publishing board only",
             file=sys.stderr,
         )
-        return None
+        return None, used
     by_pid = getattr(result, "by_pid", None)
     if not isinstance(by_pid, dict):
         print(
             "sim fell back to board; publishing board only",
             file=sys.stderr,
         )
-        return None
-    return by_pid
+        return None, used
+    return by_pid, used
 
 
 def _stale(meta: dict, label: str) -> None:
@@ -987,7 +1012,7 @@ def main(argv: list[str] | None = None) -> int:
     today = datetime.now(ET).date()
     try:
         season, week, entries = load_slate(args, today)
-        sim_by_pid = maybe_sim(
+        sim_by_pid, used_efficiency = maybe_sim(
             entries,
             args.sim,
             args.sim_seed,
@@ -999,11 +1024,15 @@ def main(argv: list[str] | None = None) -> int:
     except StaleInputs as e:
         print(f"publish projections: {e}", file=sys.stderr)
         return 1
+    except (GangstashDataKeyMissing, GangstashKeyMissing) as e:
+        print(
+            f"publish projections: {missing_read_key_message(str(e))}",
+            file=sys.stderr,
+        )
+        return 1
     except (
         PublishError,
-        GangstashDataKeyMissing,
         GangstashDataError,
-        GangstashKeyMissing,
         UnmappedTeam,
     ) as e:
         print(f"publish projections: {e}", file=sys.stderr)
@@ -1018,11 +1047,11 @@ def main(argv: list[str] | None = None) -> int:
         run_at=run_at,
         model_version=version,
         sim_by_pid=sim_by_pid,
-        sim_efficiency=args.sim_efficiency,
+        sim_efficiency=used_efficiency,
     )
     print(
         f"projections {season} week {week} {args.season_type} "
-        f"run_at={run_at} model_version={version} sim_efficiency={args.sim_efficiency}",
+        f"run_at={run_at} model_version={version} sim_efficiency={used_efficiency}",
         file=sys.stderr,
     )
     print(summarize(rows), file=sys.stderr)

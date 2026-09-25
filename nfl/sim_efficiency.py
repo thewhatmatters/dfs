@@ -285,12 +285,21 @@ def _spread(raw: list[float], budget: float) -> list[float]:
     return [value * factor for value in raw]
 
 
+_POSITION_RATES: dict[str, dict[str, float]] = {}
+
+
 def position_rates(position: str) -> dict[str, float]:
-    """Placeholder constants for one position. The no-history prior."""
+    """Placeholder constants for one position. The no-history prior.
+
+    Computed once per position. Callers must not mutate the dict.
+    """
     pos = (position or "WR").upper()
+    hit = _POSITION_RATES.get(pos)
+    if hit is not None:
+        return hit
     catch = CATCH_RATE.get(pos, 0.64)
     ypr = YARDS_PER_REC.get(pos, 11.0)
-    return {
+    hit = {
         "catch_rate": catch,
         "yards_per_target": catch * ypr,
         "rec_td_per_target": REC_TD_PER_TARGET.get(pos, 0.04),
@@ -299,6 +308,8 @@ def position_rates(position: str) -> dict[str, float]:
         "yards_per_attempt": PASS_YPA,
         "pass_td_per_attempt": PASS_TD_RATE,
     }
+    _POSITION_RATES[pos] = hit
+    return hit
 
 
 def _blend_level(
@@ -621,10 +632,31 @@ class DataEfficiency:
         for row in weeks:
             self._add_player(row)
         self._sides = _index_sides(bundle, before_week)
+        # Rates and opponent scales do not depend on the draw. Memoize them
+        # so a 10k-draw slate pays the shrinkage once per player and side.
+        self._rate_cache: dict[tuple, dict[str, float]] = {}
+        self._line_cache: dict[tuple, tuple[bool, float, float, float]] = {}
+        self._rush_cache: dict[tuple, tuple[float, float, float, float]] = {}
+        self._pass_mult: dict[str, float] = {}
+        self._rush_mult: dict[str, float] = {}
+        self._td_mult: dict[tuple[str, str], float] = {}
+        self._pass_scale: dict[tuple[str, str], float] = {}
+        self._rush_scale: dict[tuple[str, float], float] = {}
 
     def rates_for(self, player: Player | None, position: str) -> dict[str, float]:
-        """Shrunk rates. No history returns the position prior, unadjusted."""
+        """Shrunk rates. No history returns the position prior, unadjusted.
+
+        The result is memoized for this instance. Do not mutate it.
+        """
         pos = (position or "WR").upper()
+        cache_key = (id(player) if player is not None else None, pos)
+        if cache_key in self._rate_cache:
+            return self._rate_cache[cache_key]
+        computed = self._rates_for(player, pos)
+        self._rate_cache[cache_key] = computed
+        return computed
+
+    def _rates_for(self, player: Player | None, pos: str) -> dict[str, float]:
         base = position_rates(pos)
         player_sums = self._lookup(player) if player is not None else None
         if player_sums is None or (
@@ -800,6 +832,14 @@ class DataEfficiency:
         return out
 
     def pass_multiplier(self, opponent: str | None) -> float:
+        key = (opponent or "").upper()
+        if key in self._pass_mult:
+            return self._pass_mult[key]
+        value = self._pass_multiplier(opponent)
+        self._pass_mult[key] = value
+        return value
+
+    def _pass_multiplier(self, opponent: str | None) -> float:
         side = self._sides.get(((opponent or "").upper(), "defense"))
         if side is None:
             return 1.0
@@ -822,6 +862,19 @@ class DataEfficiency:
         return clamp(mult, 1.0 - OPP_CLAMP, 1.0 + OPP_CLAMP)
 
     def rush_budget_scale(
+        self,
+        team: str,
+        opponent: str | None,
+        pass_tilt: float,
+    ) -> float:
+        key = ((opponent or "").upper(), float(pass_tilt) if pass_tilt else 1.0)
+        if key in self._rush_scale:
+            return self._rush_scale[key]
+        value = self._rush_budget_scale(team, opponent, pass_tilt)
+        self._rush_scale[key] = value
+        return value
+
+    def _rush_budget_scale(
         self,
         team: str,
         opponent: str | None,
@@ -867,13 +920,12 @@ class DataEfficiency:
         prior_td: list[float] = []
         for player, rushes in specs:
             pos = (player.position or "RB").upper()
-            rates = self.rates_for(player, pos)
-            prior = position_rates(pos)
+            ypc, prior_ypc, td_rate, prior_td_rate = self._rush_rates(player, pos)
             carries = max(0.0, float(rushes))
-            raw_yd.append(carries * rates["yards_per_carry"])
-            prior_yd.append(carries * prior["yards_per_carry"])
-            raw_td.append(carries * rates["rush_td_per_carry"])
-            prior_td.append(carries * prior["rush_td_per_carry"])
+            raw_yd.append(carries * ypc)
+            prior_yd.append(carries * prior_ypc)
+            raw_td.append(carries * td_rate)
+            prior_td.append(carries * prior_td_rate)
         yard_budget = sum(prior_yd) if yard_scale == 1.0 else sum(prior_yd) * yard_scale
         td_budget = sum(prior_td) if td_scale == 1.0 else sum(prior_td) * td_scale
         yards = _spread(raw_yd, yard_budget)
@@ -883,6 +935,14 @@ class DataEfficiency:
         }
 
     def rush_multiplier(self, opponent: str | None) -> float:
+        key = (opponent or "").upper()
+        if key in self._rush_mult:
+            return self._rush_mult[key]
+        value = self._rush_multiplier(opponent)
+        self._rush_mult[key] = value
+        return value
+
+    def _rush_multiplier(self, opponent: str | None) -> float:
         side = self._sides.get(((opponent or "").upper(), "defense"))
         if side is None:
             return 1.0
@@ -900,6 +960,14 @@ class DataEfficiency:
 
     def td_multiplier(self, team: str | None, opponent: str | None) -> float:
         """Offense red-zone rate up, and a defense that allows more, both raise TDs."""
+        key = ((team or "").upper(), (opponent or "").upper())
+        if key in self._td_mult:
+            return self._td_mult[key]
+        value = self._td_multiplier(team, opponent)
+        self._td_mult[key] = value
+        return value
+
+    def _td_multiplier(self, team: str | None, opponent: str | None) -> float:
         off = self._sides.get(((team or "").upper(), "offense"))
         de = self._sides.get(((opponent or "").upper(), "defense"))
         if (off is None or off.red_zone_td_rate is None) and (
@@ -924,6 +992,14 @@ class DataEfficiency:
 
     def pass_anchor_scale(self, team: str, opponent: str | None) -> float:
         """Tilt pass yards inside the Vegas anchor. 1.0 when the rows are missing."""
+        key = ((team or "").upper(), (opponent or "").upper())
+        if key in self._pass_scale:
+            return self._pass_scale[key]
+        value = self._pass_anchor_scale(team, opponent)
+        self._pass_scale[key] = value
+        return value
+
+    def _pass_anchor_scale(self, team: str, opponent: str | None) -> float:
         off = self._sides.get((team.upper(), "offense"))
         de = self._sides.get(((opponent or "").upper(), "defense"))
         if off is None and de is None:
@@ -960,6 +1036,57 @@ class DataEfficiency:
     def td_anchor_scale(self, team: str, opponent: str | None) -> float:
         return self.td_multiplier(team, opponent)
 
+    def _line_params(
+        self, player: Player | None, position: str
+    ) -> tuple[bool, float, float, float]:
+        """``(matches_prior, catch, yards_per_target, td_rate)`` once per player.
+
+        Yards per target already include a pass multiplier other than 1,
+        in the same order as the per-draw multiply (``ypt * pass_mult``).
+        """
+        pos = (position or "WR").upper()
+        key = (id(player) if player is not None else None, pos)
+        hit = self._line_cache.get(key)
+        if hit is not None:
+            return hit
+        rates = self.rates_for(player, pos)
+        prior = position_rates(pos)
+        opponent = player.opponent if player is not None else None
+        pass_mult = self.pass_multiplier(opponent)
+        catch = rates["catch_rate"]
+        ypt = rates["yards_per_target"]
+        td_rate = rates["rec_td_per_target"]
+        same = (
+            pass_mult == 1.0
+            and catch == prior["catch_rate"]
+            and ypt == prior["yards_per_target"]
+            and td_rate == prior["rec_td_per_target"]
+        )
+        if not same and pass_mult != 1.0:
+            ypt = ypt * pass_mult
+        packed = (same, catch, ypt, td_rate)
+        self._line_cache[key] = packed
+        return packed
+
+    def _rush_rates(
+        self, player: Player, pos: str
+    ) -> tuple[float, float, float, float]:
+        """``(ypc, prior_ypc, td_per_carry, prior_td)`` once per player."""
+        key = (id(player), pos)
+        hit = self._rush_cache.get(key)
+        if hit is not None:
+            return hit
+        rates = self.rates_for(player, pos)
+        prior = position_rates(pos)
+        packed = (
+            rates["yards_per_carry"],
+            prior["yards_per_carry"],
+            rates["rush_td_per_carry"],
+            prior["rush_td_per_carry"],
+        )
+        self._rush_cache[key] = packed
+        return packed
+
     def receiving_line(
         self,
         rng: random.Random,
@@ -967,22 +1094,11 @@ class DataEfficiency:
         targets: float,
         player: Player | None = None,
     ) -> ReceivingLine:
-        rates = self.rates_for(player, position)
-        opponent = player.opponent if player is not None else None
+        same, catch, ypt, td_rate = self._line_params(player, position)
         t = max(0.0, float(targets))
-        catch = rates["catch_rate"]
-        ypt = rates["yards_per_target"]
-        td_rate = rates["rec_td_per_target"]
-        pass_mult = self.pass_multiplier(opponent)
-        prior = position_rates(position)
         # Same multiply order as the placeholder when nothing has moved,
         # so an empty history reproduces those draws bit for bit.
-        if (
-            pass_mult == 1.0
-            and catch == prior["catch_rate"]
-            and ypt == prior["yards_per_target"]
-            and td_rate == prior["rec_td_per_target"]
-        ):
+        if same:
             base = expected_receiving_line(position, t)
             return ReceivingLine(
                 targets=base.targets,
@@ -990,8 +1106,6 @@ class DataEfficiency:
                 rec_yd=sample_yards(rng, base.rec_yd),
                 rec_td=base.rec_td,
             )
-        if pass_mult != 1.0:
-            ypt *= pass_mult
         return ReceivingLine(
             targets=t,
             receptions=t * catch,

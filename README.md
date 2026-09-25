@@ -17,7 +17,7 @@ python3 -m ncaaf.optimize --csv "ncaaf/data/<FanDuel-export>.csv"
 python3 -m nfl.optimize --csv "nfl/data/<players-list>.csv"
 ```
 
-JSON on stdout; human lineup + per-game spread/total/implied totals on stderr. `--out PATH` writes the JSON. `--agent` skips prompts. NCAAF `--use-fppg` is prior-season FPPG, not this slate. NFL uploads: `nfl/export/` when `--n-lineups>1` (coverage defaults: `--max-exposure=0.60`, `--diversity=coverage`; `--max-exposure=1 --diversity=chalk` is chalk lock-in).
+JSON on stdout; human lineup + per-game spread/total/implied totals on stderr. `--out PATH` writes the JSON. `--agent` skips prompts. NCAAF `--use-fppg` is prior-season FPPG, not this slate. NFL uploads: `nfl/export/` when `--export` or `--upload` is set (`--n-lineups` does not write a file). Coverage defaults when n>1: `--max-exposure=0.60`, `--diversity=coverage`; `--max-exposure=1 --diversity=chalk` is chalk lock-in.
 
 Implementation work is meant to run on **Grok CLI**. From Cursor, the in-session model should dispatch via `bash scripts/dispatch-grok.sh results/grok-prompt.md` rather than editing the tree itself. Or just `grok` in this directory.
 
@@ -38,7 +38,7 @@ Implementation work is meant to run on **Grok CLI**. From Cursor, the in-session
 | `nfl/` | FanDuel NFL classic adapter (`python3 -m nfl.optimize`) |
 | `nfl/docs/data/player-props.md` | NFL player props via `GANGSTASH_API_KEY` |
 | `nfl/docs/data/gangstash.md` | Optional gangstash targets, game lines, depth, and team-stats cache (defaults stay Lineups / Odds API / OurLads) |
-| `nfl/export/` | FanDuel upload CSVs when `--n-lineups>1` |
+| `nfl/export/` | FanDuel upload CSVs when `--export` or `--upload` is set |
 | `.cursor/skills/optimize-nfl-classic/` | Agent skill (NFL; “optimize NFL”, `/optimize-nfl-classic`) |
 
 Default objective is **Vegas implied team totals** (spread + total). CSV `FPPG` is last season / empty — not the week-1 score. See [`ncaaf/docs/data/vegas-implied-totals.md`](ncaaf/docs/data/vegas-implied-totals.md). Missing `CFBD_API_KEY` (or `ODDS_API_KEY`) stops the run.

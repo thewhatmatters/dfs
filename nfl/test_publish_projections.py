@@ -275,7 +275,7 @@ class PayloadTest(unittest.TestCase):
             return 2026, 3, entries
 
         with patch("nfl.publish_projections.load_slate", load), patch(
-            "nfl.publish_projections.maybe_sim", return_value=sim
+            "nfl.publish_projections.maybe_sim", return_value=(sim, "data")
         ), patch(
             "nfl.publish_projections.model_version", return_value="abc1234"
         ), patch("nfl.publish_projections.post_projection_rows") as post:
@@ -323,9 +323,9 @@ class SimGuardTest(unittest.TestCase):
             ],
         )[0]
         with patch("nfl.publish_projections.load_simulate_games", return_value=None):
-            self.assertIsNone(
-                maybe_sim([entry], 10, 1, season=2026, refresh=True)
-            )
+            by_pid, mode = maybe_sim([entry], 10, 1, season=2026, refresh=True)
+        self.assertIsNone(by_pid)
+        self.assertEqual(mode, "data")
 
     def test_present_sim_is_called_with_draws(self) -> None:
         entries = build_entries(
@@ -358,8 +358,9 @@ class SimGuardTest(unittest.TestCase):
             "nfl.sim_feed.resolve_sim_inputs",
             return_value=(bundle, "sim inputs: test"),
         ):
-            out = maybe_sim(entries, 25, 3, season=2026, refresh=True)
-        self.assertEqual(out, {})
+            by_pid, mode = maybe_sim(entries, 25, 3, season=2026, refresh=True)
+        self.assertEqual(by_pid, {})
+        self.assertEqual(mode, "data")
         self.assertIs(seen["inputs"], bundle)
         self.assertEqual(seen["n"], 25)
         self.assertEqual(seen["seed"], 3)
@@ -434,11 +435,16 @@ class SimGuardTest(unittest.TestCase):
             "nfl.sim_feed.resolve_sim_inputs",
             return_value=(None, "sim inputs: gangstash unavailable — role shares deterministic"),
         ), redirect_stderr(err):
-            out = maybe_sim(entries, 10, 1, season=2026, refresh=True, week=3)
-        self.assertIsNone(out)
+            by_pid, mode = maybe_sim(entries, 10, 1, season=2026, refresh=True, week=3)
+        self.assertIsNone(by_pid)
+        self.assertEqual(mode, "placeholder")
         text = err.getvalue()
         self.assertIn(EFFICIENCY_FALLBACK_NOTE, text)
         self.assertIn("sim fell back to board; publishing board only", text)
+        self.assertLess(
+            text.index(EFFICIENCY_FALLBACK_NOTE),
+            text.index("sim fell back to board"),
+        )
 
     def test_stale_sim_inputs_exit(self) -> None:
         entries = build_entries(
@@ -475,7 +481,8 @@ class SimGuardTest(unittest.TestCase):
             "nfl.sim_feed.resolve_sim_inputs",
             return_value=(bundle, "sim inputs: test"),
         ):
-            by_pid = maybe_sim(entries, 40, 1, season=2026, refresh=True)
+            by_pid, mode = maybe_sim(entries, 40, 1, season=2026, refresh=True)
+        self.assertEqual(mode, "data")
         direct = simulate_games(players, n=40, seed=1, inputs=bundle).by_pid
         adjusted = {
             pl.pid: pl
@@ -522,6 +529,82 @@ class ExitTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         load.assert_not_called()
         post.assert_not_called()
+
+    def test_missing_read_key_names_the_gate(self) -> None:
+        import io
+        from contextlib import redirect_stderr
+
+        from nfl.gangstash import GangstashDataKeyMissing
+
+        err = io.StringIO()
+        with patch(
+            "nfl.publish_projections.load_slate",
+            side_effect=GangstashDataKeyMissing("GANGSTASH_API_KEY is not set"),
+        ), patch("nfl.publish_projections.post_projection_rows") as post, redirect_stderr(
+            err
+        ):
+            rc = main(["--dry-run"])
+        self.assertEqual(rc, 1)
+        post.assert_not_called()
+        text = err.getvalue()
+        self.assertIn("publish projections:", text)
+        self.assertIn("GANGSTASH_API_KEY", text)
+        self.assertIn("game lines", text)
+        self.assertIn("depth", text)
+        self.assertIn("targets", text)
+        self.assertIn("snaps", text)
+        self.assertIn("props", text)
+        self.assertIn("exits without posting", text)
+        self.assertIn("--refresh", text)
+        self.assertNotIn("oddsapi", text)
+        self.assertNotIn("--lines-source", text)
+
+    def test_fallback_header_prints_the_effective_mode(self) -> None:
+        import io
+        import tempfile
+        from contextlib import redirect_stderr
+
+        from nfl.sim_efficiency import EFFICIENCY_FALLBACK_NOTE
+
+        entries = build_entries(
+            [_line()],
+            [
+                _depth("Patrick Mahomes", "KC", "QB", 1, "00-0033873"),
+                _depth("Josh Allen", "BUF", "QB", 1, "00-0034857"),
+            ],
+        )
+
+        def load(_args, _today):
+            return 2026, 3, entries
+
+        err = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "nfl.publish_projections.load_slate", load
+        ), patch(
+            "nfl.sim_feed.resolve_sim_inputs",
+            return_value=(
+                None,
+                "sim inputs: gangstash unavailable — role shares deterministic",
+            ),
+        ), redirect_stderr(err):
+            rc = main(
+                [
+                    "--dry-run",
+                    "--out-dir",
+                    tmp,
+                    "--sim",
+                    "10",
+                    "--sim-efficiency",
+                    "data",
+                ]
+            )
+        self.assertEqual(rc, 0)
+        text = err.getvalue()
+        self.assertLess(
+            text.index(EFFICIENCY_FALLBACK_NOTE),
+            text.index("sim_efficiency=placeholder"),
+        )
+        self.assertNotIn("sim_efficiency=data", text)
 
     def test_stale_week_exits_before_post(self) -> None:
         with patch("nfl.publish_projections.projections_key", return_value="sekrit"), patch(

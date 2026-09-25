@@ -119,7 +119,7 @@ from nfl.targets import (  # noqa: E402
     print_targets_gaps,
 )
 from nfl.teams import UnmappedTeam  # noqa: E402
-from nfl.upload import export_lineups  # noqa: E402
+from nfl.upload import export_lineups, slate_contest  # noqa: E402
 
 VEGAS_LABEL = (
     "Gangstash player-prop FD points when volume lines join; else implied "
@@ -527,9 +527,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     ap.add_argument(
         "--upload",
-        help="write FanDuel upload CSV (Id:Nickname, picker order). "
+        help="write FanDuel upload CSV (Id:Nickname, picker order) to this path. "
         "Uses nfl/data/FanDuel-NFL-*-entries-upload-template.csv when present "
-        "(keeps entry_id); legacy QB-first templates still work.",
+        "(keeps entry_id); legacy QB-first templates still work. "
+        "Does not write nfl/export/ unless --export is also set.",
+    )
+    ap.add_argument(
+        "--export",
+        action="store_true",
+        help="write a stamped upload CSV under nfl/export/ "
+        "(nfl-{contest}-{objective}-{timestamp}.csv). "
+        "Off unless this flag is set. --upload writes its own path and "
+        "does not write nfl/export/. --n-lineups does not write a file.",
     )
     ap.add_argument(
         "--slate-status",
@@ -544,6 +553,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "JSON always includes slate_status after a successful ingest.",
     )
     return _apply_multi_lineup_defaults(ap.parse_args(argv))
+
+
+def announce_efficiency(requested: str, inputs, *, before_week: int | None = None):
+    """Print any fallback note, then the efficiency mode that will run."""
+    efficiency, used, note = resolve_run_efficiency(
+        requested,
+        inputs,
+        before_week=before_week,
+    )
+    if note:
+        print(note, file=sys.stderr)
+    print(f"sim efficiency: {used}", file=sys.stderr)
+    return efficiency, used
 
 
 def _sim_n(args) -> int:
@@ -899,7 +921,7 @@ def main(argv: list[str] | None = None) -> int:
         "site": FANDUEL_NFL.site,
         "sport": FANDUEL_NFL.sport,
         "csv": str(csv_path),
-        "contest": "133104",
+        "contest": slate_contest(raw) or "133104",
         "salary_cap": rules.salary_cap,
         "salary_floor": rules.salary_floor,
         "min_teams": FANDUEL_NFL.min_teams,
@@ -955,6 +977,7 @@ def main(argv: list[str] | None = None) -> int:
             "max_per_team": args.max_per_team,
             "stack_qb": args.stack_qb,
             "upload": args.upload,
+            "export": args.export,
         },
         "bring_back": args.bring_back,
         "cash_line": args.cash_line,
@@ -972,7 +995,6 @@ def main(argv: list[str] | None = None) -> int:
     game_sim = None
     if sim_n > 0:
         print(sim_header(sim_n), file=sys.stderr)
-        print(f"sim efficiency: {args.sim_efficiency}", file=sys.stderr)
         weeks = args.targets_weeks or (
             [args.targets_week] if args.targets_week else None
         )
@@ -991,14 +1013,12 @@ def main(argv: list[str] | None = None) -> int:
             _write_payload(payload, args)
             return 1
         print(sim_note, file=sys.stderr)
-        efficiency, used_mode, efficiency_note = resolve_run_efficiency(
+        efficiency, used_mode = announce_efficiency(
             args.sim_efficiency,
             sim_inputs,
             before_week=args.week,
         )
-        if efficiency_note:
-            print(efficiency_note, file=sys.stderr)
-            args.sim_efficiency = used_mode
+        args.sim_efficiency = used_mode
         source, source_note = projection_source_for_run(
             args.projection_source, sim_inputs
         )
@@ -1114,6 +1134,7 @@ def main(argv: list[str] | None = None) -> int:
             contest=payload["contest"],
             objective=args.objective,
             upload=args.upload,
+            export=args.export,
             contest_ids={p.pid for p in raw},
         )
     except (OSError, ValueError) as e:

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import random
 import unittest
+from pathlib import Path
 
 from nfl.players import Player
 from nfl.projections import week1_score
@@ -29,8 +31,10 @@ from nfl.sim_efficiency import (
     shrink,
 )
 from nfl.sim_inputs import (
+    CarryWeek,
     PlayerWeek,
     SimInputs,
+    SnapWeek,
     TargetWeek,
     TeamStat,
     player_week_from_row,
@@ -687,3 +691,249 @@ class UsageHookTest(unittest.TestCase):
         )
         assert explicit is not None
         self.assertAlmostEqual(explicit.seconds_per_play or 0, 29.8)
+
+
+def _skill(pid, name, position, team, opponent, **kw):
+    return _pl(
+        pid=pid,
+        name=name,
+        position=position,
+        team=team,
+        opponent=opponent,
+        game="DET@GB",
+        total=46.0,
+        spread=-3.0 if team == "GB" else 3.0,
+        implied_total=21.5 if team == "GB" else 24.5,
+        implied_opp=24.5 if team == "GB" else 21.5,
+        depth_rank=1,
+        salary=kw.pop("salary", 7000),
+        **kw,
+    )
+
+
+def _pw(week, name, team, position, **kw):
+    return _week(week, player_name=name, team_fd=team, position=position, **kw)
+
+
+def regression_slate():
+    """Two-team slate with weeks 1–2 of usage, air yards, and opponent rates.
+
+    Captured against the pre-speed ``DataEfficiency`` (n=40, seed=11,
+    before_week=3). The speed rewrite must match these draws.
+    """
+    players = [
+        _skill("det-qb", "Jared Goff", "QB", "DET", "GB", salary=8000, prop_pass_yds=255.5),
+        _skill(
+            "det-rb",
+            "Jahmyr Gibbs",
+            "RB",
+            "DET",
+            "GB",
+            salary=9000,
+            prop_rush_yds=72.5,
+        ),
+        _skill("det-wr", "Amon-Ra St. Brown", "WR", "DET", "GB", salary=8500),
+        _skill("det-te", "Sam LaPorta", "TE", "DET", "GB", salary=6400),
+        _skill("gb-qb", "Jordan Love", "QB", "GB", "DET", salary=7800, prop_pass_yds=240.5),
+        _skill("gb-rb", "Josh Jacobs", "RB", "GB", "DET", salary=7600, prop_rush_yds=68.5),
+        _skill("gb-wr", "Romeo Doubs", "WR", "GB", "DET", salary=5600),
+        _skill("gb-dst", "Packers", "D", "GB", "DET", salary=4000),
+    ]
+    weeks = []
+    targets = []
+    carries = []
+    snaps = []
+    counting = {
+        "Jared Goff": dict(
+            position="QB",
+            team="DET",
+            pass_attempts=34,
+            completions=23,
+            passing_yards=255,
+            passing_tds=2,
+            interceptions=1,
+        ),
+        "Jahmyr Gibbs": dict(
+            position="RB",
+            team="DET",
+            carries=15,
+            rushing_yards=72,
+            rushing_tds=1,
+            targets=5,
+            receptions=4,
+            receiving_yards=28,
+            receiving_tds=0,
+            receiving_air_yards=12,
+            target_share=0.14,
+            red_zone_targets=1,
+            red_zone_carries=3,
+            goal_line_carries=2,
+        ),
+        "Amon-Ra St. Brown": dict(
+            position="WR",
+            team="DET",
+            targets=10,
+            receptions=8,
+            receiving_yards=96,
+            receiving_tds=1,
+            receiving_air_yards=78,
+            target_share=0.28,
+            air_yards_share=0.32,
+            red_zone_targets=2,
+        ),
+        "Sam LaPorta": dict(
+            position="TE",
+            team="DET",
+            targets=6,
+            receptions=4,
+            receiving_yards=44,
+            receiving_tds=0,
+            receiving_air_yards=31,
+            target_share=0.16,
+            red_zone_targets=1,
+        ),
+        "Jordan Love": dict(
+            position="QB",
+            team="GB",
+            pass_attempts=32,
+            completions=21,
+            passing_yards=248,
+            passing_tds=1,
+            interceptions=1,
+        ),
+        "Josh Jacobs": dict(
+            position="RB",
+            team="GB",
+            carries=18,
+            rushing_yards=81,
+            rushing_tds=1,
+            targets=3,
+            receptions=2,
+            receiving_yards=14,
+            receiving_air_yards=6,
+            target_share=0.09,
+            red_zone_carries=4,
+            goal_line_carries=2,
+        ),
+        "Romeo Doubs": dict(
+            position="WR",
+            team="GB",
+            targets=7,
+            receptions=4,
+            receiving_yards=61,
+            receiving_tds=1,
+            receiving_air_yards=70,
+            target_share=0.22,
+            air_yards_share=0.30,
+            red_zone_targets=1,
+        ),
+    }
+    for name, base in counting.items():
+        team = base["team"]
+        position = base["position"]
+        for week in (1, 2):
+            bumped = dict(base)
+            if position == "QB":
+                bumped["pass_attempts"] = base["pass_attempts"] + week
+                bumped["passing_yards"] = base["passing_yards"] + 10 * week
+            else:
+                bumped["targets"] = base.get("targets", 0) + week
+                bumped["receiving_yards"] = base.get("receiving_yards", 0) + 5 * week
+            weeks.append(_pw(week, name, team, position, **{k: v for k, v in bumped.items() if k not in {"team", "position"}}))
+            if position in {"WR", "TE", "RB"}:
+                targets.append(
+                    TargetWeek(
+                        season=2026,
+                        week=week,
+                        position=position,
+                        player_name=name,
+                        team_fd=team,
+                        targets=float(bumped.get("targets") or 0),
+                        target_share=base.get("target_share"),
+                        team_targets=36.0,
+                        team_pass_attempts=34.0,
+                    )
+                )
+            if position == "RB":
+                carries.append(
+                    CarryWeek(
+                        season=2026,
+                        week=week,
+                        player_name=name,
+                        team_fd=team,
+                        carries=float(base["carries"]),
+                        position="RB",
+                    )
+                )
+            if position in {"WR", "TE", "RB", "QB"}:
+                snaps.append(
+                    SnapWeek(
+                        season=2026,
+                        week=week,
+                        position=position,
+                        player_name=name,
+                        team_fd=team,
+                        offense_pct=0.85 if position != "QB" else 1.0,
+                    )
+                )
+    def side(team, side_name, **kw):
+        return TeamStat(
+            team_fd=team,
+            side=side_name,
+            week=1,
+            pass_n=420,
+            rush_n=280,
+            n=700,
+            **kw,
+        )
+
+    team_rows = (
+        side("DET", "offense", pass_epa_per_play=0.14, rush_epa_per_play=0.04, pass_rate=0.57, yards_per_carry=4.6, yards_per_dropback=6.5, plays_per_game=65, pace_games=2),
+        side("DET", "defense", pass_epa_per_play=-0.02, rush_epa_per_play=0.01, yards_per_carry_allowed=4.1, yards_per_dropback_allowed=5.8, sack_rate=0.072),
+        side("GB", "offense", pass_epa_per_play=0.08, rush_epa_per_play=0.06, pass_rate=0.55, yards_per_carry=4.4, yards_per_dropback=6.2, plays_per_game=62, pace_games=2),
+        side("GB", "defense", pass_epa_per_play=0.06, rush_epa_per_play=-0.03, yards_per_carry_allowed=4.5, yards_per_dropback_allowed=6.4, sack_rate=0.058),
+    )
+    inputs = SimInputs(
+        player_weeks=tuple(weeks),
+        team_weeks=team_rows,
+        team_stats=team_rows,
+        targets=tuple(targets),
+        carries=tuple(carries),
+        snaps=tuple(snaps),
+    )
+    return players, inputs
+
+
+def regression_stats(n: int = 40, seed: int = 11) -> dict:
+    players, inputs = regression_slate()
+    sim = simulate_games(
+        players,
+        n=n,
+        seed=seed,
+        inputs=inputs,
+        efficiency=DataEfficiency(inputs, before_week=3),
+    )
+    out = {}
+    for pl in players:
+        stats = sim.by_pid[pl.pid]
+        out[pl.pid] = {
+            "mean": stats.mean,
+            "p10": stats.p10,
+            "p50": stats.p50,
+            "p90": stats.p90,
+            "source": stats.source,
+        }
+    return out
+
+
+class EfficiencyRegressionTest(unittest.TestCase):
+    def test_same_seed_matches_the_fixture(self) -> None:
+        path = Path(__file__).resolve().parent / "testdata" / "efficiency_regression.json"
+        expected = json.loads(path.read_text(encoding="utf-8"))
+        got = regression_stats(n=int(expected["n"]), seed=int(expected["seed"]))
+        self.assertEqual(set(got), set(expected["players"]))
+        for pid, row in expected["players"].items():
+            live = got[pid]
+            self.assertEqual(live["source"], row["source"], pid)
+            for key in ("mean", "p10", "p50", "p90"):
+                self.assertAlmostEqual(live[key], row[key], places=6, msg=f"{pid} {key}")

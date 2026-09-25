@@ -1140,6 +1140,21 @@ class SimEfficiencyLabelTest(unittest.TestCase):
         self.assertIn("sim efficiency: data", text)
         self.assertNotIn("sim efficiency:", quiet.getvalue())
 
+    def test_fallback_prints_the_effective_mode_after_the_note(self) -> None:
+        from nfl.optimize import announce_efficiency
+        from nfl.sim_efficiency import EFFICIENCY_FALLBACK_NOTE
+
+        err = io.StringIO()
+        with redirect_stderr(err):
+            _efficiency, used = announce_efficiency("data", None, before_week=3)
+        text = err.getvalue()
+        self.assertEqual(used, "placeholder")
+        self.assertLess(
+            text.index(EFFICIENCY_FALLBACK_NOTE),
+            text.index("sim efficiency: placeholder"),
+        )
+        self.assertNotIn("sim efficiency: data", text)
+
 
 if __name__ == "__main__":
     unittest.main()

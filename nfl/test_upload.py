@@ -18,12 +18,15 @@ from nfl.upload import (
     SLOT_COUNT,
     UPLOAD_TEMPLATE,
     _display_path,
+    contest_mismatch_message,
     export_lineups,
     parse_upload_id,
     resolve_upload_template,
+    slate_contest,
     slot_start_index,
     stamped_export_name,
     stamped_export_path,
+    template_contest_ids,
     upload_cell,
     upload_row,
     validate_upload,
@@ -258,6 +261,7 @@ class StampedExportTest(unittest.TestCase):
                     n_lineups=150,
                     contest="133104",
                     objective="ceiling",
+                    export=True,
                     when=self._STAMP,
                     export_dir=folder,
                     contest_ids=ids,
@@ -328,6 +332,7 @@ class StampedExportTest(unittest.TestCase):
                     contest="133104",
                     objective="ceiling",
                     upload=upload,
+                    export=True,
                     when=self._STAMP,
                     export_dir=folder,
                     contest_ids=ids,
@@ -353,6 +358,7 @@ class StampedExportTest(unittest.TestCase):
                     n_lineups=20,
                     contest="133104",
                     objective="floor",
+                    export=True,
                     when=self._STAMP,
                     export_dir=folder,
                     contest_ids=ids,
@@ -361,6 +367,92 @@ class StampedExportTest(unittest.TestCase):
                 written["export"].name,
                 "nfl-133104-floor-20260906-132748.csv",
             )
+
+    def test_multi_without_export_or_upload_writes_nothing(self):
+        a, b = _nine("a"), _nine("b")
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp) / "export"
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                written = export_lineups(
+                    [a, b],
+                    n_lineups=150,
+                    contest="133104",
+                    objective="ceiling",
+                    when=self._STAMP,
+                    export_dir=folder,
+                )
+            self.assertEqual(written, {})
+            self.assertFalse(folder.exists())
+            self.assertEqual(buf.getvalue(), "")
+
+    def test_contest_mismatch_warns_and_still_writes(self):
+        a, b = _nine("a"), _nine("b")
+        ids = {p.pid for lu in (a, b) for p in lu.slots.values()}
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpl = _write_entries_template(Path(tmp) / "tmpl.csv", n=4)
+            folder = Path(tmp) / "export"
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                written = export_lineups(
+                    [a, b],
+                    n_lineups=2,
+                    contest="133104",
+                    objective="ceiling",
+                    export=True,
+                    when=self._STAMP,
+                    export_dir=folder,
+                    contest_ids=ids,
+                    template=tmpl,
+                )
+            log = buf.getvalue()
+            self.assertIn(
+                "WARNING: entries template contest_id (C99) does not match "
+                "players CSV contest 133104. Do not upload this file.",
+                log,
+            )
+            self.assertTrue(written["export"].is_file())
+            self.assertLess(log.index("WARNING:"), log.index("export 2 rows"))
+
+    def test_matching_contest_is_quiet(self):
+        a, b = _nine("a"), _nine("b")
+        ids = {p.pid for lu in (a, b) for p in lu.slots.values()}
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpl = _write_entries_template(Path(tmp) / "tmpl.csv", n=4)
+            upload = Path(tmp) / "also.csv"
+            buf = io.StringIO()
+            with redirect_stderr(buf):
+                export_lineups(
+                    [a, b],
+                    n_lineups=2,
+                    contest="C99",
+                    objective="ceiling",
+                    upload=upload,
+                    contest_ids=ids,
+                    template=tmpl,
+                )
+            self.assertNotIn("WARNING:", buf.getvalue())
+            self.assertIn("upload 2 rows", buf.getvalue())
+
+    def test_slate_contest_is_the_majority_prefix(self):
+        players = [
+            _pl(pid="134251-1"),
+            _pl(pid="134251-2"),
+            _pl(pid="133104-9"),
+            _pl(pid="nohyphen"),
+        ]
+        self.assertEqual(slate_contest(players), "134251")
+        self.assertEqual(slate_contest([_pl(pid="plain")]), "")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmpl = _write_entries_template(Path(tmp) / "tmpl.csv", n=1)
+            import csv
+
+            with tmpl.open(newline="", encoding="utf-8") as fh:
+                rows = list(csv.reader(fh))
+        self.assertEqual(template_contest_ids(rows), {"C99"})
+        self.assertIsNone(contest_mismatch_message(set(), "134251"))
+        self.assertIsNone(contest_mismatch_message({"134251"}, "134251"))
+        self.assertIsNone(contest_mismatch_message({"C99"}, ""))
 
 
 if __name__ == "__main__":

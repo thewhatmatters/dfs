@@ -338,17 +338,29 @@ def simulate_games(
         groups.setdefault(_game_key(pl), []).append(pl)
     for key in groups:
         groups[key].sort(key=lambda p: p.pid)
+    # Shares, catchers, and team rates are constant across draws.
+    preps: dict[tuple[str, str], _OppPrep] = {}
+    for key, group in groups.items():
+        for team in _teams_in(group):
+            roster = [p for p in group if (p.team or "").upper() == team]
+            preps[(key, team)] = _prepare_opportunity(roster, index)
     opportunity = frozenset(
-        team
-        for group in groups.values()
-        for team in _teams_in(group)
-        if _catchers(team, group, index)
+        team for (_key, team), prep in preps.items() if prep.catchers
     )
+    slate = []
+    for key in sorted(groups):
+        group = groups[key]
+        team_preps = [
+            preps[(key, team)]
+            for team in sorted(_teams_in(group))
+            if preps[(key, team)].catchers
+        ]
+        slate.append((group, team_preps))
     rng = random.Random(int(seed))
     raw: dict[str, list[float]] = {p.pid: [] for p in players}
+    score_points = eff.points
     for _ in range(n):
-        for key in sorted(groups):
-            group = groups[key]
+        for group, team_preps in slate:
             home_pts, away_pts, away, home = _draw_game(rng, group, index)
             if away is None or home is None:
                 for pl in group:
@@ -358,17 +370,16 @@ def simulate_games(
                     )
                 continue
             counts: dict[str, OpportunityCount] = {}
-            for team in sorted(_teams_in(group)):
-                if team not in opportunity:
-                    continue
-                margin = _team_margin(team, home_pts, away_pts, away, home)
+            for prep in team_preps:
+                margin = _team_margin(prep.team, home_pts, away_pts, away, home)
                 counts.update(
                     _draw_team_opportunities(
                         rng,
-                        [p for p in group if (p.team or "").upper() == team],
+                        prep.players,
                         margin,
                         index,
                         eff,
+                        prep,
                     )
                 )
             for pl in group:
@@ -381,7 +392,7 @@ def simulate_games(
                         _score_fallback(pl, team_pts, opp_pts, group, index)
                     )
                 else:
-                    raw[pl.pid].append(eff.points(rng, pl, opp_count))
+                    raw[pl.pid].append(score_points(rng, pl, opp_count))
     draws = {pid: tuple(xs) for pid, xs in raw.items()}
     layered = _layered_pids(groups, opportunity, index)
     by_pid: dict[str, SimStats] = {}
@@ -686,13 +697,17 @@ def _score_fallback(
     return starter_qb_points(player, team_pts, index)
 
 
-def _score_world(player: Player, team_pts: float, opp_pts: float) -> float:
-    if _is_dst(player):
-        return dst_pa_points(opp_pts) + DST_SACK_TO_PRIOR
+_ROLE_COEF: dict[int, float] = {}
+
+
+def _role_coef(player: Player) -> float:
+    """Depth × position share × usage. Constant for a player across draws."""
+    key = id(player)
+    if key in _ROLE_COEF:
+        return _ROLE_COEF[key]
     share = POS_FD_SHARE.get((player.position or "WR").upper(), 0.18)
-    pts = (
-        float(team_pts)
-        * depth_prior(player.depth_rank)
+    coef = (
+        depth_prior(player.depth_rank)
         * share
         * usage_factor(
             player.target_share,
@@ -701,6 +716,14 @@ def _score_world(player: Player, team_pts: float, opp_pts: float) -> float:
             snap_share=player.snap_share,
         )
     )
+    _ROLE_COEF[key] = coef
+    return coef
+
+
+def _score_world(player: Player, team_pts: float, opp_pts: float) -> float:
+    if _is_dst(player):
+        return dst_pa_points(opp_pts) + DST_SACK_TO_PRIOR
+    pts = float(team_pts) * _role_coef(player)
     if has_volume_props(player):
         pts *= prop_factor(model_point(player), player.prop_fd)
         implied = float(player.implied_total or 0.0)
@@ -1475,6 +1498,22 @@ def _weekly_shares(
     return _played_shares(weeks, snaps)
 
 
+_RECEIVING_TAKES_PLAYER: dict[type, bool] = {}
+
+
+def _receiving_takes_player(eff: EfficiencyModel, fn) -> bool:
+    kind = type(eff)
+    if kind in _RECEIVING_TAKES_PLAYER:
+        return _RECEIVING_TAKES_PLAYER[kind]
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        params = {}
+    takes = "player" in params
+    _RECEIVING_TAKES_PLAYER[kind] = takes
+    return takes
+
+
 def _realize_receiving(
     eff: EfficiencyModel,
     rng: random.Random,
@@ -1485,11 +1524,7 @@ def _realize_receiving(
     fn = getattr(eff, "receiving_line", None)
     if fn is None:
         return expected_receiving_line(position, targets)
-    try:
-        params = inspect.signature(fn).parameters
-    except (TypeError, ValueError):
-        params = {}
-    if "player" in params:
+    if _receiving_takes_player(eff, fn):
         return fn(rng, position, targets, player=player)
     return fn(rng, position, targets)
 
@@ -1601,55 +1636,77 @@ def _team_implied(players: list[Player]) -> float:
     return 0.0
 
 
-def _draw_team_opportunities(
-    rng: random.Random,
-    team_players: list[Player],
-    margin: float,
-    index: _HistoryIndex,
-    eff: EfficiencyModel,
-) -> dict[str, OpportunityCount]:
-    """Plays, script, anchors, joint shares. Empty if no target history.
+class _OppPrep:
+    """Per-team constants. Reused for every draw of the slate."""
 
-    RNG order (stable): one plays gaussian, then target-share gammas in
-    pid order (plus an "other" bucket), then rush-share gammas in pid
-    order when some RB has snaps or carries, then receiving-line yards
-    (catchers, then the other bucket), then one team pass-yard gaussian
-    around the implied-total anchor (skipped when that anchor is 0).
-    Only ``passing_qb`` gets pass attempts and QB rushes; other QBs are
-    explicit zeros. Every roster RB gets a rush count so a bellcow does
-    not absorb the backup's carries.
-    """
+    __slots__ = (
+        "players",
+        "team",
+        "opponent",
+        "catchers",
+        "simplex_means",
+        "other",
+        "kappa",
+        "rbs",
+        "rush_means",
+        "rush_pids",
+        "rush_mean_list",
+        "any_rush_signal",
+        "implied",
+        "starter",
+        "tpa",
+        "offense",
+        "defense",
+        "plays_mu",
+    )
+
+    def __init__(self) -> None:
+        self.players: list[Player] = []
+        self.team = ""
+        self.opponent = ""
+        self.catchers: tuple[Player, ...] = ()
+        self.simplex_means: list[float] = []
+        self.other = 0.0
+        self.kappa = 10.0
+        self.rbs: tuple[Player, ...] = ()
+        self.rush_means: dict[str, float] = {}
+        self.rush_pids: list[str] = []
+        self.rush_mean_list: list[float] = []
+        self.any_rush_signal = False
+        self.implied = 0.0
+        self.starter: Player | None = None
+        self.tpa = DEFAULT_TARGETS_PER_ATTEMPT
+        self.offense: TeamStat | None = None
+        self.defense: TeamStat | None = None
+        self.plays_mu = LEAGUE_PLAYS
+
+
+def _prepare_opportunity(team_players: list[Player], index: _HistoryIndex) -> _OppPrep:
+    """Catchers, shares, and team rates. No RNG."""
+    prep = _OppPrep()
+    prep.players = team_players
     if not team_players:
-        return {}
+        return prep
     team = (team_players[0].team or "").upper()
-    catchers = _catchers(team, team_players, index)
-    if not catchers:
-        return {}
-    offense = index.offense(team)
+    prep.team = team
     opponent = ""
     for pl in team_players:
         if (pl.opponent or "").strip():
             opponent = (pl.opponent or "").upper()
             break
+    prep.opponent = opponent
+    catchers = tuple(_catchers(team, team_players, index))
+    prep.catchers = catchers
+    if not catchers:
+        return prep
+    offense = index.offense(team)
     defense = index.defense(opponent) if opponent else None
-    plays = _gauss_floor(
-        rng, offense_plays_mu(offense, defense), PLAYS_SIGMA, PLAYS_FLOOR
-    )
-    rush_rate = scripted_rush_rate(offense, margin)
-    pass_rate = 1.0 - rush_rate
-    implied = _team_implied(team_players)
-    starter = passing_qb(team_players)
-    yard_prop = starter.prop_pass_yds if starter is not None else None
-    td_prop = starter.prop_pass_tds if starter is not None else None
-    yard_anchor = pass_yard_anchor(implied, pass_rate, yard_prop)
-    td_anchor = pass_td_anchor(implied, pass_rate, td_prop)
-    pass_attempts = plays * pass_rate
-    rush_attempts = team_rush_attempts(plays, rush_rate, implied)
-    yard_anchor, rush_attempts, td_anchor = _tilt_anchors(
-        eff, team, opponent, yard_anchor, rush_attempts, td_anchor
-    )
-    team_targets = pass_attempts * index.targets_per_attempt(team)
-
+    prep.offense = offense
+    prep.defense = defense
+    prep.plays_mu = offense_plays_mu(offense, defense)
+    prep.implied = _team_implied(team_players)
+    prep.starter = passing_qb(team_players)
+    prep.tpa = index.targets_per_attempt(team)
     means = [
         mean_target_share(index.target_weeks(pl), index.snap_weeks(pl))
         for pl in catchers
@@ -1667,33 +1724,83 @@ def _draw_team_opportunities(
         _weekly_shares(index.target_weeks(pl), index.snap_weeks(pl))
         for pl in catchers
     ]
-    kappa = share_kappa(series)
-    means, other = _fold_inactive_targets(means, inactive_means)
-    simplex_means = list(means)
+    prep.kappa = share_kappa(series)
+    folded, other = _fold_inactive_targets(means, inactive_means)
+    prep.other = other
+    simplex = list(folded)
     if other > 1e-6:
-        simplex_means.append(other)
-    drawn = draw_simplex(rng, simplex_means, kappa)
-    target_share = {pl.pid: drawn[i] for i, pl in enumerate(catchers)}
-    other_share = drawn[-1] if other > 1e-6 else 0.0
-
-    rbs = [
+        simplex.append(other)
+    prep.simplex_means = simplex
+    rbs = tuple(
         pl
         for pl in team_players
         if (pl.position or "").upper() == "RB" and not is_inactive(pl)
-    ]
+    )
+    prep.rbs = rbs
     snap_means = {pl.pid: index.snap_mean(pl) for pl in rbs}
     carry_means = {pl.pid: index.mean_carries(pl) for pl in rbs}
-    rush_means, any_rush_signal = blended_rush_shares(rbs, snap_means, carry_means)
-    if any_rush_signal and rbs:
-        ordered = [pl.pid for pl in rbs]
-        rush_drawn = draw_simplex(
-            rng,
-            [rush_means.get(pid, 0.0) for pid in ordered],
-            kappa,
-        )
-        rush_share = {pid: rush_drawn[i] for i, pid in enumerate(ordered)}
+    rush_means, any_rush = blended_rush_shares(list(rbs), snap_means, carry_means)
+    prep.rush_means = rush_means
+    prep.any_rush_signal = any_rush
+    prep.rush_pids = [pl.pid for pl in rbs]
+    prep.rush_mean_list = [rush_means.get(pid, 0.0) for pid in prep.rush_pids]
+    return prep
+
+
+def _draw_team_opportunities(
+    rng: random.Random,
+    team_players: list[Player],
+    margin: float,
+    index: _HistoryIndex,
+    eff: EfficiencyModel,
+    prep: _OppPrep | None = None,
+) -> dict[str, OpportunityCount]:
+    """Plays, script, anchors, joint shares. Empty if no target history.
+
+    RNG order (stable): one plays gaussian, then target-share gammas in
+    pid order (plus an "other" bucket), then rush-share gammas in pid
+    order when some RB has snaps or carries, then receiving-line yards
+    (catchers, then the other bucket), then one team pass-yard gaussian
+    around the implied-total anchor (skipped when that anchor is 0).
+    Only ``passing_qb`` gets pass attempts and QB rushes; other QBs are
+    explicit zeros. Every roster RB gets a rush count so a bellcow does
+    not absorb the backup's carries.
+    """
+    if prep is None:
+        prep = _prepare_opportunity(team_players, index)
+    catchers = prep.catchers
+    if not catchers:
+        return {}
+    team = prep.team
+    opponent = prep.opponent
+    offense = prep.offense
+    team_players = prep.players
+    plays = _gauss_floor(rng, prep.plays_mu, PLAYS_SIGMA, PLAYS_FLOOR)
+    rush_rate = scripted_rush_rate(offense, margin)
+    pass_rate = 1.0 - rush_rate
+    implied = prep.implied
+    starter = prep.starter
+    yard_prop = starter.prop_pass_yds if starter is not None else None
+    td_prop = starter.prop_pass_tds if starter is not None else None
+    yard_anchor = pass_yard_anchor(implied, pass_rate, yard_prop)
+    td_anchor = pass_td_anchor(implied, pass_rate, td_prop)
+    pass_attempts = plays * pass_rate
+    rush_attempts = team_rush_attempts(plays, rush_rate, implied)
+    yard_anchor, rush_attempts, td_anchor = _tilt_anchors(
+        eff, team, opponent, yard_anchor, rush_attempts, td_anchor
+    )
+    team_targets = pass_attempts * prep.tpa
+    drawn = draw_simplex(rng, prep.simplex_means, prep.kappa)
+    target_share = {pl.pid: drawn[i] for i, pl in enumerate(catchers)}
+    other = prep.other
+    other_share = drawn[-1] if other > 1e-6 else 0.0
+    rbs = prep.rbs
+    kappa = prep.kappa
+    if prep.any_rush_signal and rbs:
+        rush_drawn = draw_simplex(rng, prep.rush_mean_list, kappa)
+        rush_share = {pid: rush_drawn[i] for i, pid in enumerate(prep.rush_pids)}
     else:
-        rush_share = rush_means
+        rush_share = prep.rush_means
 
     # Passing floor is yard_anchor / td_anchor (implied total × pass rate,
     # or the passing prop). Rush floor is the starter's own history or
@@ -1801,6 +1908,15 @@ class _HistoryIndex:
         self._snap_name: dict[tuple[str, str], list[SnapWeek]] = {}
         self._carry_pid: dict[str, list[CarryWeek]] = {}
         self._carry_name: dict[tuple[str, str], list[CarryWeek]] = {}
+        self._cache_tgt: dict[str, list[TargetWeek]] = {}
+        self._cache_snap: dict[str, list[SnapWeek]] = {}
+        self._cache_carry: dict[str, list[CarryWeek]] = {}
+        self._cache_off: dict[str, TeamStat | None] = {}
+        self._cache_def: dict[str, TeamStat | None] = {}
+        self._cache_tpa: dict[str, float] = {}
+        self._cache_carries: dict[str, float | None] = {}
+        self._cache_snap_mean: dict[str, float | None] = {}
+        self._cache_var: dict[tuple[str, str], float | None] = {}
         for row in inputs.targets:
             if row.player_name:
                 self._tgt_name.setdefault(
@@ -1829,79 +1945,125 @@ class _HistoryIndex:
             if row.gsis_id:
                 self._carry_pid.setdefault(row.gsis_id, []).append(row)
 
+    def _player_key(self, player: Player) -> str:
+        return player.pid or f"\0{id(player)}"
+
     def target_weeks(self, player: Player) -> list[TargetWeek]:
-        hit = self._tgt_pid.get(player.pid)
+        key = self._player_key(player)
+        if key in self._cache_tgt:
+            return self._cache_tgt[key]
+        hit = self._tgt_pid.get(player.pid) if player.pid else None
         if hit:
+            self._cache_tgt[key] = hit
             return hit
-        return list(
+        rows = list(
             self._tgt_name.get(
                 ((player.team or "").upper(), match_key(player.name)),
                 [],
             )
         )
+        self._cache_tgt[key] = rows
+        return rows
 
     def snap_weeks(self, player: Player) -> list[SnapWeek]:
-        hit = self._snap_pid.get(player.pid)
+        key = self._player_key(player)
+        if key in self._cache_snap:
+            return self._cache_snap[key]
+        hit = self._snap_pid.get(player.pid) if player.pid else None
         if hit:
+            self._cache_snap[key] = hit
             return hit
-        return list(
+        rows = list(
             self._snap_name.get(
                 ((player.team or "").upper(), match_key(player.name)),
                 [],
             )
         )
+        self._cache_snap[key] = rows
+        return rows
 
     def carry_weeks(self, player: Player) -> list[CarryWeek]:
-        hit = self._carry_pid.get(player.pid)
+        key = self._player_key(player)
+        if key in self._cache_carry:
+            return self._cache_carry[key]
+        hit = self._carry_pid.get(player.pid) if player.pid else None
         if hit:
+            self._cache_carry[key] = hit
             return hit
-        return list(
+        rows = list(
             self._carry_name.get(
                 ((player.team or "").upper(), match_key(player.name)),
                 [],
             )
         )
+        self._cache_carry[key] = rows
+        return rows
 
     def mean_carries(self, player: Player) -> float | None:
+        key = self._player_key(player)
+        if key in self._cache_carries:
+            return self._cache_carries[key]
         weeks = self.carry_weeks(player)
         if not weeks:
-            return None
-        return sum(float(w.carries) for w in weeks) / len(weeks)
+            val = None
+        else:
+            val = sum(float(w.carries) for w in weeks) / len(weeks)
+        self._cache_carries[key] = val
+        return val
 
     def snap_mean(self, player: Player) -> float | None:
+        key = self._player_key(player)
+        if key in self._cache_snap_mean:
+            return self._cache_snap_mean[key]
         vals = [
             float(w.offense_pct)
             for w in self.snap_weeks(player)
             if w.offense_pct is not None and w.offense_pct > 0
         ]
         if not vals:
-            return None
-        return sum(vals) / len(vals)
+            val = None
+        else:
+            val = sum(vals) / len(vals)
+        self._cache_snap_mean[key] = val
+        return val
 
     def offense(self, team: str) -> TeamStat | None:
+        key = team.upper()
+        if key in self._cache_off:
+            return self._cache_off[key]
         rows = [
             r
             for r in self.inputs.team_stats
-            if r.team_fd == team.upper() and r.is_offense
+            if r.team_fd == key and r.is_offense
         ]
         if not rows:
+            self._cache_off[key] = None
             return None
         rows.sort(key=lambda r: (-(r.n or 0), r.side))
+        self._cache_off[key] = rows[0]
         return rows[0]
 
     def defense(self, team: str) -> TeamStat | None:
+        key = team.upper()
+        if key in self._cache_def:
+            return self._cache_def[key]
         rows = [
             r
             for r in self.inputs.team_stats
-            if r.team_fd == team.upper() and r.is_defense
+            if r.team_fd == key and r.is_defense
         ]
         if not rows:
+            self._cache_def[key] = None
             return None
         rows.sort(key=lambda r: (-(r.n or 0), r.side))
+        self._cache_def[key] = rows[0]
         return rows[0]
 
     def scoring_var(self, team: str, opponent: str | None) -> float | None:
         """Mean of this team's offensive EPA var and the opponent's defensive var."""
+        key = (team.upper(), (opponent or "").upper())
+        if key in self._cache_var:
+            return self._cache_var[key]
         parts: list[float] = []
         off = self.offense(team)
         if off is not None and off.epa_variance() is not None:
@@ -1911,13 +2073,19 @@ class _HistoryIndex:
             if de is not None and de.epa_variance() is not None:
                 parts.append(float(de.epa_variance()))
         if not parts:
-            return None
-        return sum(parts) / len(parts)
+            val = None
+        else:
+            val = sum(parts) / len(parts)
+        self._cache_var[key] = val
+        return val
 
     def targets_per_attempt(self, team: str) -> float:
+        key = team.upper()
+        if key in self._cache_tpa:
+            return self._cache_tpa[key]
         by_week: dict[int, float] = {}
         for row in self.inputs.targets:
-            if row.team_fd != team.upper():
+            if row.team_fd != key:
                 continue
             if not row.team_targets or not row.team_pass_attempts:
                 continue
@@ -1925,8 +2093,11 @@ class _HistoryIndex:
                 continue
             by_week[row.week] = float(row.team_targets) / float(row.team_pass_attempts)
         if not by_week:
-            return DEFAULT_TARGETS_PER_ATTEMPT
-        return sum(by_week.values()) / len(by_week)
+            val = DEFAULT_TARGETS_PER_ATTEMPT
+        else:
+            val = sum(by_week.values()) / len(by_week)
+        self._cache_tpa[key] = val
+        return val
 
 
 def _percentile(sorted_xs: list[float], p: float) -> float:

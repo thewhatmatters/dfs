@@ -40,11 +40,18 @@ The key is the header only. A query-string key is not sent (the API returns
 by every row and both models. Posting that same `run_at` again updates in
 place. A new `run_at` is a new run.
 
-`model_version` is `git rev-parse --short HEAD`. The run log also prints
-`sim_efficiency` (default `data`). Each `model=sim` row stores that
-mode on `inputs.sim_efficiency`. Board rows do not. Missing sim inputs
-fall back to placeholder, the sim is not posted, and the log says the
-publish stayed on the board.
+`model_version` is `git rev-parse --short HEAD`. The run log prints
+`sim_efficiency` after any fallback, so a data run that had no sim
+inputs shows `sim_efficiency=placeholder`. Each `model=sim` row stores
+that effective mode on `inputs.sim_efficiency`. Board rows do not.
+Missing sim inputs fall back to placeholder, the sim is not posted, and
+the log says the publish stayed on the board.
+
+`GANGSTASH_API_KEY` has to be set. If it is missing the command exits 1
+before it posts. The message names the key and says the job reads game
+lines, depth, targets, snaps, and props from gangstash and does not
+switch to another source. `--refresh` (the default) does not read a
+cache when the key is missing.
 
 ## What gets scored
 
@@ -82,7 +89,8 @@ Exit status is non-zero and stderr starts with `publish projections:`.
 - `GANGSTASH_PROJECTIONS_WRITER_KEY` missing (unless `--dry-run`)
 - no `game_lines` for the target week, or that cache is stale
 - a slate team has no skill depth
-- read key missing, HTTP error, or a stale cache for lines, depth, targets, snaps, or props
+- `GANGSTASH_API_KEY` missing: exit 1 immediately. The message names the key, the five read datasets (game lines, depth, targets, snaps, props), and that nothing is posted. There is no second read source, and `--refresh` does not use a cache in that case
+- read key present but the HTTP call fails, or a stale cache for lines, depth, targets, snaps, or props
 - sim inputs come back with a stale cache when `--sim` is set
 
 ## Read back
