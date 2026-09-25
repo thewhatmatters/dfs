@@ -93,6 +93,7 @@ from nfl.sim import (  # noqa: E402
     format_board_vs_sim,
     format_correlation_summary,
     format_sim_diagnostic,
+    parse_calibration,
     sim_header,
     simulate_games,
 )
@@ -432,6 +433,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "league averages. data uses shrunk gangstash player and team rates. "
         "Missing sim inputs fall back to placeholder and the log says so. "
         "Does not change the board formula.",
+    )
+    ap.add_argument(
+        "--sim-calibration",
+        default="off",
+        help="opt-in sim calibration: off (default), team, level, rates, "
+        "all, or a comma list. team widens the game total and ties skill "
+        "points to the drawn team score. level uses prior-week rush yards. "
+        "rates puts the pass multiplier and a softer red-zone TD rate on "
+        "the anchors. Stays off until a 2025 holdout says it beats data mode.",
     )
     ap.add_argument(
         "--sim-inputs",
@@ -1027,12 +1037,22 @@ def main(argv: list[str] | None = None) -> int:
             args.projection_source = source
             payload["flags"]["projection_source"] = source
         payload["flags"]["sim_efficiency"] = used_mode
+        try:
+            parse_calibration(args.sim_calibration)
+        except ValueError as exc:
+            emit("SIM_CALIBRATION", str(exc))
+            payload["status"] = "error"
+            stamp(payload, "SIM_CALIBRATION", str(exc))
+            _write_payload(payload, args)
+            return 1
+        payload["flags"]["sim_calibration"] = args.sim_calibration
         game_sim = simulate_games(
             pool,
             n=sim_n,
             seed=args.sim_seed,
             inputs=sim_inputs,
             efficiency=efficiency,
+            calibration=args.sim_calibration,
         )
         sim_by_pid = game_sim.by_pid
         payload["sim_diagnostic"] = format_sim_diagnostic(
