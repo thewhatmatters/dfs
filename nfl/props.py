@@ -5,8 +5,8 @@ implied, not an override. NFL scoring includes 100/300 bonuses when the *line*
 is ≥ threshold. Jr. name join via match_key. Missing props → model path
 (factor 1.0).
 
-Game lines (spreads/totals) stay on The Odds API in nfl/lines.py. This module
-does not call Odds and does not need ODDS_API_KEY.
+Game lines (spreads/totals) come from gangstash in nfl/lines.py. This module
+does not call The Odds API.
 
 Prop strings: see PROP_FIELD. Unmapped `prop` values are counted and returned
 as unmapped_props (exact strings). They are not scored.

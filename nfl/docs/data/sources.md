@@ -12,13 +12,11 @@ Skill pointer: `.cursor/skills/optimize-nfl-classic/references/sources.md`.
 |-------|------|--------|--------------|------------|------|
 | `CSV_FANDUEL` | FanDuel players-list CSV (local) | `nfl/players.py` | none — you download it | **stop** | — |
 | `REPO` | package + rules doc missing | preflight | — | **stop** | — |
-| `LINES_KEY` | no Odds key | `nfl/lines.py` | `ODDS_API_KEY` | **stop** (no silent FPPG) | `--lines-json` |
-| `LINES_AUTH` | lines HTTP 401/403 | `nfl/lines.py` | same key | **stop** | — |
-| `LINES_ODDS` | Odds API game odds | `nfl/lines.py` | `ODDS_API_KEY` (query param is their contract; do not log it) | **stop** | `--lines-json` |
+| `LINES_AUTH` | gangstash lines HTTP 401/403 | `nfl/lines.py`, `nfl/http.py` | `GANGSTASH_API_KEY` | **stop** | `--lines-json` or `--lines-file` |
 | `LINES_JSON` | replay `--lines-json` missing/bad | `nfl/lines.py` | — | **stop** | — |
-| `LINES_GANGSTASH_KEY` | default `--lines-source=gangstash` and no key / no cache | `nfl/lines.py`, `nfl/gangstash.py` | `GANGSTASH_API_KEY` (`x-api-key`; never a service-role key) | **stop** (no silent FPPG). Stderr names the old flags | `--lines-source=oddsapi` or `--lines-json` |
-| `LINES_GANGSTASH` | gangstash `dataset=game_lines` HTTP, truncated board, bad fields, or missing slate game | `nfl/gangstash_data.py`, `nfl/lines.py` | cache `nfl/data/gangstash-data/` | **stop** | `--lines-source=oddsapi` |
-| `LINES_JOIN` | FanDuel abbrev ↔ Odds / gangstash team code | `nfl/teams.py` | — | **stop** | add a `TEAMS` row (`JAX`→`JAC`, `WSH`→`WAS`) |
+| `LINES_GANGSTASH_KEY` | gangstash lines and no key / no cache | `nfl/lines.py`, `nfl/gangstash.py` | `GANGSTASH_API_KEY` (`x-api-key`; never a service-role key) | **stop** (no silent FPPG). Message names gangstash | `--lines-json` or `--lines-file` |
+| `LINES_GANGSTASH` | gangstash `dataset=game_lines` or `closing_lines` HTTP, truncated board, bad fields, or missing slate game | `nfl/gangstash_data.py`, `nfl/lines.py` | cache `nfl/data/gangstash-data/` | **stop**. Message names gangstash | `--lines-json` or `--lines-file` |
+| `LINES_JOIN` | FanDuel abbrev ↔ gangstash team code | `nfl/teams.py` | — | **stop** | add a `TEAMS` row (`JAX`→`JAC`, `WSH`→`WAS`) |
 | `LINES_ATTACH` | no pool left after implied totals | `nfl/projections.py` | — | **stop** | — |
 | `INJ_ESPN` | ESPN injury dump (`site.web.api`; `site.api` often 403) | `nfl/injuries.py` | none (public ESPN) | **stop** | `--skip-injuries` |
 | `DEPTH_OURLADS` | OurLads NFL HTML, slate teams only | `nfl/ourlads.py` | grant: [`ourlads-authorization.md`](ourlads-authorization.md) | **stop** | `--skip-depth` (unlisted prior) |
@@ -62,7 +60,7 @@ Do not scrape FanDuel. Do not `--refresh-props` unless asked (refetches the Gang
 
 ## Stop vs degrade (quick)
 
-- **Must have to score the slate:** CSV, lines key + fetch + join. Default lines source is gangstash (`GANGSTASH_API_KEY`, `LINES_GANGSTASH_KEY`). `--lines-source=oddsapi` uses `ODDS_API_KEY` (`LINES_KEY`).
+- **Must have to score the slate:** CSV, gangstash lines key + fetch + join (`GANGSTASH_API_KEY`, `LINES_GANGSTASH_KEY`). A missing key or a failed fetch stops the run and names gangstash. There is no other lines source and no silent FPPG. `--lines-json` / `--lines-file` replay a simple spread/total file.
 - **May skip:** ESPN injuries (`--skip-injuries`), depth (`--skip-depth`, or gangstash depth with no key and no cache → unlisted prior), targets (`--skip-targets`, missing legacy CSV, or gangstash targets with no key and no cache), snaps (`--skip-snaps`, missing legacy CSV, or gangstash snaps with no key and no cache), props (`--skip-props` or missing Gangstash key and no cache).
 - **Depth fallbacks:** `--depth-source=ourlads` or `--depth-source=espn` (`DEPTH_ESPN`; often 403). Default is gangstash.
 

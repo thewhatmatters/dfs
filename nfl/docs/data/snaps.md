@@ -92,7 +92,7 @@ objective. `--skip-snaps` or an unmatched name keeps snap fields empty.
 
 Lineups player-prop pages look like
 [`https://www.lineups.com/nfl/player-prop-bets/`](https://www.lineups.com/nfl/player-prop-bets/).
-Inventory only — Odds API props stay the live overlay. Do not implement
+Inventory only — gangstash props stay the live overlay. Do not implement
 a Lineups props ingest until asked.
 
 ## Commands

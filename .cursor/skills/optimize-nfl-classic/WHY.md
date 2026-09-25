@@ -79,7 +79,7 @@ NFL path is flags-only.
   (`https://www.lineups.com/nfl/player-prop-bets/`).
 - 2026-09-17: **Picker Sources + slate status.** Last picker column is
   compact join tags (`gs-depth`/`ourlads`/`espn`, `gs-tgt`/`lineups-tgt`,
-  `gs-snap`/`lineups-snap`, `gs-props`/`odds-props`, `vegas-dst`) from
+  `gs-snap`/`lineups-snap`, `gs-props`, `vegas-dst`) from
   fields already on the player — not a
   new scrape and not ILP. `--slate-status` (default only) prints pool +
   per-source coverage and exits 0; `=with-solve` prints then solves.
@@ -97,10 +97,10 @@ NFL path is flags-only.
   — do not invent an alias; he stays unmatched / usage 1.0.
 - 2026-09-24: **NFL player props use the Gangstash HTTP API.**
   `GANGSTASH_API_KEY`, header `x-api-key`, cache
-  `nfl/data/gangstash-props/`. Game lines default to `ODDS_API_KEY`
-  (`--lines-source=gangstash` optional; see `nfl/docs/data/gangstash.md`).
+  `nfl/data/gangstash-props/`. Game lines use the same key
+  (`dataset=game_lines` or `closing_lines`; see `nfl/docs/data/gangstash.md`).
   Unmapped `prop` strings print and are not scored. Picker tag is
-  `gs-props` when `prop_book` is gangstash. See
+  `gs-props` when a prop line is present. See
   `nfl/docs/data/player-props.md`.
 
 ## 4. Known limitations / environment caveats
@@ -118,4 +118,4 @@ See `skill-architecture.md` §B; this skill targets every PASS that applies.
 ## 6. Notes
 
 Hard dep: repo `nfl` package (same git tree). Soft: `pulp` (gated, greedy degrade).
-Vegas game lines, targets, snaps, and depth default to gangstash (`GANGSTASH_API_KEY`). `--lines-source=oddsapi` is the Odds key (`LINES_KEY`). Missing gangstash key and no cache stops lines and degrades the other three; stderr names the old flags. `python3 -m nfl.targets --refresh` and `python3 -m nfl.snaps --refresh` are the legacy optional Lineups CSVs. Choke ids: `nfl/docs/data/sources.md`.
+Vegas game lines, targets, snaps, and depth come from gangstash (`GANGSTASH_API_KEY`). Game lines have no other source: a missing key stops the run (`LINES_GANGSTASH_KEY`) and names gangstash. Missing key and no cache degrades targets, snaps, and depth; stderr names `--targets-source=lineups --snaps-source=lineups --depth-source=ourlads`. `python3 -m nfl.targets --refresh` and `python3 -m nfl.snaps --refresh` are the legacy optional Lineups CSVs. Choke ids: `nfl/docs/data/sources.md`.

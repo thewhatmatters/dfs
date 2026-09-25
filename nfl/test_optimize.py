@@ -7,7 +7,7 @@ import unittest
 from contextlib import redirect_stderr
 from dataclasses import replace
 
-from nfl.lines import filter_commence, implied_totals, parse_odds_games, slate_window
+from nfl.lines import filter_commence, implied_totals, slate_window
 from nfl.names import match_key
 from nfl.explain import bring_back_note, explain_player, lineup_notes
 from nfl.optimize import _attach_totals, _print_picker, qb_wr_stack
@@ -397,67 +397,6 @@ class OppDstIlpTest(unittest.TestCase):
         self.assertLessEqual(lu.salary, rules.salary_cap)
         self.assertGreaterEqual(len(lu.teams), rules.min_teams)
         self.assertTrue(all(n <= rules.max_per_team for n in lu.teams.values()))
-
-    def test_odds_parse_requires_window_not_week18(self):
-        from datetime import date as date_cls
-        from datetime import datetime, timezone
-
-        start, end = slate_window(date_cls(2026, 9, 13))
-        slate = [("ARI@LAC", "ARI", "LAC")]
-        payload = [
-            {
-                "id": "week18",
-                "home_team": "Los Angeles Chargers",
-                "away_team": "Arizona Cardinals",
-                "commence_time": "2026-12-20T18:00:00Z",
-                "bookmakers": [
-                    {
-                        "key": "fanduel",
-                        "markets": [
-                            {
-                                "key": "spreads",
-                                "outcomes": [
-                                    {"name": "Los Angeles Chargers", "point": -3.5},
-                                    {"name": "Arizona Cardinals", "point": 3.5},
-                                ],
-                            },
-                            {
-                                "key": "totals",
-                                "outcomes": [{"name": "Over", "point": 48.5}],
-                            },
-                        ],
-                    }
-                ],
-            },
-            {
-                "id": "week1",
-                "home_team": "Los Angeles Chargers",
-                "away_team": "Arizona Cardinals",
-                "commence_time": "2026-09-13T20:05:00Z",
-                "bookmakers": [
-                    {
-                        "key": "fanduel",
-                        "markets": [
-                            {
-                                "key": "spreads",
-                                "outcomes": [
-                                    {"name": "Los Angeles Chargers", "point": -3.0},
-                                    {"name": "Arizona Cardinals", "point": 3.0},
-                                ],
-                            },
-                            {
-                                "key": "totals",
-                                "outcomes": [{"name": "Over", "point": 44.5}],
-                            },
-                        ],
-                    }
-                ],
-            },
-        ]
-        by = parse_odds_games(payload, slate, start=start, end=end)
-        self.assertAlmostEqual(by["LAC"].total, 44.5)
-        self.assertAlmostEqual(by["LAC"].home_spread, -3.0)
-        self.assertTrue(start <= datetime(2026, 9, 13, 20, 5, tzinfo=timezone.utc) < end)
 
 
 def _wide_pool() -> list[Player]:

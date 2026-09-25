@@ -124,7 +124,6 @@ class BuildSlateStatusTest(unittest.TestCase):
             snaps={"skipped": False, "week": 2},
             props={
                 "skipped": False,
-                "credits_remaining": 80,
             },
             injuries={"skipped": False, "dropped": 1, "unmatched": 2},
         )
@@ -154,7 +153,8 @@ class BuildSlateStatusTest(unittest.TestCase):
         self.assertIn("depth  ourlads  4 / 4 relevant skill", text)
         self.assertIn("targets  3 / 3 relevant RB+WR+TE  week 2", text)
         self.assertIn("snaps  1 / 1 relevant RB  (WR/TE 2 / 2)  week 2", text)
-        self.assertIn("props  4 / 4 relevant skill  credits_left 80", text)
+        self.assertIn("props  4 / 4 relevant skill", text)
+        self.assertNotIn("credits_left", text)
         self.assertIn("dst  1 / 1 relevant DEF implied opp", text)
         self.assertIn("injuries  applied  dropped 1  unmatched 2", text)
         self.assertIn("gaps  none", text)

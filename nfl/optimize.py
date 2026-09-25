@@ -250,7 +250,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     ap.add_argument(
         "--lines-json",
-        help="replay Odds / simple-games JSON instead of a live API",
+        help="replay a simple spread/total JSON file instead of live gangstash lines",
     )
     ap.add_argument(
         "--lines-file",
@@ -273,10 +273,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     ap.add_argument(
         "--lines-source",
-        choices=("oddsapi", "gangstash"),
+        choices=("gangstash",),
         default="gangstash",
-        help="game lines provider (default gangstash, GANGSTASH_API_KEY). "
-        "oddsapi is the Odds API fallback. --lines-json still wins.",
+        help="game lines provider (gangstash only, GANGSTASH_API_KEY). "
+        "--lines-file and --lines-json still win.",
     )
     ap.add_argument(
         "--skip-depth",

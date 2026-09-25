@@ -35,7 +35,7 @@ from nfl.gangstash_data import (
     parse_game_line,
 )
 from nfl.http import HttpError
-from nfl.lines import LinesGangstashKeyMissing, ingest_slate_lines
+from nfl.lines import LinesError, LinesGangstashKeyMissing, ingest_slate_lines
 from nfl.optimize import _gangstash_snaps_weeks, parse_args
 from nfl.snaps import _pct, attach_snaps, load_optimizer_snaps
 from nfl.players import Player
@@ -900,11 +900,10 @@ class GameLinesTest(unittest.TestCase):
         with patch(
             "nfl.lines.fetch_game_lines",
             return_value=(raw, {"live": True, "cache": None, "cache_stale": False}),
-        ) as gs, patch("nfl.lines.fetch_odds") as odds:
+        ) as gs:
             by_team = ingest_slate_lines(
                 players, slate_day=date(2026, 9, 13), source="gangstash"
             )
-        odds.assert_not_called()
         gs.assert_called_once()
         self.assertEqual(gs.call_args.kwargs["on_date"], date(2026, 9, 13))
         line = by_team["PHI"]
@@ -915,18 +914,39 @@ class GameLinesTest(unittest.TestCase):
         self.assertAlmostEqual(line.home_moneyline or 0, -170)
         self.assertEqual(by_team["DAL"].game, "DAL@PHI")
 
-    def test_oddsapi_source_does_not_call_gangstash(self) -> None:
+    def test_oddsapi_source_is_rejected(self) -> None:
         players = [_pl()]
-        sentinel = {"PHI": object()}
-        with patch("nfl.lines.fetch_odds", return_value=[]) as odds, patch(
-            "nfl.lines.parse_odds_games", return_value=sentinel
-        ), patch("nfl.lines.fetch_game_lines") as gs:
-            out = ingest_slate_lines(
-                players, slate_day=date(2026, 9, 13), source="oddsapi"
-            )
-        odds.assert_called_once()
+        with patch("nfl.lines.fetch_game_lines") as gs:
+            with self.assertRaises(LinesError) as ctx:
+                ingest_slate_lines(
+                    players, slate_day=date(2026, 9, 13), source="oddsapi"
+                )
         gs.assert_not_called()
-        self.assertIs(out, sentinel)
+        text = str(ctx.exception).casefold()
+        self.assertIn("gangstash", text)
+        self.assertIn("game_lines", text)
+
+    def test_odds_api_dump_is_rejected(self) -> None:
+        players = [_pl()]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "odds.json"
+            path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "home_team": "Philadelphia Eagles",
+                            "away_team": "Dallas Cowboys",
+                            "bookmakers": [],
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(LinesError) as ctx:
+                ingest_slate_lines(
+                    players, lines_json=path, slate_day=date(2026, 9, 13)
+                )
+        self.assertIn("gangstash", str(ctx.exception).casefold())
 
     def test_lines_json_wins_over_gangstash_source(self) -> None:
         players = [_pl()]
@@ -936,9 +956,7 @@ class GameLinesTest(unittest.TestCase):
                 json.dumps([{"away": "DAL", "home": "PHI", "spread": -3, "total": 44}]),
                 encoding="utf-8",
             )
-            with patch("nfl.lines.fetch_game_lines") as gs, patch(
-                "nfl.lines.fetch_odds"
-            ) as odds:
+            with patch("nfl.lines.fetch_game_lines") as gs:
                 by_team = ingest_slate_lines(
                     players,
                     lines_json=path,
@@ -946,7 +964,6 @@ class GameLinesTest(unittest.TestCase):
                     source="gangstash",
                 )
         gs.assert_not_called()
-        odds.assert_not_called()
         self.assertEqual(by_team["PHI"].source, "lines-json")
         self.assertAlmostEqual(by_team["PHI"].total, 44)
 
@@ -1239,10 +1256,15 @@ class FlagDefaultTest(unittest.TestCase):
         self.assertEqual(_gangstash_snaps_weeks("gangstash", [2], [1, 2]), [2])
         self.assertIsNone(_gangstash_snaps_weeks("lineups", [1, 2], [1, 2]))
 
+    def test_lines_source_oddsapi_is_not_a_choice(self) -> None:
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            parse_args(["--csv", "players.csv", "--lines-source", "oddsapi"])
+
     def test_missing_key_message_names_old_flags(self) -> None:
         text = missing_key_message("GANGSTASH_API_KEY is not set")
         self.assertIn(FALLBACK_FLAGS, text)
-        self.assertIn("--lines-source=oddsapi", text)
+        self.assertNotIn("--lines-source=oddsapi", text)
+        self.assertNotIn("ODDS_API", text)
         self.assertIn("--targets-source=lineups", text)
         self.assertIn("--snaps-source=lineups", text)
         self.assertIn("--depth-source=ourlads", text)
