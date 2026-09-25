@@ -117,4 +117,4 @@ See `skill-architecture.md` §B; this skill targets every PASS that applies.
 ## 6. Notes
 
 Hard dep: repo `nfl` package (same git tree). Soft: `pulp` (gated, greedy degrade).
-Vegas game lines: `ODDS_API_KEY` by default (hard gate `LINES_KEY`). `--lines-source=gangstash` uses `GANGSTASH_API_KEY` (`LINES_GANGSTASH_KEY`). Player props: `GANGSTASH_API_KEY` (degrade `PROPS_GANGSTASH_KEY` when no cache). Targets default to Lineups. Choke ids: `nfl/docs/data/sources.md`.
+Vegas game lines, targets, snaps, and depth default to gangstash (`GANGSTASH_API_KEY`). `--lines-source=oddsapi` is the Odds key (`LINES_KEY`). Missing gangstash key and no cache stops lines and degrades the other three; stderr names the old flags. `python3 -m nfl.targets --refresh` and `python3 -m nfl.snaps --refresh` are the legacy optional Lineups CSVs. Choke ids: `nfl/docs/data/sources.md`.

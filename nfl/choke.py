@@ -5,7 +5,12 @@ from __future__ import annotations
 import sys
 from typing import Any
 
-from nfl.depth import DepthError, EspnDepthError, GangstashDepthError
+from nfl.depth import (
+    DepthError,
+    EspnDepthError,
+    GangstashDepthError,
+    GangstashDepthKeyMissing,
+)
 from nfl.http import HttpAuthError
 from nfl.injuries import InjuryError
 from nfl.lines import (
@@ -53,6 +58,8 @@ def lines_id(exc: BaseException) -> str:
 def depth_id(exc: BaseException) -> str:
     if isinstance(exc, UnmappedTeam):
         return "DEPTH_JOIN"
+    if isinstance(exc, GangstashDepthKeyMissing):
+        return "DEPTH_GANGSTASH_KEY"
     if isinstance(exc, GangstashDepthError):
         return "DEPTH_GANGSTASH"
     if isinstance(exc, EspnDepthError):

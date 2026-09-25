@@ -7,10 +7,11 @@ not `ready` or optimize prints `choke <ID>:`.
 Do not duplicate grant text or HTTP recipes here. Ingest stays in
 `nfl/lines.py`, `nfl/injuries.py`, `nfl/ourlads.py`, `nfl/depth.py`,
 `nfl/targets.py`, `nfl/snaps.py`, `nfl/props.py`, `nfl/gangstash.py`,
-`nfl/gangstash_data.py`. Optional `/data` datasets: `nfl/docs/data/gangstash.md`.
-Default Lineups grant: `nfl/docs/data/lineups-authorization.md`.
+`nfl/gangstash_data.py`. Default `/data` datasets: `nfl/docs/data/gangstash.md`.
+Lineups (`python3 -m nfl.targets --refresh`, `python3 -m nfl.snaps --refresh`) is the legacy optional CSV path: `nfl/docs/data/lineups-authorization.md`.
 
 On failure, report the **id** (e.g. `LINES_KEY`, `INJ_ESPN`, `DEPTH_OURLADS`,
 `DEPTH_ESPN`, `PROPS_GANGSTASH_KEY`) and the stop-vs-degrade row. Green runs do not
-dump the catalog. Do not scrape FanDuel. Default depth is OurLads
+dump the catalog. Do not scrape FanDuel. Default depth is gangstash.
+OurLads remains `--depth-source=ourlads`
 (`nfl/docs/data/ourlads-authorization.md`).

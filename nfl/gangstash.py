@@ -70,6 +70,19 @@ class GangstashDataKeyMissing(GangstashDataError):
     """No GANGSTASH_API_KEY and no usable /data cache."""
 
 
+# Old CLI sources. Printed when the key is missing and no cache exists.
+FALLBACK_FLAGS = (
+    "--lines-source=oddsapi --targets-source=lineups "
+    "--snaps-source=lineups --depth-source=ourlads"
+)
+
+
+def missing_key_message(detail: str) -> str:
+    """One line: what failed, then the flags that restore the previous sources."""
+    text = (detail or "GANGSTASH_API_KEY is not set and no cache exists").strip()
+    return f"{text}; pass {FALLBACK_FLAGS}"
+
+
 def _key() -> str:
     k = envmod.get("GANGSTASH_API_KEY")
     if not k:

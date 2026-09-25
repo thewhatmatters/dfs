@@ -15,8 +15,8 @@ Solve the highest-projection legal FanDuel NFL classic lineup for a slate CSV.
 
 ## What it does
 
-Loads contest rules from this repo, filters the FanDuel export, joins Vegas
-lines + OurLads depth + Lineups RB/WR/TE targets + Lineups snaps + ESPN injuries + Gangstash props (cached), and runs the PuLP ILP
+Loads contest rules from this repo, filters the FanDuel export, joins gangstash
+lines, depth, targets, and snaps (fallbacks: oddsapi, ourlads/espn, lineups) + ESPN injuries + Gangstash props (cached), and runs the PuLP ILP
 (greedy if PuLP is missing). Default objective is **week1_score** (implied×depth×share×usage, volume props a
 ±20% tilt — not an override). No FPPG. No stdin interview. No question card.
 
@@ -51,24 +51,24 @@ Repo-root `scripts/optimize.py` is the **NCAAF** shim — do not use it here.
 | `--csv=PATH` | FanDuel players-list CSV (required) |
 | `--out=PATH` | write JSON artifact |
 | `--lines-json=PATH` | replay Odds / simple-games JSON (wins over `--lines-source`) |
-| `--lines-source=oddsapi\|gangstash` | default **oddsapi** (`ODDS_API_KEY`). `gangstash` is `dataset=game_lines` |
-| `--skip-depth` | skip OurLads depth join (unlisted prior) |
-| `--refresh-depth` | refetch OurLads HTML (slate teams only) |
-| `--depth-source=ourlads\|espn\|gangstash` | default **ourlads**; `espn` often 403; `gangstash` is `dataset=depth_charts` |
+| `--lines-source=gangstash\|oddsapi` | default **gangstash**. `oddsapi` uses `ODDS_API_KEY` |
+| `--skip-depth` | skip depth join (unlisted prior) |
+| `--refresh-depth` | refetch depth (OurLads HTML when that source is selected) |
+| `--depth-source=gangstash\|ourlads\|espn` | default **gangstash**. `ourlads` or `espn` (often 403) are fallbacks |
 | `--skip-injuries` | skip ESPN injury join |
 | `--refresh-injuries` | refetch ESPN injuries |
 | `--skip-targets` | skip RB/WR/TE target join (usage uses snaps or 1.0) |
-| `--targets-source=lineups\|gangstash` | default **lineups** CSV. `gangstash` share is sum(targets)/sum(team_targets) |
+| `--targets-source=gangstash\|lineups` | default **gangstash**. `lineups` is the legacy CSV. Share is sum(targets)/sum(team_targets) |
 | `--targets-csv=PATH` | Lineups `targets.csv` (default `nfl/data/targets.csv`) |
 | `--targets-week=N` | join that week (lineups default: latest week in the CSV) |
-| `--targets-weeks=1,2` | gangstash window only |
-| `--refresh-targets` | refetch gangstash targets (not the Lineups scrape) |
+| `--targets-weeks=1,2` | gangstash window. Unset = every completed week the API returns |
+| `--refresh-targets` | refetch gangstash targets (legacy Lineups scrape is `python3 -m nfl.targets --refresh`) |
 | `--skip-snaps` | skip snap join (RB usage uses targets or 1.0) |
-| `--snaps-source=lineups\|gangstash` | default **lineups** CSV. `gangstash` `offense_pct` is the 0–1 `snap_share` |
+| `--snaps-source=gangstash\|lineups` | default **gangstash**. `offense_pct` is the 0–1 `snap_share`. `lineups` is the legacy CSV |
 | `--snaps-csv=PATH` | Lineups `snaps.csv` (default `nfl/data/snaps.csv`) |
 | `--snaps-week=N` | Lineups join week (default: latest week in the CSV) |
-| `--snaps-weeks=1,2` | gangstash window; if omitted, uses `--targets-weeks` or every week returned |
-| `--refresh-snaps` | refetch gangstash snaps (not the Lineups scrape) |
+| `--snaps-weeks=1,2` | gangstash window. Unset = every completed week the API returns |
+| `--refresh-snaps` | refetch gangstash snaps (legacy Lineups scrape is `python3 -m nfl.snaps --refresh`) |
 | `--skip-props` | skip Gangstash player props |
 | `--refresh-props` | refetch Gangstash props — do not unless asked |
 | `--exclude-questionable` | drop CSV Q; IR/NA already dropped |

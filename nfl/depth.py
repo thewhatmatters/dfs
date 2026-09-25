@@ -66,7 +66,11 @@ class EspnDepthError(DepthError):
 
 
 class GangstashDepthError(DepthError):
-    """Fatal gangstash depth ingest (optional --depth-source=gangstash)."""
+    """Fatal gangstash depth ingest."""
+
+
+class GangstashDepthKeyMissing(GangstashDepthError):
+    """No GANGSTASH_API_KEY and no depth cache. Optimizer leaves depth unlisted."""
 
 
 def _override_lookup(team: str, ourlads_norm: str) -> str | None:
@@ -203,7 +207,7 @@ def ingest_gangstash_slate_depth(
     try:
         raw, _meta = fetch_depth_charts(refresh=refresh, cache_day=cache_day)
     except GangstashDataKeyMissing as e:
-        raise GangstashDepthError(str(e)) from e
+        raise GangstashDepthKeyMissing(str(e)) from e
     except (GangstashTruncated, GangstashDataError) as e:
         raise GangstashDepthError(str(e)) from e
 

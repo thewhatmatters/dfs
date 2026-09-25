@@ -1,14 +1,16 @@
 # RB/WR/TE targets (usage tilt)
 
-Default source is Lineups (`--targets-source=lineups`). Grant:
+The optimizer default is gangstash (`--targets-source=gangstash`). This file
+is the legacy Lineups CSV, selected with `--targets-source=lineups`. Grant:
 [`lineups-authorization.md`](lineups-authorization.md). Public Lineups
 SSR pages, cached. Do not scrape FanDuel.
 
-`--targets-source=gangstash` reads `dataset=targets` instead of this CSV.
-Window share is `sum(targets)/sum(team_targets)`. The tilt math does not
-change. See [`gangstash.md`](gangstash.md). RB snap share is still Lineups.
+Gangstash window share is `sum(targets)/sum(team_targets)`. With
+`--targets-weeks` unset, the client omits `week` and keeps every completed
+week the API returns. The tilt math does not change. See
+[`gangstash.md`](gangstash.md).
 
-Wednesday-style weekly refresh (after the prior week’s games land):
+Legacy optional refresh (only when you want this CSV):
 
 ```
 python3 -m nfl.targets --refresh

@@ -31,21 +31,23 @@ Optional live check (no network otherwise):
 GANGSTASH_LIVE_SMOKE=1 python3 -m unittest nfl.test_gangstash_data.LiveSmokeTest
 ```
 
-## Flags (defaults are today’s sources)
+## Flags (defaults are gangstash)
 
 | flag | choices | default | what it reads |
 |------|---------|---------|----------------|
-| `--lines-source` | `oddsapi`, `gangstash` | **oddsapi** | Vegas spread + total → implied team totals |
-| `--targets-source` | `lineups`, `gangstash` | **lineups** | RB/WR/TE `target_share` for the existing usage tilt |
-| `--snaps-source` | `lineups`, `gangstash` | **lineups** | RB/WR/TE `snap_share` (RB rush-role tilt) |
-| `--depth-source` | `ourlads`, `espn`, `gangstash` | **ourlads** | depth rank prior |
-| `--targets-weeks` | comma list (`1,2`) | unset | gangstash target window only |
-| `--snaps-weeks` | comma list (`1,2`) | unset | gangstash snap window; if unset, uses `--targets-weeks`, else every week returned |
+| `--lines-source` | `gangstash`, `oddsapi` | **gangstash** | Vegas spread + total → implied team totals |
+| `--targets-source` | `gangstash`, `lineups` | **gangstash** | RB/WR/TE `target_share` for the existing usage tilt |
+| `--snaps-source` | `gangstash`, `lineups` | **gangstash** | RB/WR/TE `snap_share` (RB rush-role tilt) |
+| `--depth-source` | `gangstash`, `ourlads`, `espn` | **gangstash** | depth rank prior |
+| `--targets-weeks` | comma list (`1,2`) | unset | every completed week the API returns for the season |
+| `--snaps-weeks` | comma list (`1,2`) | unset | every completed week the API returns for the season |
 | `--targets-week` | N | latest CSV week / that gangstash week | single week |
 | `--snaps-week` | N | latest CSV week | Lineups join week |
 | `--refresh-targets` | flag | off | bypass the gangstash targets day cache |
 | `--refresh-snaps` | flag | off | bypass the gangstash snaps day cache |
 | `--lines-json` | path | unset | replay file; wins over `--lines-source` |
+
+Unset `--targets-weeks` / `--snaps-weeks` omit `week`, so the window is whatever completed weeks gangstash has loaded (2026 weeks 1–2 today; week 3 is not loaded yet). A missing `GANGSTASH_API_KEY` with no cache degrades targets, snaps, and depth, and stops lines (no silent FPPG). The stderr line names the previous flags: `--lines-source=oddsapi --targets-source=lineups --snaps-source=lineups --depth-source=ourlads`.
 
 `--skip-targets` / `--skip-snaps` / `--skip-depth` still skip those joins.
 Gangstash `offense_pct` is a 0–1 fraction, the same scale as Lineups
@@ -163,6 +165,7 @@ read by `week1_score`. Season rows include `team`, `team_fd`, `side`,
 | `TARGETS_GANGSTASH_KEY` | `--targets-source=gangstash`, no key, no cache | **degrade** — usage 1.0 |
 | `TARGETS_GANGSTASH` | targets HTTP, truncated board past the cap, empty payload, or missing `player_name` column | **stop** |
 | `TARGETS_JOIN` | unmapped `team_fd` | **stop** |
+| `DEPTH_GANGSTASH_KEY` | `--depth-source=gangstash`, no key, no cache | **degrade** — unlisted prior |
 | `DEPTH_GANGSTASH` | `--depth-source=gangstash` HTTP, truncated, empty payload, missing columns, or slate team missing | **stop** |
 | `SNAPS_GANGSTASH_KEY` | `--snaps-source=gangstash`, no key, no cache | **degrade** — RB usage uses targets or 1.0 |
 | `SNAPS_GANGSTASH` | snaps HTTP, truncated board past the cap, empty payload, or missing columns | **stop** |

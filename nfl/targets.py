@@ -1,20 +1,20 @@
-"""RB/WR/TE target share for the usage tilt.
+"""Legacy Lineups RB/WR/TE target CSV (optional `--targets-source=lineups`).
 
-Default source is Lineups.com → nfl/data/targets.csv (`--targets-source=lineups`).
+The optimizer default is gangstash. This command refreshes the old CSV.
 Public pages only (no login). Identified User-Agent; cache under
 nfl/data/lineups-targets/. Grant: nfl/docs/data/lineups-authorization.md.
 
 Some egress IPs get Cloudflare 403 on live urllib. Prefer cached `.json`
 (SSR payload) when present; seed those from a network that can fetch.
 
-Wednesday-style weekly refresh (after the prior week’s games land):
+Legacy optional refresh:
 
   python3 -m nfl.targets --refresh
   python3 -m nfl.snaps --refresh
 
-`--targets-source=gangstash` reads `dataset=targets` and collapses a week
-window with sum(targets)/sum(team_targets). The join still uses
-`attach_targets` (unmatched target_share stays empty → usage 1.0).
+`--targets-source=gangstash` (the default) reads `dataset=targets` and
+collapses every returned week with sum(targets)/sum(team_targets). The join
+still uses `attach_targets` (unmatched target_share stays empty → usage 1.0).
 
 Usage:
   python3 -m nfl.targets --refresh

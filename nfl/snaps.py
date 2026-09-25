@@ -1,12 +1,14 @@
-"""Lineups.com RB/WR/TE snap-count refresh → nfl/data/snaps.csv.
+"""Legacy Lineups RB/WR/TE snap CSV (optional `--snaps-source=lineups`).
 
-Public pages only (no login). Identified User-Agent; cache under
-nfl/data/lineups-snaps/. Grant: nfl/docs/data/lineups-authorization.md.
+The optimizer default is gangstash (`offense_pct` is the 0–1 snap share).
+This command refreshes the old CSV. Public pages only (no login).
+Identified User-Agent; cache under nfl/data/lineups-snaps/.
+Grant: nfl/docs/data/lineups-authorization.md.
 
 Some egress IPs get Cloudflare 403 on live urllib. Prefer cached `.json`
 (SSR payload) when present; seed those from a network that can fetch.
 
-Wednesday-style weekly refresh (after the prior week’s games land):
+Legacy optional refresh:
 
   python3 -m nfl.targets --refresh
   python3 -m nfl.snaps --refresh
