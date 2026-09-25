@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import argparse
 import sys
-from dataclasses import dataclass
+from collections import defaultdict
+from dataclasses import dataclass, replace
 from datetime import date
 
 from nfl.gangstash import (
@@ -648,6 +649,8 @@ class GangstashDepthSlot:
     player_name: str
     gsis_id: str | None = None
     player_id: str | None = None
+    pos_slot: str | None = None
+    chart_format: str | None = None
 
 
 def parse_depth_slot(row: dict) -> GangstashDepthSlot | None:
@@ -675,6 +678,8 @@ def parse_depth_slot(row: dict) -> GangstashDepthSlot | None:
     if rank is None or rank < 1:
         raise GangstashDataError(f"gangstash pos_rank {rank_raw!r} for {name}")
     team = require_fd(team_raw)
+    slot = _str(row.get("pos_slot")) or None
+    chart = _str(row.get("chart_format")) or None
     return GangstashDepthSlot(
         team_fd=team.fd,
         position=pos,
@@ -682,6 +687,8 @@ def parse_depth_slot(row: dict) -> GangstashDepthSlot | None:
         player_name=name,
         gsis_id=_str(row.get("gsis_id")) or None,
         player_id=_str(row.get("player_id")) or None,
+        pos_slot=slot,
+        chart_format=chart,
     )
 
 
@@ -730,6 +737,40 @@ def map_depth_slots(rows: list) -> list[GangstashDepthSlot]:
         skipped,
         "null player_name, team_fd, pos_abb, or pos_rank",
     )
+    return out
+
+
+def uniquify_depth_ranks(slots: list[GangstashDepthSlot]) -> list[GangstashDepthSlot]:
+    """Give each (team, position) a unique rank when the chart repeats one.
+
+    2024 ``depth_charts_weekly`` rows are ``chart_format=nflverse_weekly``.
+    ``pos_rank`` can repeat and ``pos_slot`` is null. ESPN charts (2025 and
+    2026) already have unique ranks and are returned unchanged, including
+    gaps such as 1, 2, 5.
+
+    A tied group is ordered by ``pos_rank``, then ``pos_slot``, then player
+    name, and written as 1..n. The second tied WR1 becomes rank 2.
+    """
+    groups: dict[tuple[str, str], list[GangstashDepthSlot]] = defaultdict(list)
+    order: list[tuple[str, str]] = []
+    for slot in slots:
+        key = (slot.team_fd, slot.position)
+        if key not in groups:
+            order.append(key)
+        groups[key].append(slot)
+    out: list[GangstashDepthSlot] = []
+    for key in order:
+        group = groups[key]
+        ranks = [slot.rank for slot in group]
+        if len(ranks) == len(set(ranks)):
+            out.extend(group)
+            continue
+        ordered = sorted(
+            group,
+            key=lambda slot: (slot.rank, slot.pos_slot or "", slot.player_name),
+        )
+        for index, slot in enumerate(ordered, start=1):
+            out.append(slot if slot.rank == index else replace(slot, rank=index))
     return out
 
 
@@ -1021,6 +1062,41 @@ def parse_dst_row(row: dict) -> dict | None:
         "season": _int(row.get("season")) or 0,
         "fd_points": fd_points,
     }
+
+
+def fetch_props_closing(
+    *,
+    season: int,
+    week: int | None = None,
+    player: str | None = None,
+    team: str | None = None,
+    prop: str | None = None,
+    refresh: bool = False,
+    cache_day: date | None = None,
+) -> tuple[list[dict], dict]:
+    """`dataset=props_closing`. `season` is required.
+
+    The last pre-kickoff BettingPros line per player and prop. Optional
+    filters: `week`, `player`, `team`, `prop`. Rows stay raw. The dataset
+    starts at 2026 week 3; an empty payload is an empty list.
+    """
+    if int(season) < 1:
+        raise GangstashDataError("gangstash props_closing requires season")
+    params: dict[str, str] = {"season": str(int(season))}
+    if week is not None:
+        params["week"] = str(int(week))
+    if player:
+        params["player"] = str(player).strip()
+    if team:
+        params["team"] = str(team).strip().upper()
+    if prop:
+        params["prop"] = str(prop).strip()
+    return fetch_dataset(
+        dataset_id("props_closing"),
+        params,
+        refresh=refresh,
+        cache_day=cache_day,
+    )
 
 
 def fetch_team_stats_weekly(
