@@ -53,6 +53,8 @@ class InjuryRow:
     name: str
     team: str
     status: str
+    gsis_id: str | None = None
+    player_id: str | None = None
 
 
 def _cache_path() -> Path:
@@ -111,6 +113,15 @@ def parse_injuries(payload: dict) -> list[InjuryRow]:
     return out
 
 
+def _blank(value: object) -> bool:
+    return value is None or value == ""
+
+
+def _opt_id(row: dict, key: str) -> str | None:
+    text = str(row.get(key) or "").strip()
+    return text or None
+
+
 def injury_rows_from_records(
     rows: list[dict],
     *,
@@ -119,32 +130,60 @@ def injury_rows_from_records(
 ) -> list[InjuryRow]:
     """Gangstash ``dataset=injuries`` rows for one season and week.
 
-    A row with no ``season`` or ``week`` is a live dump and is dropped so
-    today's report is not applied to a past week.
+    ``season`` is required on the query. ``week``, ``team``, ``gsis_id``,
+    and ``status`` may be absent. A row is kept with ``player_id`` or
+    ``gsis_id`` even when the name is blank. A mismatched season or week
+    is dropped. If any row carries a week, undated rows are dropped. If
+    none do, they are kept: the query was already that season and week.
     """
+    saw_week = any(
+        isinstance(row, dict) and not _blank(row.get("week")) for row in rows
+    )
     out: list[InjuryRow] = []
     for row in rows:
         if not isinstance(row, dict):
             continue
         row_season = row.get("season")
         row_week = row.get("week")
-        if row_season in (None, "") or row_week in (None, ""):
-            continue
-        try:
-            if int(row_season) != int(season) or int(row_week) != int(week):
+        if not _blank(row_season):
+            try:
+                if int(row_season) != int(season):
+                    continue
+            except (TypeError, ValueError):
                 continue
-        except (TypeError, ValueError):
+        if not _blank(row_week):
+            try:
+                if int(row_week) != int(week):
+                    continue
+            except (TypeError, ValueError):
+                continue
+        elif saw_week:
             continue
         name = str(row.get("player_name") or row.get("name") or "").strip()
         status = str(row.get("status") or "").strip()
         team_raw = str(row.get("team_fd") or row.get("team") or "").strip()
-        if not name or not status or not team_raw:
+        gsis_id = _opt_id(row, "gsis_id")
+        player_id = _opt_id(row, "player_id")
+        if not name and not gsis_id and not player_id:
             continue
-        try:
-            team = require_fd(team_raw).fd
-        except UnmappedTeam:
+        team = ""
+        if team_raw:
+            try:
+                team = require_fd(team_raw).fd
+            except UnmappedTeam:
+                if not gsis_id and not player_id:
+                    continue
+        elif not gsis_id and not player_id:
             continue
-        out.append(InjuryRow(name=name, team=team, status=status))
+        out.append(
+            InjuryRow(
+                name=name,
+                team=team,
+                status=status,
+                gsis_id=gsis_id,
+                player_id=player_id,
+            )
+        )
     return out
 
 
@@ -165,15 +204,26 @@ def is_inactive(player: Player) -> bool:
 
 
 def stamp_injuries(players: list[Player], rows: list[InjuryRow]) -> list[Player]:
-    """Write gangstash statuses onto matching players. CSV codes stay otherwise."""
-    by_key = {
-        (r.team, match_key(r.name)): injury_code(r.status)
-        for r in rows
-        if injury_code(r.status)
-    }
+    """Write gangstash statuses onto matching players. CSV codes stay otherwise.
+
+    A row matches ``Player.pid`` against ``gsis_id`` or ``player_id`` first
+    (depth-chart pools use the gsis id as the pid), then ``(team, name)``.
+    """
+    by_id: dict[str, str] = {}
+    by_key: dict[tuple[str, str], str] = {}
+    for row in rows:
+        code = injury_code(row.status)
+        if not code:
+            continue
+        if row.gsis_id:
+            by_id[row.gsis_id] = code
+        if row.player_id:
+            by_id[row.player_id] = code
+        if row.name and row.team:
+            by_key[(row.team, match_key(row.name))] = code
     out: list[Player] = []
     for pl in players:
-        code = by_key.get((pl.team, match_key(pl.name)))
+        code = by_id.get(pl.pid) or by_key.get((pl.team, match_key(pl.name)))
         if not code:
             out.append(pl)
             continue

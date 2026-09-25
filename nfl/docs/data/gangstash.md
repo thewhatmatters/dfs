@@ -72,12 +72,15 @@ python3 -m nfl.gangstash_data team-stats-weekly --season 2026 --week 1,2
 | `GANGSTASH_TARGETS_DATASET` | `targets` | `dataset=` value |
 | `GANGSTASH_GAME_LINES_DATASET` | `game_lines` | `dataset=` value |
 | `GANGSTASH_DEPTH_DATASET` | `depth_charts` | `dataset=` value |
+| `GANGSTASH_DEPTH_CHARTS_WEEKLY_DATASET` | `depth_charts_weekly` | `dataset=` value |
 | `GANGSTASH_TEAM_STATS_DATASET` | `team_stats` | `dataset=` value |
 | `GANGSTASH_TEAM_STATS_WEEKLY_DATASET` | `team_stats_weekly` | `dataset=` value |
 | `GANGSTASH_SNAPS_DATASET` | `snaps` | `dataset=` value |
 | `GANGSTASH_PLAYER_STATS_WEEKLY_DATASET` | `player_stats_weekly` | `dataset=` value |
 | `GANGSTASH_CLOSING_LINES_DATASET` | `closing_lines` | `dataset=` value |
 | `GANGSTASH_INJURIES_DATASET` | `injuries` | `dataset=` value |
+| `GANGSTASH_DST_WEEKLY_DATASET` | `dst_weekly` | `dataset=` value |
+| `GANGSTASH_PLAYER_USAGE_DATASET` | `player_usage` | `dataset=` value |
 
 ## Queries this client sends
 
@@ -85,11 +88,14 @@ python3 -m nfl.gangstash_data team-stats-weekly --season 2026 --week 1,2
 |---------|--------|--------|
 | `targets` | `season` (required), `week` (single or `1,2`), optional `position` (`WR`/`TE`/`RB`), `team` | season is the FanDuel CSV year. 2026 weeks 1–2 are loaded (640 rows) |
 | `game_lines` | `date=YYYY-MM-DD` (ET kickoff) **or** `season` + one `week` | optimizer sends the slate **date** only, unless `--week` is set |
-| `closing_lines` | `season` + one `week` | preferred for a past `--week` and for `nfl.backtest`. Not deployed yet (Unknown dataset is printed, then `game_lines`). Implied team totals are enough when spread and total are absent |
-| `depth_charts` | optional `team`, `position` (that is `pos_abb`), `pos_grp`, `season`, `week` | optimizer requests `pos_grp=3WR 1TE`. A chart with no `week` column is the current chart |
-| `injuries` | `season` + one `week` | not deployed. Backtest uses the FanDuel CSV indicator and ignores an Unknown dataset |
+| `closing_lines` | `season` + one `week` | preferred for a past `--week` and for `nfl.backtest`. Live rows use `home_line` (negative = home favored), `total`, `implied_home_total`, `implied_away_total`. `kickoff` may be null. A row that still will not parse is skipped and the week falls through to `game_lines` |
+| `depth_charts` | optional `team`, `position` (that is `pos_abb`), `pos_grp`, `season`, `week` | optimizer requests `pos_grp=3WR 1TE`. A chart with no `week` column is the current chart. Live and nightly projections use this dataset |
+| `depth_charts_weekly` | `season` required; `week` (one week or a comma list), `team`, `position`, `pos_grp` optional | last chart strictly before kickoff. Only games that have already kicked off. The backtest uses this for the target week and falls back to `depth_charts` when it is missing |
+| `injuries` | `season` required; `week`, `team`, `gsis_id`, and `status` optional. Rows carry `player_id` | live. Backtest stamps the week. No-CSV mode uses this feed. A CSV pool still prefers to stay quiet when the fetch fails |
 | `team_stats` | `season` (required), `season_type` (default `REG`), optional `side` (`offense`/`defense`), `team` | not scored |
-| `team_stats_weekly` | `season` + `week` (single or comma list), optional `team` | not scored. Adds `week`, `opponent`, `game_id` on each row |
+| `team_stats_weekly` | `season` + `week` (single or comma list), optional `team` | backtest pools weeks before the target into team EPA variance. The optimizer still overlays rates on the season board |
+| `dst_weekly` | `season` (required), optional `week`, optional `team` | DEF actuals for the backtest. Join is `(season, week, team)`. `fd_points` is the FanDuel score |
+| `player_usage` | `season` required; `week`, `team`, `gsis_id`, `position` optional | one row per player-week. The sim feed sends season and the prior-week list only |
 | `snaps` | `season` (required), `week` (single or `1,2`), optional `position` (`WR`/`TE`/`RB`), `team` (FD or nflverse; `JAC` and `JAX` both work) | 2026 weeks 1–2 are 2,994 rows (185 RB, 335 WR, 220 TE). `offense_pct` is a 0–1 fraction |
 
 ## Response fields
@@ -127,34 +133,46 @@ dropped when `commence_time` is present. A missing slate game is
 (stop — no silent FPPG).
 
 **`closing_lines`:** same join as `game_lines`. A past week
-(`nfl.optimize --week`, `nfl.backtest`) tries this dataset first. The
-dataset is nflverse-sourced. Rows may send `home_implied_total` /
-`home_implied_tt` and `away_implied_total` / `away_implied_tt` instead of
-`spread` and `total`. When both implied totals are present they win: total
-is the sum, and home spread is away implied minus home implied (negative
-when home is favored). Otherwise nflverse `spread_line` is positive when
-the home team is favored, so the stored home spread is `-spread_line` and
-the total is `total_line` (not the final-score `total` column). A plain
-`spread` column is already the Odds sign and is not flipped. An empty close
-falls through to `game_lines`. The live API currently returns Unknown
-dataset. The backtest prints `closing_lines: not available (Unknown dataset)`
-and does not treat that as a quiet skip. If `game_lines` also fails and no
-`--lines-file` was given, the backtest stops unless `--allow-missing-lines`.
+(`nfl.optimize --week`, `nfl.backtest`) tries this dataset first. Live rows
+use `home_team`, `away_team`, `home_line` (negative when home is favored,
+the Odds sign, not flipped), `total`, `implied_home_total`,
+`implied_away_total`, and `kickoff` (null on the rows seen so far). Implied
+totals win when both are present: total is the sum, and home spread is away
+implied minus home implied. nflverse-shaped rows may still send
+`home_implied_total` / `home_implied_tt` and `spread_line` (positive when
+home is favored, stored as `-spread_line`) with `total_line` rather than the
+final-score `total`. A plain `spread` column is already the Odds sign and is
+not flipped. A row that still has no spread and total is skipped. If the
+close then does not cover the slate, the week uses `game_lines` instead of
+raising. Unknown dataset is still printed (`closing_lines: not available
+(Unknown dataset)`) and is not a quiet skip. If `game_lines` also fails and
+no `--lines-file` was given, the backtest stops unless
+`--allow-missing-lines`. A line failure is `choke LINES`, including a
+spread/total parse error. It is not `choke PLAYER_STATS_WEEKLY`. When every
+kickoff is null, prop snapshots use Sunday 17:00 UTC of that 2026 week
+(Thursday would drop Friday–Sunday scrapes). Depth snapshots stay on the
+Thursday guess.
 `--lines-file` (CSV or JSON) still wins over both. A file with `season`,
 `week`, `home_team`, `away_team`, `spread_line`, and `total_line` is an
-nflverse schedule: `game_id`, `gameday`, `gametime`, `home_line`,
-`away_line`, moneylines, `*_spread_odds`, `under_odds`, `over_odds`, and
-`home_implied_tt` / `away_implied_tt` are ignored. `JAX`→`JAC`, `LA`→`LAR`.
+nflverse schedule: `game_id`, `gameday`, `gametime`, `away_line`,
+moneylines, `*_spread_odds`, `under_odds`, `over_odds`, and
+`home_implied_tt` / `away_implied_tt` are ignored. On that file, `home_line`
+stays ignored because `spread_line` is the schedule column (positive when
+home is favored). The live closing API is the path that reads `home_line`
+as the Odds sign. `JAX`→`JAC`, `LA`→`LAR`.
 A missing required column, or zero games after the season/week filter, is
 an error. A simple file (no nflverse schedule columns) still errors on a
 column the reader does not know.
 
-**`injuries`:** not deployed (Unknown dataset). The backtest does not list
-that as missing and does not stop. It reads the FanDuel CSV Injury Indicator
-(`O` / `D` / `IR` / `Q` / `NA`). `O`, `D`, `IR`, and `NA` hand the chart
-slot to the next healthy player. `Q` keeps the pre-game projection. If this
-dataset later returns `player_name`, `team_fd`, `status`, `season`, `week`,
-those rows are applied for that week.
+**`injuries`:** live. `season` is required. `week`, `team`, `gsis_id`, and
+`status` are optional. Rows carry `player_id`. The backtest stamps the
+week onto the pool (id match, then team and name). `O`, `D`, `IR`, and
+`NA` are out of the sim's target and rush shares and hand the chart slot
+to the next healthy player. `Q` keeps the pre-game projection. A FanDuel
+CSV still has its Injury Indicator. A failed injuries fetch on a CSV pool
+is not listed as missing. No-CSV mode has no indicator column, so a failed
+fetch is `missing: injuries` and does not stop the week. An Unknown dataset
+on a CSV pool is still a quiet skip.
 
 **`depth_charts`** (latest ESPN via nflverse): `team`, `team_fd`, `pos_grp`,
 `pos_abb`, `pos_name`, `pos_slot`, `pos_rank`, `player_name`, `gsis_id`,
@@ -168,6 +186,17 @@ skipped. One stderr line reports how many were skipped. An empty payload, or
 a payload missing those columns, is `DEPTH_GANGSTASH` (stop). A slate team
 with no skill rows is the same choke. `--skip-depth` still leaves the
 unlisted prior.
+
+**`depth_charts_weekly`** is the same chart plus `season`, `week`,
+`game_type`, `game_id`, `opponent`, `kickoff_at`, and `team_fd`. Each row
+is the last chart strictly before that game's kickoff, so it exists only
+after kickoff. `nfl.backtest` uses it for the target week. A missing
+weekly payload is `missing: depth_charts_weekly` and the backtest falls
+back to `depth_charts`. Live and nightly projections stay on
+`depth_charts`. The chart is ESPN via nflverse from game-day morning and
+does not list inactives. A few rows have no `player_id`; those match on
+name and team. The listed QB1 is the main-pool starter. The hindsight
+pool still uses the QB who actually took the snaps.
 
 **`snaps`** (one player-week). `offense_pct` is a 0–1 fraction. The client
 does not divide it by 100. Window `snap_share` is
@@ -189,7 +218,25 @@ read by `week1_score`. Season rows include `team`, `team_fd`, `side`,
 `epa_var`, pass and rush `success_rate` and `epa_per_play`, `early_down_*`,
 `explosive_rate`, `third_down_rate`, `red_zone_td_rate`, and raw `n` /
 `epa_sum` / `epa_sq_sum` (all, pass, and rush). Weekly rows add `week`,
-`opponent`, and `game_id`.
+`opponent`, and `game_id`. Both sides also carry pace and efficiency:
+`pace_games`, `pace_plays`, `play_seconds`, `pace_neutral_plays`,
+`neutral_play_seconds`, `rush_yards`, `net_pass_yards`, `air_yards`,
+`plays_per_game`, `seconds_per_play`, `neutral_seconds_per_play`,
+`yards_per_carry`, `yards_per_dropback`, `yards_per_pass_attempt`,
+`sack_rate`, `air_yards_per_attempt`. A defense row is what that defense
+allowed, and its `sack_rate` is sacks generated. `seconds_per_play` is
+`play_seconds / timed_plays` and `neutral_seconds_per_play` is
+`neutral_play_seconds / neutral_timed_plays`. League offense averages are
+29.80 overall and 32.34 neutral. The sim blends those with plays per game
+for team play volume and clamps the pace leg to ±15%.
+
+**`player_usage`** (one player-week): `season`, `week`, `season_type`,
+`gsis_id`, `player_id`, `team`, `team_fd`, `position`, `targets`,
+`receiving_air_yards` (can be negative), `target_share` (0 for linemen),
+`air_yards_share`, `wopr`, `carries`, `rz_targets`, `rz_carries` (inside
+the 20), `gl_carries` (inside the 5), `rz_receiving_tds`, `rz_rushing_tds`.
+The sim uses it for target share, aDOT, and red-zone / goal-line TD rates.
+Weeks before the backtest target only.
 
 ## Failure
 

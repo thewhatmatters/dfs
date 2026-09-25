@@ -262,6 +262,19 @@ def week_kickoff_guess(season: int, week: int) -> datetime | None:
     return datetime(2026, 9, 10, tzinfo=timezone.utc) + timedelta(days=7 * (int(week) - 1))
 
 
+def week_prop_cutoff(season: int, week: int) -> datetime | None:
+    """Sunday 17:00 UTC of the 2026 week.
+
+    Closing rows often have a null kickoff. Using Thursday as the prop
+    cutoff would drop Friday–Sunday pre-game scrapes. Depth snapshots stay
+    on the Thursday guess; only the prop filter uses this later stamp.
+    """
+    thursday = week_kickoff_guess(season, week)
+    if thursday is None:
+        return None
+    return thursday + timedelta(days=3, hours=17)
+
+
 def depth_rows_for_backtest(
     fetched: list[dict],
     *,
@@ -441,13 +454,23 @@ def attach_depth_ranks(
     source: str | None = None,
 ) -> tuple[list[Player], dict]:
     idx = depth_index(rows)
+    by_id: dict[str, tuple[int, DepthRow]] = {}
+    for row in rows:
+        for ident in (row.gsis_id, row.player_id):
+            if not ident:
+                continue
+            prev = by_id.get(ident)
+            if prev is None or row.rank < prev[0]:
+                by_id[ident] = (row.rank, row)
     out: list[Player] = []
     matched = 0
     for pl in players:
         if pl.position == "D":
             out.append(pl)
             continue
-        hit = idx.get((pl.team, match_key(pl.name)))
+        hit = by_id.get(pl.pid) if pl.pid else None
+        if hit is None:
+            hit = idx.get((pl.team, match_key(pl.name)))
         rank = hit[0] if hit else None
         if rank is not None:
             matched += 1

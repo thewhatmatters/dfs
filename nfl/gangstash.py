@@ -42,12 +42,15 @@ DATASET_ENV = {
     "targets": "GANGSTASH_TARGETS_DATASET",
     "game_lines": "GANGSTASH_GAME_LINES_DATASET",
     "depth_charts": "GANGSTASH_DEPTH_DATASET",
+    "depth_charts_weekly": "GANGSTASH_DEPTH_CHARTS_WEEKLY_DATASET",
     "team_stats": "GANGSTASH_TEAM_STATS_DATASET",
     "team_stats_weekly": "GANGSTASH_TEAM_STATS_WEEKLY_DATASET",
     "snaps": "GANGSTASH_SNAPS_DATASET",
     "player_stats_weekly": "GANGSTASH_PLAYER_STATS_WEEKLY_DATASET",
     "closing_lines": "GANGSTASH_CLOSING_LINES_DATASET",
     "injuries": "GANGSTASH_INJURIES_DATASET",
+    "dst_weekly": "GANGSTASH_DST_WEEKLY_DATASET",
+    "player_usage": "GANGSTASH_PLAYER_USAGE_DATASET",
 }
 
 

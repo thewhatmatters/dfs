@@ -96,6 +96,7 @@ from nfl.sim import (  # noqa: E402
     sim_header,
     simulate_games,
 )
+from nfl.sim_efficiency import build_efficiency  # noqa: E402
 from nfl.sim_feed import resolve_sim_inputs  # noqa: E402
 from nfl.sim_inputs import SimInputError  # noqa: E402
 from nfl.slate_status import build_slate_status, format_slate_status  # noqa: E402
@@ -418,6 +419,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=DEFAULT_SEED,
         help="RNG seed for --sim (default 1)",
+    )
+    ap.add_argument(
+        "--sim-efficiency",
+        choices=("placeholder", "data"),
+        default="placeholder",
+        help="layer-4 efficiency for --sim: placeholder (default) keeps "
+        "league averages; data uses shrunk gangstash player and team rates. "
+        "Does not change the board.",
     )
     ap.add_argument(
         "--sim-inputs",
@@ -977,7 +986,15 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         print(sim_note, file=sys.stderr)
         game_sim = simulate_games(
-            pool, n=sim_n, seed=args.sim_seed, inputs=sim_inputs
+            pool,
+            n=sim_n,
+            seed=args.sim_seed,
+            inputs=sim_inputs,
+            efficiency=build_efficiency(
+                args.sim_efficiency,
+                sim_inputs,
+                before_week=args.week,
+            ),
         )
         sim_by_pid = game_sim.by_pid
         payload["sim_diagnostic"] = format_sim_diagnostic(

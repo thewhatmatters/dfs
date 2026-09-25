@@ -13,6 +13,7 @@ Read key: GANGSTASH_API_KEY (existing /data and /props clients).
 `--sim N` also posts model=sim. Draws and percentiles come from
 `simulate_games` with the same gangstash `SimInputs` the optimizer
 builds for `--projection-source sim`. `mean` is that simulated mean.
+`--sim-efficiency` matches the optimizer (default `placeholder`).
 Missing sim publishes the board and says so.
 """
 
@@ -206,13 +207,17 @@ def maybe_sim(
     *,
     season: int,
     refresh: bool,
+    week: int | None = None,
+    sim_efficiency: str = "placeholder",
 ) -> dict | None:
     """pid → SimStats for model=sim.
 
     Same call as the optimizer's `--projection-source sim` path:
-    `resolve_sim_inputs` then `simulate_games(..., inputs=)`.
-    `mean` on the published row is that draw's mean (the ILP mean
-    when projection source is sim). p10/p50/p90 are the same draws.
+    `resolve_sim_inputs` then `simulate_games(..., inputs=, efficiency=)`.
+    `before_week` drops the slate week and later, so a nightly publish
+    uses completed weeks only. `mean` on the published row is that draw's
+    mean (the ILP mean when projection source is sim). p10/p50/p90 are
+    the same draws.
     """
     if n <= 0:
         return None
@@ -245,11 +250,18 @@ def maybe_sim(
     print(note, file=sys.stderr)
     if "stale cache" in note:
         raise StaleInputs("sim inputs cache is stale")
+    from nfl.sim_efficiency import build_efficiency
+
     result = fn(
         [e.player for e in entries],
         n=int(n),
         seed=int(seed),
         inputs=sim_inputs,
+        efficiency=build_efficiency(
+            sim_efficiency,
+            sim_inputs,
+            before_week=week,
+        ),
     )
     by_pid = getattr(result, "by_pid", None)
     if not isinstance(by_pid, dict):
@@ -905,6 +917,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     ap.add_argument("--sim-seed", type=int, default=1)
     ap.add_argument(
+        "--sim-efficiency",
+        choices=("placeholder", "data"),
+        default="placeholder",
+        help="layer-4 efficiency for --sim: placeholder (default) keeps "
+        "league averages; data uses shrunk gangstash rates. Same flag as "
+        "nfl.optimize.",
+    )
+    ap.add_argument(
         "--dry-run",
         action="store_true",
         help=f"Write JSON and CSV under {OUT_DIR} and do not POST",
@@ -940,6 +960,8 @@ def main(argv: list[str] | None = None) -> int:
             args.sim_seed,
             season=season,
             refresh=bool(args.refresh),
+            week=week,
+            sim_efficiency=args.sim_efficiency,
         )
     except StaleInputs as e:
         print(f"publish projections: {e}", file=sys.stderr)

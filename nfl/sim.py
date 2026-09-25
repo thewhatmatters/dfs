@@ -5,9 +5,12 @@ share that world:
 
 1. Game — Vegas total + home spread. Sigma scales with team EPA variance
    when team stats are present; otherwise the fixed constants below.
-2. Volume + script — team plays and a pass/rush split. Neutral pass rate
-   (or pass rate minus PROE) shifts with the drawn margin: trailing teams
-   pass more, leading teams run more. Passing yards and TDs are anchored
+2. Volume + script — team plays and a pass/rush split. Plays per game,
+   when that column is present, is shrunk toward 63 and blended with the
+   opponent's defensive plays faced and with seconds per play (league
+   29.80, neutral 32.34). The pace leg is clamped to ±15%. Neutral pass
+   rate (or pass rate minus PROE) shifts with the drawn
+   margin: trailing teams pass more, leading teams run more. Passing yards and TDs are anchored
    to the Vegas implied total times that pass rate (a passing prop replaces
    the matching anchor). Team rush attempts come from team_stats plus the
    same script, then a yard budget tied to the implied total.
@@ -23,11 +26,18 @@ share that world:
    rush-yard floor. With catcher history the same passing floor is the
    implied-total anchor, and the rush count is his own carries or at least
    max(league rush share, that yard floor). Other QBs on that team score 0.
-   O, D, IR, and NA do not keep the starter job.
+   O, D, IR, and NA do not keep the starter job, and they do not draw
+   target or rush share. That share is renormalized onto active teammates.
 
 Efficiency (yards per opportunity, TD rates) is ``PlaceholderEfficiency``
-in ``nfl/sim_efficiency.py``. Layer 4 replaces that class; it is not a
-prop-line calibration.
+or ``DataEfficiency`` in ``nfl/sim_efficiency.py``. ``DataEfficiency`` is
+layer 4 (shrunk player rates and a clamped opponent). It is not a
+prop-line calibration. ``simulate_games`` still defaults to the
+placeholder so empty inputs and existing callers keep the same draws.
+The CLI flag is ``--sim-efficiency {placeholder,data}`` (default
+``placeholder`` until data mode beats it). Data mode keeps team rush
+attempts on the implied script and redistributes the rush-yard budget.
+It does not also scale attempts.
 
 Inputs are ``SimInputs`` (team stats, weekly targets, optional snaps).
 The sim does not call Gangstash. Empty inputs reproduce the role-share
@@ -46,6 +56,7 @@ player p10s.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import math
 import random
 from dataclasses import dataclass, field, replace
@@ -79,7 +90,9 @@ from nfl.sim_efficiency import (
     PlaceholderEfficiency,
     ReceivingLine,
     expected_receiving_line,
+    clamp,
     sample_yards,
+    shrink,
 )
 from nfl.sim_inputs import CarryWeek, SimInputs, SnapWeek, TargetWeek, TeamStat
 
@@ -112,6 +125,12 @@ EPA_SCALE_MAX = 1.80
 LEAGUE_PLAYS = 63.0
 PLAYS_SIGMA = 4.0
 PLAYS_FLOOR = 40.0
+# Plays per game shrink toward 63. One game of 70 becomes (70 + 252) / 5.
+PLAYS_PRIOR_GAMES = 4.0
+# League offense pace. Seconds per play are play_seconds / timed_plays.
+LEAGUE_SECONDS_PER_PLAY = 29.80
+LEAGUE_NEUTRAL_SECONDS_PER_PLAY = 32.34
+PACE_CLAMP = 0.15
 LEAGUE_NEUTRAL_PASS_RATE = 0.57
 # +1.2 percentage points of pass rate per point of deficit.
 SCRIPT_PASS_PER_POINT = 0.012
@@ -647,8 +666,12 @@ def _score_fallback(
     group: list[Player],
     index: _HistoryIndex | None,
 ) -> float:
-    """Role share, except the passing QB (anchors) and his backups (0)."""
-    if (player.position or "").upper() == "QB" and is_inactive(player):
+    """Role share, except the passing QB (anchors) and his backups (0).
+
+    O, D, IR, and NA score 0. They are already out of the target and rush
+    shares, so a fallback must not put a role-share stub back on them.
+    """
+    if is_inactive(player) and not _is_dst(player):
         return 0.0
     if (player.position or "").upper() != "QB":
         return _score_world(player, team_pts, opp_pts)
@@ -814,8 +837,65 @@ def scripted_rush_rate(stat: TeamStat | None, margin: float) -> float:
     return rush_rate
 
 
-def offense_plays_mu(stat: TeamStat | None) -> float:
-    """Plays per game. A team_stats count in one-game range wins; else 63."""
+def _shrunk_plays(stat: TeamStat | None) -> float | None:
+    if stat is None or stat.plays_per_game is None:
+        return None
+    games = float(stat.pace_games) if stat.pace_games else 1.0
+    return shrink(float(stat.plays_per_game), games, LEAGUE_PLAYS, PLAYS_PRIOR_GAMES)
+
+
+def _pace_plays(seconds: float | None, games: float, league_seconds: float) -> float | None:
+    """Plays implied by pace. Faster than the league means more plays.
+
+    The seconds rate is shrunk toward the league, then the play ratio is
+    clamped to ±``PACE_CLAMP``.
+    """
+    if seconds is None or float(seconds) <= 0 or league_seconds <= 0:
+        return None
+    shrunk = shrink(float(seconds), games, league_seconds, PLAYS_PRIOR_GAMES)
+    if shrunk <= 0:
+        return None
+    ratio = clamp(league_seconds / shrunk, 1.0 - PACE_CLAMP, 1.0 + PACE_CLAMP)
+    if ratio == 1.0:
+        return LEAGUE_PLAYS
+    return LEAGUE_PLAYS * ratio
+
+
+def _side_volume(stat: TeamStat | None) -> list[float]:
+    """Shrunk plays per game, plus one pace leg from the seconds columns."""
+    if stat is None:
+        return []
+    games = float(stat.pace_games) if stat.pace_games else 1.0
+    parts: list[float] = []
+    plays = _shrunk_plays(stat)
+    if plays is not None:
+        parts.append(plays)
+    pace: list[float] = []
+    neutral = _pace_plays(
+        stat.neutral_seconds_per_play, games, LEAGUE_NEUTRAL_SECONDS_PER_PLAY
+    )
+    overall = _pace_plays(stat.seconds_per_play, games, LEAGUE_SECONDS_PER_PLAY)
+    if neutral is not None:
+        pace.append(neutral)
+    if overall is not None:
+        pace.append(overall)
+    if pace:
+        parts.append(sum(pace) / len(pace))
+    return parts
+
+
+def offense_plays_mu(stat: TeamStat | None, defense: TeamStat | None = None) -> float:
+    """Plays per game.
+
+    ``plays_per_game`` on the offense, blended with the opponent's defensive
+    plays faced and with seconds per play on both sides. Each plays figure
+    shrinks toward 63 with a 4-game prior. Pace is clamped to ±15% of 63.
+    With none of those columns, a pass+rush count in the one-game range
+    wins; otherwise 63.
+    """
+    parts = _side_volume(stat) + _side_volume(defense)
+    if parts:
+        return sum(parts) / len(parts)
     if stat is None or not stat.pass_n or not stat.rush_n:
         return LEAGUE_PLAYS
     total = int(stat.pass_n) + int(stat.rush_n)
@@ -1285,11 +1365,12 @@ def _qb_depth_key(player: Player) -> tuple:
     return (rank, -(player.salary or 0), player.pid)
 
 
-def _catchers(
+def _target_candidates(
     team: str,
     group: list[Player],
     index: _HistoryIndex,
 ) -> list[Player]:
+    """WR/TE/RB with a positive target share, including inactive players."""
     out: list[Player] = []
     for pl in group:
         if (pl.team or "").upper() != team:
@@ -1299,6 +1380,45 @@ def _catchers(
         if mean_target_share(index.target_weeks(pl), index.snap_weeks(pl)) > 0:
             out.append(pl)
     return out
+
+
+def _catchers(
+    team: str,
+    group: list[Player],
+    index: _HistoryIndex,
+) -> list[Player]:
+    """Active catchers. O, D, IR, and NA do not take a target share."""
+    return [pl for pl in _target_candidates(team, group, index) if not is_inactive(pl)]
+
+
+def _fold_inactive_targets(
+    active: list[float],
+    inactive: list[float],
+) -> tuple[list[float], float]:
+    """Move inactive target share onto active catchers.
+
+    ``other`` stays the residual of the original shares (rostered plus
+    inactive), after the same >1 normalization. Inactive mass is not dumped
+    into that unrostered bucket. No active catchers: the mass falls into
+    ``other``.
+    """
+    all_sum = sum(active) + sum(inactive)
+    if all_sum > 1.0:
+        scale = 1.0 / all_sum
+        active = [value * scale for value in active]
+        inactive_mass = sum(inactive) * scale
+        other = 0.0
+    else:
+        inactive_mass = sum(inactive)
+        other = 1.0 - all_sum
+    active_sum = sum(active)
+    if inactive_mass > 0.0 and active_sum > 0.0:
+        active = [
+            value + inactive_mass * (value / active_sum) for value in active
+        ]
+    elif inactive_mass > 0.0:
+        other += inactive_mass
+    return active, other
 
 
 def _snap_pct_by_week(snaps: list[SnapWeek] | None) -> dict[int, float]:
@@ -1359,10 +1479,17 @@ def _realize_receiving(
     rng: random.Random,
     position: str,
     targets: float,
+    player: Player | None = None,
 ) -> ReceivingLine:
     fn = getattr(eff, "receiving_line", None)
     if fn is None:
         return expected_receiving_line(position, targets)
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "player" in params:
+        return fn(rng, position, targets, player=player)
     return fn(rng, position, targets)
 
 
@@ -1438,6 +1565,34 @@ def _rb_rush_attempts(
     return out
 
 
+def _tilt_anchors(
+    eff: EfficiencyModel,
+    team: str,
+    opponent: str,
+    yard_anchor: float,
+    rush_attempts: float,
+    td_anchor: float,
+) -> tuple[float, float, float]:
+    """Pass-vs-rush tilt and a red-zone TD nudge. Placeholder has neither.
+
+    A pass-anchor scale above 1 raises passing yards. Rush attempts stay
+    on the implied script. Data mode puts the rush complement on the
+    rush-yard budget (``allocate_rush``), so volume and efficiency do not
+    both scale.
+    """
+    scale_fn = getattr(eff, "pass_anchor_scale", None)
+    if scale_fn is not None:
+        tilt = float(scale_fn(team, opponent or None))
+        if tilt != 1.0:
+            yard_anchor *= tilt
+    td_fn = getattr(eff, "td_anchor_scale", None)
+    if td_fn is not None:
+        td_scale = float(td_fn(team, opponent or None))
+        if td_scale != 1.0:
+            td_anchor *= td_scale
+    return yard_anchor, rush_attempts, td_anchor
+
+
 def _team_implied(players: list[Player]) -> float:
     for pl in players:
         if pl.implied_total is not None and float(pl.implied_total) > 0:
@@ -1470,7 +1625,15 @@ def _draw_team_opportunities(
     if not catchers:
         return {}
     offense = index.offense(team)
-    plays = _gauss_floor(rng, offense_plays_mu(offense), PLAYS_SIGMA, PLAYS_FLOOR)
+    opponent = ""
+    for pl in team_players:
+        if (pl.opponent or "").strip():
+            opponent = (pl.opponent or "").upper()
+            break
+    defense = index.defense(opponent) if opponent else None
+    plays = _gauss_floor(
+        rng, offense_plays_mu(offense, defense), PLAYS_SIGMA, PLAYS_FLOOR
+    )
     rush_rate = scripted_rush_rate(offense, margin)
     pass_rate = 1.0 - rush_rate
     implied = _team_implied(team_players)
@@ -1481,23 +1644,30 @@ def _draw_team_opportunities(
     td_anchor = pass_td_anchor(implied, pass_rate, td_prop)
     pass_attempts = plays * pass_rate
     rush_attempts = team_rush_attempts(plays, rush_rate, implied)
+    yard_anchor, rush_attempts, td_anchor = _tilt_anchors(
+        eff, team, opponent, yard_anchor, rush_attempts, td_anchor
+    )
     team_targets = pass_attempts * index.targets_per_attempt(team)
 
     means = [
         mean_target_share(index.target_weeks(pl), index.snap_weeks(pl))
         for pl in catchers
     ]
+    inactive = [
+        pl
+        for pl in _target_candidates(team, team_players, index)
+        if is_inactive(pl)
+    ]
+    inactive_means = [
+        mean_target_share(index.target_weeks(pl), index.snap_weeks(pl))
+        for pl in inactive
+    ]
     series = [
         _weekly_shares(index.target_weeks(pl), index.snap_weeks(pl))
         for pl in catchers
     ]
     kappa = share_kappa(series)
-    mean_sum = sum(means)
-    if mean_sum > 1.0:
-        means = [m / mean_sum for m in means]
-        other = 0.0
-    else:
-        other = 1.0 - mean_sum
+    means, other = _fold_inactive_targets(means, inactive_means)
     simplex_means = list(means)
     if other > 1e-6:
         simplex_means.append(other)
@@ -1505,7 +1675,11 @@ def _draw_team_opportunities(
     target_share = {pl.pid: drawn[i] for i, pl in enumerate(catchers)}
     other_share = drawn[-1] if other > 1e-6 else 0.0
 
-    rbs = [pl for pl in team_players if (pl.position or "").upper() == "RB"]
+    rbs = [
+        pl
+        for pl in team_players
+        if (pl.position or "").upper() == "RB" and not is_inactive(pl)
+    ]
     snap_means = {pl.pid: index.snap_mean(pl) for pl in rbs}
     carry_means = {pl.pid: index.mean_carries(pl) for pl in rbs}
     rush_means, any_rush_signal = blended_rush_shares(rbs, snap_means, carry_means)
@@ -1528,12 +1702,15 @@ def _draw_team_opportunities(
         qb_rushes = min(qb_rushes, rush_attempts)
     rb_pool = max(0.0, rush_attempts - qb_rushes)
     rb_rushes = _rb_rush_attempts(rbs, rush_share, rb_pool)
+    rush_alloc = _rush_allocation(
+        eff, team, opponent, starter, qb_rushes, rbs, rb_rushes
+    )
     out: dict[str, OpportunityCount] = {}
     lines: list[ReceivingLine] = []
     raw_by_pid: dict[str, tuple[float, float, ReceivingLine]] = {}
     for pl in catchers:
         targets = team_targets * target_share[pl.pid]
-        line = _realize_receiving(eff, rng, pl.position or "WR", targets)
+        line = _realize_receiving(eff, rng, pl.position or "WR", targets, pl)
         lines.append(line)
         raw_by_pid[pl.pid] = (targets, rb_rushes.get(pl.pid, 0.0), line)
     other_targets = team_targets * other_share
@@ -1547,29 +1724,69 @@ def _draw_team_opportunities(
     cursor = 0
     for pl in catchers:
         targets, rushes, _raw = raw_by_pid[pl.pid]
+        rush_yards, rush_tds = rush_alloc.get(pl.pid, (None, None))
         out[pl.pid] = OpportunityCount(
             targets=targets,
             rushes=rushes,
             receiving=team_lines[cursor],
+            rush_yards=rush_yards,
+            rush_tds=rush_tds,
         )
         cursor += 1
     for pl in rbs:
         if pl.pid in out:
             continue
-        out[pl.pid] = OpportunityCount(rushes=rb_rushes.get(pl.pid, 0.0))
+        rush_yards, rush_tds = rush_alloc.get(pl.pid, (None, None))
+        out[pl.pid] = OpportunityCount(
+            rushes=rb_rushes.get(pl.pid, 0.0),
+            rush_yards=rush_yards,
+            rush_tds=rush_tds,
+        )
     for pl in team_players:
         if (pl.position or "").upper() != "QB":
             continue
         if starter is not None and pl.pid == starter.pid:
+            rush_yards, rush_tds = rush_alloc.get(pl.pid, (None, None))
             out[pl.pid] = OpportunityCount(
                 pass_attempts=pass_attempts,
                 rushes=qb_rushes,
                 team_receiving=team_lines,
+                rush_yards=rush_yards,
+                rush_tds=rush_tds,
             )
         else:
             # In the dict so the backup is not scored off team points.
             out[pl.pid] = OpportunityCount()
     return out
+
+
+def _rush_allocation(
+    eff: EfficiencyModel,
+    team: str,
+    opponent: str,
+    starter: Player | None,
+    qb_rushes: float,
+    rbs: list[Player],
+    rb_rushes: dict[str, float],
+) -> dict[str, tuple[float, float]]:
+    """Data-mode rush yards and TDs. Placeholder has no allocator."""
+    alloc = getattr(eff, "allocate_rush", None)
+    if alloc is None:
+        return {}
+    specs: list[tuple[Player, float]] = []
+    if starter is not None and qb_rushes > 0:
+        specs.append((starter, qb_rushes))
+    for pl in rbs:
+        carries = rb_rushes.get(pl.pid, 0.0)
+        if carries > 0:
+            specs.append((pl, carries))
+    if not specs:
+        return {}
+    tilt = 1.0
+    scale_fn = getattr(eff, "pass_anchor_scale", None)
+    if scale_fn is not None:
+        tilt = float(scale_fn(team, opponent or None))
+    return alloc(specs, team=team, opponent=opponent or None, pass_tilt=tilt)
 
 
 class _HistoryIndex:
@@ -1584,25 +1801,28 @@ class _HistoryIndex:
         self._carry_pid: dict[str, list[CarryWeek]] = {}
         self._carry_name: dict[tuple[str, str], list[CarryWeek]] = {}
         for row in inputs.targets:
-            self._tgt_name.setdefault(
-                (row.team_fd, match_key(row.player_name)), []
-            ).append(row)
+            if row.player_name:
+                self._tgt_name.setdefault(
+                    (row.team_fd, match_key(row.player_name)), []
+                ).append(row)
             if row.player_id:
                 self._tgt_pid.setdefault(row.player_id, []).append(row)
             if row.gsis_id:
                 self._tgt_pid.setdefault(row.gsis_id, []).append(row)
         for row in inputs.snaps:
-            self._snap_name.setdefault(
-                (row.team_fd, match_key(row.player_name)), []
-            ).append(row)
+            if row.player_name:
+                self._snap_name.setdefault(
+                    (row.team_fd, match_key(row.player_name)), []
+                ).append(row)
             if row.player_id:
                 self._snap_pid.setdefault(row.player_id, []).append(row)
             if row.gsis_id:
                 self._snap_pid.setdefault(row.gsis_id, []).append(row)
         for row in inputs.carries:
-            self._carry_name.setdefault(
-                (row.team_fd, match_key(row.player_name)), []
-            ).append(row)
+            if row.player_name:
+                self._carry_name.setdefault(
+                    (row.team_fd, match_key(row.player_name)), []
+                ).append(row)
             if row.player_id:
                 self._carry_pid.setdefault(row.player_id, []).append(row)
             if row.gsis_id:
