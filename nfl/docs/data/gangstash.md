@@ -79,6 +79,7 @@ python3 -m nfl.gangstash_data team-stats-weekly --season 2026 --week 1,2
 | `GANGSTASH_CLOSING_LINES_DATASET` | `closing_lines` | `dataset=` value |
 | `GANGSTASH_INJURIES_DATASET` | `injuries` | `dataset=` value |
 | `GANGSTASH_DST_WEEKLY_DATASET` | `dst_weekly` | `dataset=` value |
+| `GANGSTASH_PLAYER_USAGE_DATASET` | `player_usage` | `dataset=` value |
 
 ## Queries this client sends
 
@@ -92,6 +93,7 @@ python3 -m nfl.gangstash_data team-stats-weekly --season 2026 --week 1,2
 | `team_stats` | `season` (required), `season_type` (default `REG`), optional `side` (`offense`/`defense`), `team` | not scored |
 | `team_stats_weekly` | `season` + `week` (single or comma list), optional `team` | backtest pools weeks before the target into team EPA variance. The optimizer still overlays rates on the season board |
 | `dst_weekly` | `season` (required), optional `week`, optional `team` | DEF actuals for the backtest. Join is `(season, week, team)`. `fd_points` is the FanDuel score |
+| `player_usage` | `season` required; `week`, `team`, `gsis_id`, `position` optional | one row per player-week. The sim feed sends season and the prior-week list only |
 | `snaps` | `season` (required), `week` (single or `1,2`), optional `position` (`WR`/`TE`/`RB`), `team` (FD or nflverse; `JAC` and `JAX` both work) | 2026 weeks 1–2 are 2,994 rows (185 RB, 335 WR, 220 TE). `offense_pct` is a 0–1 fraction |
 
 ## Response fields
@@ -203,7 +205,23 @@ read by `week1_score`. Season rows include `team`, `team_fd`, `side`,
 `epa_var`, pass and rush `success_rate` and `epa_per_play`, `early_down_*`,
 `explosive_rate`, `third_down_rate`, `red_zone_td_rate`, and raw `n` /
 `epa_sum` / `epa_sq_sum` (all, pass, and rush). Weekly rows add `week`,
-`opponent`, and `game_id`.
+`opponent`, and `game_id`. Both sides also carry pace and efficiency:
+`pace_games`, `pace_plays`, `play_seconds`, `pace_neutral_plays`,
+`neutral_play_seconds`, `rush_yards`, `net_pass_yards`, `air_yards`,
+`plays_per_game`, `seconds_per_play`, `neutral_seconds_per_play`,
+`yards_per_carry`, `yards_per_dropback`, `yards_per_pass_attempt`,
+`sack_rate`, `air_yards_per_attempt`. A defense row is what that defense
+allowed, and its `sack_rate` is sacks generated. `seconds_per_play` and
+`neutral_seconds_per_play` are about 17% low until a denominator fix;
+the sim stores them and does not use them.
+
+**`player_usage`** (one player-week): `season`, `week`, `season_type`,
+`gsis_id`, `player_id`, `team`, `team_fd`, `position`, `targets`,
+`receiving_air_yards` (can be negative), `target_share` (0 for linemen),
+`air_yards_share`, `wopr`, `carries`, `rz_targets`, `rz_carries` (inside
+the 20), `gl_carries` (inside the 5), `rz_receiving_tds`, `rz_rushing_tds`.
+The sim uses it for target share, aDOT, and red-zone / goal-line TD rates.
+Weeks before the backtest target only.
 
 ## Failure
 

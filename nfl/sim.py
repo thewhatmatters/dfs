@@ -5,9 +5,11 @@ share that world:
 
 1. Game — Vegas total + home spread. Sigma scales with team EPA variance
    when team stats are present; otherwise the fixed constants below.
-2. Volume + script — team plays and a pass/rush split. Neutral pass rate
-   (or pass rate minus PROE) shifts with the drawn margin: trailing teams
-   pass more, leading teams run more. Passing yards and TDs are anchored
+2. Volume + script — team plays and a pass/rush split. Plays per game,
+   when that column is present, is shrunk toward 63 and blended with the
+   opponent's defensive plays faced. Seconds per play are stored and not
+   read. Neutral pass rate (or pass rate minus PROE) shifts with the drawn
+   margin: trailing teams pass more, leading teams run more. Passing yards and TDs are anchored
    to the Vegas implied total times that pass rate (a passing prop replaces
    the matching anchor). Team rush attempts come from team_stats plus the
    same script, then a yard budget tied to the implied total.
@@ -88,6 +90,7 @@ from nfl.sim_efficiency import (
     ReceivingLine,
     expected_receiving_line,
     sample_yards,
+    shrink,
 )
 from nfl.sim_inputs import CarryWeek, SimInputs, SnapWeek, TargetWeek, TeamStat
 
@@ -120,6 +123,8 @@ EPA_SCALE_MAX = 1.80
 LEAGUE_PLAYS = 63.0
 PLAYS_SIGMA = 4.0
 PLAYS_FLOOR = 40.0
+# Plays per game shrink toward 63. One game of 70 becomes (70 + 252) / 5.
+PLAYS_PRIOR_GAMES = 4.0
 LEAGUE_NEUTRAL_PASS_RATE = 0.57
 # +1.2 percentage points of pass rate per point of deficit.
 SCRIPT_PASS_PER_POINT = 0.012
@@ -826,8 +831,24 @@ def scripted_rush_rate(stat: TeamStat | None, margin: float) -> float:
     return rush_rate
 
 
-def offense_plays_mu(stat: TeamStat | None) -> float:
-    """Plays per game. A team_stats count in one-game range wins; else 63."""
+def _shrunk_plays(stat: TeamStat | None) -> float | None:
+    if stat is None or stat.plays_per_game is None:
+        return None
+    games = float(stat.pace_games) if stat.pace_games else 1.0
+    return shrink(float(stat.plays_per_game), games, LEAGUE_PLAYS, PLAYS_PRIOR_GAMES)
+
+
+def offense_plays_mu(stat: TeamStat | None, defense: TeamStat | None = None) -> float:
+    """Plays per game.
+
+    ``plays_per_game`` on the offense, blended with the opponent's defensive
+    plays faced, each shrunk toward 63 with a 4-game prior. Seconds per play
+    are not read. With no plays-per-game column, a pass+rush count in the
+    one-game range wins; otherwise 63.
+    """
+    parts = [val for val in (_shrunk_plays(stat), _shrunk_plays(defense)) if val is not None]
+    if parts:
+        return sum(parts) / len(parts)
     if stat is None or not stat.pass_n or not stat.rush_n:
         return LEAGUE_PLAYS
     total = int(stat.pass_n) + int(stat.rush_n)
@@ -1557,7 +1578,15 @@ def _draw_team_opportunities(
     if not catchers:
         return {}
     offense = index.offense(team)
-    plays = _gauss_floor(rng, offense_plays_mu(offense), PLAYS_SIGMA, PLAYS_FLOOR)
+    opponent = ""
+    for pl in team_players:
+        if (pl.opponent or "").strip():
+            opponent = (pl.opponent or "").upper()
+            break
+    defense = index.defense(opponent) if opponent else None
+    plays = _gauss_floor(
+        rng, offense_plays_mu(offense, defense), PLAYS_SIGMA, PLAYS_FLOOR
+    )
     rush_rate = scripted_rush_rate(offense, margin)
     pass_rate = 1.0 - rush_rate
     implied = _team_implied(team_players)
@@ -1568,11 +1597,6 @@ def _draw_team_opportunities(
     td_anchor = pass_td_anchor(implied, pass_rate, td_prop)
     pass_attempts = plays * pass_rate
     rush_attempts = team_rush_attempts(plays, rush_rate, implied)
-    opponent = ""
-    for pl in team_players:
-        if (pl.opponent or "").strip():
-            opponent = (pl.opponent or "").upper()
-            break
     yard_anchor, rush_attempts, td_anchor = _tilt_anchors(
         eff, team, opponent, yard_anchor, rush_attempts, td_anchor
     )
@@ -1730,25 +1754,28 @@ class _HistoryIndex:
         self._carry_pid: dict[str, list[CarryWeek]] = {}
         self._carry_name: dict[tuple[str, str], list[CarryWeek]] = {}
         for row in inputs.targets:
-            self._tgt_name.setdefault(
-                (row.team_fd, match_key(row.player_name)), []
-            ).append(row)
+            if row.player_name:
+                self._tgt_name.setdefault(
+                    (row.team_fd, match_key(row.player_name)), []
+                ).append(row)
             if row.player_id:
                 self._tgt_pid.setdefault(row.player_id, []).append(row)
             if row.gsis_id:
                 self._tgt_pid.setdefault(row.gsis_id, []).append(row)
         for row in inputs.snaps:
-            self._snap_name.setdefault(
-                (row.team_fd, match_key(row.player_name)), []
-            ).append(row)
+            if row.player_name:
+                self._snap_name.setdefault(
+                    (row.team_fd, match_key(row.player_name)), []
+                ).append(row)
             if row.player_id:
                 self._snap_pid.setdefault(row.player_id, []).append(row)
             if row.gsis_id:
                 self._snap_pid.setdefault(row.gsis_id, []).append(row)
         for row in inputs.carries:
-            self._carry_name.setdefault(
-                (row.team_fd, match_key(row.player_name)), []
-            ).append(row)
+            if row.player_name:
+                self._carry_name.setdefault(
+                    (row.team_fd, match_key(row.player_name)), []
+                ).append(row)
             if row.player_id:
                 self._carry_pid.setdefault(row.player_id, []).append(row)
             if row.gsis_id:

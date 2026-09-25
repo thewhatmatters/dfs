@@ -147,11 +147,23 @@ Data mode, prior-count blend `(n * observed + prior_n * prior) / (n + prior_n)`:
 
 One prior week sits mostly on the prior. A bellcow week is about 20 carries and a tight end week is about 6 targets, so those counts are a small share of the player prior. The team-position prior is a few team-weeks for the same reason: the player shrinks toward the team rate, and a one-week team rate must not become that target. The league rate is shrunk toward the placeholder constants. A player with no history stays on those constants. The backtest and the nightly publish set `before_week` to the scored week, so week N and later rows are dropped. A season-to-date `team_stats` row (no week) is not used for that cutoff. The optimizer, with no week cutoff, uses `team_weeks` when the feed has them and otherwise the season board.
 
-Opponent defense scales pass efficiency by pass EPA and success allowed, and rush efficiency by rush EPA and success allowed. Early-down rates win when those columns are present. The sample is shrunk with a 100-play prior. The multiplier is clamped to ±15%. One EPA per play above the league is +0.50 before that clamp. Red-zone TD rate (offense, and defense allowed) nudges the team TD anchor, clamped to ±15%.
+Opponent defense scales pass efficiency by pass EPA and success allowed, then yards per dropback allowed versus 6.0 (yards per attempt versus 7.1 only when dropback is missing), then sack rate versus 6.5%. Rush efficiency uses rush EPA and success allowed, then yards per carry allowed versus 4.3. Early-down rates win when those columns are present. The sample is shrunk with a 100-play prior. Each multiplier is clamped to ±15%. One EPA per play above the league is +0.50 before that clamp. The rush-yard budget then multiplies the pass-tilt complement by that rush multiplier and clamps the product again to ±15%. Red-zone TD rate (offense, and defense allowed) nudges the team TD anchor, clamped to ±15%. Defense air yards per attempt are stored and are not in the multiplier.
 
 Offense pass EPA versus rush EPA, plus the same gap in what the defense allows, tilts the pass yard anchor by at most ±8%. Rush attempts stay on the implied-total script. The rush-yard budget takes the complement (`2 - tilt`) times the opponent rush multiplier, and that product is clamped again to ±15% (`COMBINED_CLAMP`), so 1.08 × 1.15 cannot become 1.24. Team rush yards are `sum(rushes × prior yards per carry) × that one scale`. A hot yards-per-carry or rush TD rate only steals share from other rushers. Receiving yards and receiving TDs were already rescaled to the pass anchor, so a hot tight end rate redistributes that pie and does not add to it. O, D, IR, and NA players are left out of target and rush shares. Their share is renormalized onto active teammates.
 
-Optional columns stay `None` and are skipped until the aggregator ships them: `receiving_air_yards`, `target_share`, `air_yards_share`, `wopr`, `red_zone_targets`, `red_zone_carries`, `goal_line_carries` on a player-week; `plays_per_game`, `seconds_per_play`, and the neutral pair on a team-week; `yards_per_carry_allowed`, `yards_per_dropback_allowed`, `yards_per_attempt_allowed`, `sack_rate`, `air_yards_per_attempt_allowed` on a defense. Air yards, red-zone targets, and goal-line carries blend 10% into yards per target or the TD rate when present. Yards allowed and sack rate blend into the opponent multiplier and still hit the ±15% clamp. Plays per game and seconds per play are stored and do not change layer 2.
+Every new column is optional. `None` leaves that piece on the path above, so an empty bundle and a history with none of these columns stay on the placeholder draws.
+
+| Input | What it changes |
+|---|---|
+| `player_usage` `target_share`, else `air_yards_share`, else `wopr / 2.2` | Dirichlet target share. Both shares present: 75% targets, 25% air. A positive targets-dataset share is blended 50/50. A zero usage share (linemen) does not replace a positive one |
+| `receiving_air_yards`, or `air_yards_share / target_share × 7.4` | 10% tilt on yards per target (aDOT). Negative air yards lower it. League air yards per target stays 8.0 |
+| `rz_targets / targets` versus 0.12 | Receiving TD rate, when the column is present (including 0). Shrunk like the other rates, then clamped to 0.5–2.0 times the position prior. Raw receiving TDs are not also blended |
+| `gl_carries / carries` versus 0.08, else `rz_carries / carries` versus 0.15 | Rush TD rate, same shrink and clamp. Goal line wins when both columns are present. The team rush TD total stays on the prior budget |
+| Defense `yards_per_dropback` (allowed) versus 6.0, else yards per attempt versus 7.1, then `sack_rate` versus 6.5% | Pass multiplier, after EPA, inside ±15% |
+| Defense `yards_per_carry` (allowed) versus 4.3 | Rush multiplier, after EPA, inside ±15%. The rush-yard budget scale clamps the product with the pass tilt again |
+| Offense `plays_per_game`, blended with opponent defense plays faced | Team play volume. Each side shrinks toward 63 with a 4-game prior |
+
+`seconds_per_play` and `neutral_seconds_per_play` are stored and off. Data Aggregator reads them about 17% low while a denominator bug is fixed. `rz_receiving_tds` and `rz_rushing_tds` are stored and do not set the TD rate. A backtest uses weeks before the target only. Week 1 fetches none of these.
 
 ## Gangstash feed
 
@@ -166,7 +178,8 @@ When `--sim` runs and `--sim-inputs` is omitted, `nfl/sim_feed.py` builds `SimIn
 | Target shares | `targets`, that same week list, or every week the season query returns | one player-week each, not the single-share usage aggregate |
 | RB rush shares | `snaps`, same window, `position=RB` | `offense_pct` |
 | RB carry shares | `player_stats_weekly`, same window | `carries` or `rushing_attempts` (skipped when the dataset is missing) |
-| Layer 4 rates | `player_stats_weekly` and `team_stats_weekly`, same window | counting stats, EPA, success, red-zone TD rate. Optional columns when present |
+| Target-share and red-zone usage | `player_usage`, same window | `target_share`, `air_yards_share`, `wopr`, `rz_targets`, `rz_carries`, `gl_carries`, `receiving_air_yards`. One row per player-week. Week 1 does not fetch it |
+| Layer 4 rates | `player_stats_weekly`, `player_usage`, and `team_stats_weekly`, same window | counting stats, EPA, success, red-zone TD rate, yards allowed, sack rate, plays per game. Seconds per play are stored and unused |
 
 No key and no cache for every dataset prints one line and keeps role shares:
 

@@ -15,6 +15,7 @@ from dataclasses import replace
 from nfl.gangstash import GangstashDataError, GangstashDataKeyMissing, GangstashTruncated
 from nfl.gangstash_data import (
     fetch_player_stats_weekly,
+    fetch_player_usage,
     fetch_snaps,
     fetch_targets,
     fetch_team_stats,
@@ -37,6 +38,8 @@ UNAVAILABLE_NOTE = (
 )
 
 _RATE_FIELDS = ("pass_rate", "neutral_pass_rate", "proe")
+# WOPR = 1.5 * target_share + 0.7 * air_yards_share. Divide to recover a share.
+WOPR_SHARE_DIVISOR = 2.2
 
 
 def resolve_sim_inputs(
@@ -124,14 +127,23 @@ def load_gangstash_sim_inputs(
                 refresh=False,
             )
         )
+        usage_rows, usage_meta, usage_err = _pull(
+            lambda: fetch_player_usage(
+                season=season,
+                weeks=weeks,
+                refresh=False,
+            )
+        )
         if weeks:
             target_rows = _rows_in_weeks(target_rows, weeks)
             snap_rows = _rows_in_weeks(snap_rows, weeks)
             stat_rows = _rows_in_weeks(stat_rows, weeks)
+            usage_rows = _rows_in_weeks(usage_rows, weeks)
     else:
         target_rows, target_meta, target_err = [], {}, None
         snap_rows, snap_meta, snap_err = [], {}, None
         stat_rows, stat_meta, stat_err = [], {}, None
+        usage_rows, usage_meta, usage_err = [], {}, None
     if weekly_only:
         team_stats = _pooled_weekly_rows(weekly_rows)
     else:
@@ -139,19 +151,21 @@ def load_gangstash_sim_inputs(
     targets = _targets(target_rows)
     snaps = _snaps(snap_rows)
     carries = _carries(stat_rows)
+    player_rows = _player_week_rows(stat_rows)
+    targets, player_rows = _apply_player_usage(targets, player_rows, usage_rows)
     inputs = sim_inputs_from_records(
         team_stats=team_stats,
         targets=targets,
         snaps=snaps,
         carries=carries,
-        player_weeks=_player_week_rows(stat_rows),
+        player_weeks=player_rows,
         team_weeks=_weekly_team_rows(weekly_rows),
     )
     if inputs.empty:
         return None, UNAVAILABLE_NOTE
     stale = any(
         bool(meta.get("cache_stale"))
-        for meta in (stats_meta, weekly_meta, target_meta, snap_meta, stat_meta)
+        for meta in (stats_meta, weekly_meta, target_meta, snap_meta, stat_meta, usage_meta)
     )
     skipped = [
         name
@@ -161,6 +175,7 @@ def load_gangstash_sim_inputs(
             ("targets", target_err),
             ("snaps", snap_err),
             ("player_stats_weekly", stat_err),
+            ("player_usage", usage_err),
         )
         if err
     ]
@@ -169,7 +184,8 @@ def load_gangstash_sim_inputs(
         f"targets {len(inputs.targets)}  snaps {len(inputs.snaps)}  "
         f"carries {len(inputs.carries)}  "
         f"player_weeks {len(inputs.player_weeks)}  "
-        f"team_weeks {len(inputs.team_weeks)}"
+        f"team_weeks {len(inputs.team_weeks)}  "
+        f"usage {len(usage_rows)}"
     )
     if weekly_only:
         note += "  team_stats_scope weekly"
@@ -331,6 +347,18 @@ def _as_row(stat: TeamStat) -> dict:
         "yards_per_attempt_allowed": stat.yards_per_attempt_allowed,
         "sack_rate": stat.sack_rate,
         "air_yards_per_attempt_allowed": stat.air_yards_per_attempt_allowed,
+        "pace_games": stat.pace_games,
+        "pace_plays": stat.pace_plays,
+        "play_seconds": stat.play_seconds,
+        "pace_neutral_plays": stat.pace_neutral_plays,
+        "neutral_play_seconds": stat.neutral_play_seconds,
+        "rush_yards": stat.rush_yards,
+        "net_pass_yards": stat.net_pass_yards,
+        "air_yards": stat.air_yards,
+        "yards_per_carry": stat.yards_per_carry,
+        "yards_per_dropback": stat.yards_per_dropback,
+        "yards_per_pass_attempt": stat.yards_per_pass_attempt,
+        "air_yards_per_attempt": stat.air_yards_per_attempt,
     }
 
 
@@ -411,20 +439,40 @@ def _pool_team_side(team: str, side: str, rows: list[TeamStat]) -> TeamStat:
         early_down_rush_success_rate=_weighted_mean(
             rows, "early_down_rush_success_rate", "early_down_rush_n"
         ),
-        plays_per_game=_weighted_mean(rows, "plays_per_game", "n"),
+        plays_per_game=_plays_per_game_pool(rows),
         seconds_per_play=_weighted_mean(rows, "seconds_per_play", "n"),
         neutral_plays_per_game=_weighted_mean(rows, "neutral_plays_per_game", "n"),
         neutral_seconds_per_play=_weighted_mean(rows, "neutral_seconds_per_play", "n"),
-        yards_per_carry_allowed=_weighted_mean(rows, "yards_per_carry_allowed", "rush_n"),
-        yards_per_dropback_allowed=_weighted_mean(
-            rows, "yards_per_dropback_allowed", "pass_n"
+        yards_per_carry_allowed=_paired_rate(
+            rows, "yards_per_carry_allowed", "yards_per_carry", "rush_n"
         ),
-        yards_per_attempt_allowed=_weighted_mean(
-            rows, "yards_per_attempt_allowed", "pass_n"
+        yards_per_dropback_allowed=_paired_rate(
+            rows, "yards_per_dropback_allowed", "yards_per_dropback", "pass_n"
+        ),
+        yards_per_attempt_allowed=_paired_rate(
+            rows, "yards_per_attempt_allowed", "yards_per_pass_attempt", "pass_n"
         ),
         sack_rate=_weighted_mean(rows, "sack_rate", "pass_n"),
-        air_yards_per_attempt_allowed=_weighted_mean(
-            rows, "air_yards_per_attempt_allowed", "pass_n"
+        air_yards_per_attempt_allowed=_paired_rate(
+            rows, "air_yards_per_attempt_allowed", "air_yards_per_attempt", "pass_n"
+        ),
+        pace_games=_sum_pace_games(rows),
+        pace_plays=_sum_optional(rows, "pace_plays"),
+        play_seconds=_sum_optional(rows, "play_seconds"),
+        pace_neutral_plays=_sum_optional(rows, "pace_neutral_plays"),
+        neutral_play_seconds=_sum_optional(rows, "neutral_play_seconds"),
+        rush_yards=_sum_optional(rows, "rush_yards"),
+        net_pass_yards=_sum_optional(rows, "net_pass_yards"),
+        air_yards=_sum_optional(rows, "air_yards"),
+        yards_per_carry=_paired_rate(rows, "yards_per_carry", "yards_per_carry_allowed", "rush_n"),
+        yards_per_dropback=_paired_rate(
+            rows, "yards_per_dropback", "yards_per_dropback_allowed", "pass_n"
+        ),
+        yards_per_pass_attempt=_paired_rate(
+            rows, "yards_per_pass_attempt", "yards_per_attempt_allowed", "pass_n"
+        ),
+        air_yards_per_attempt=_paired_rate(
+            rows, "air_yards_per_attempt", "air_yards_per_attempt_allowed", "pass_n"
         ),
     )
 
@@ -563,3 +611,252 @@ def _snaps(rows: list[dict]) -> list[dict]:
             continue
         out.append(item)
     return out
+
+
+def _positive_share(val) -> float | None:
+    if val is None or val == "":
+        return None
+    try:
+        num = float(val)
+    except (TypeError, ValueError):
+        return None
+    if num > 1.5:
+        num = num / 100.0
+    if num > 0:
+        return num
+    return None
+
+
+def _usage_share(row: dict) -> float | None:
+    """Target share from usage. A zero target share does not win by itself."""
+    tgt = _positive_share(row.get("target_share"))
+    air = _positive_share(row.get("air_yards_share"))
+    if tgt is not None and air is not None:
+        return 0.75 * tgt + 0.25 * air
+    if tgt is not None:
+        return tgt
+    if air is not None:
+        return air
+    raw = row.get("wopr")
+    if raw is None or raw == "":
+        return None
+    try:
+        wopr = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if wopr <= 0 or WOPR_SHARE_DIVISOR <= 0:
+        return None
+    return min(1.0, max(0.0, wopr / WOPR_SHARE_DIVISOR))
+
+
+def _week_of(row: dict) -> int | None:
+    raw = row.get("week")
+    if raw is None or raw == "":
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _index_by_id(rows: list[dict]) -> tuple[dict, dict]:
+    by_gsis: dict[tuple[str, int], dict] = {}
+    by_pid: dict[tuple[str, int], dict] = {}
+    for row in rows:
+        week = _week_of(row)
+        if week is None:
+            continue
+        gsis = str(row.get("gsis_id") or "").strip()
+        pid = str(row.get("player_id") or "").strip()
+        if gsis:
+            by_gsis.setdefault((gsis, week), row)
+        if pid:
+            by_pid.setdefault((pid, week), row)
+    return by_gsis, by_pid
+
+
+def _find_row(by_gsis: dict, by_pid: dict, row: dict) -> dict | None:
+    week = _week_of(row)
+    if week is None:
+        return None
+    gsis = str(row.get("gsis_id") or "").strip()
+    if gsis and (gsis, week) in by_gsis:
+        return by_gsis[(gsis, week)]
+    pid = str(row.get("player_id") or "").strip()
+    if pid and (pid, week) in by_pid:
+        return by_pid[(pid, week)]
+    return None
+
+
+def _blank_field(row: dict, key: str) -> bool:
+    val = row.get(key)
+    if val is None:
+        return True
+    if isinstance(val, str) and not str(val).strip():
+        return True
+    return False
+
+
+def _first_present(row: dict, keys: tuple[str, ...]):
+    for key in keys:
+        val = row.get(key)
+        if val is None:
+            continue
+        if isinstance(val, str) and not val.strip():
+            continue
+        return val
+    return None
+
+
+_USAGE_COPIES = (
+    ("receiving_air_yards", ("receiving_air_yards",)),
+    ("air_yards_share", ("air_yards_share",)),
+    ("wopr", ("wopr",)),
+    ("target_share", ("target_share",)),
+    ("red_zone_targets", ("red_zone_targets", "rz_targets")),
+    ("red_zone_carries", ("red_zone_carries", "rz_carries")),
+    ("goal_line_carries", ("goal_line_carries", "gl_carries")),
+    ("rz_receiving_tds", ("rz_receiving_tds",)),
+    ("rz_rushing_tds", ("rz_rushing_tds",)),
+)
+
+
+def _copy_usage(dest: dict, source: dict) -> None:
+    for dest_key, source_keys in _USAGE_COPIES:
+        if not _blank_field(dest, dest_key):
+            continue
+        val = _first_present(source, source_keys)
+        if val is not None:
+            dest[dest_key] = val
+
+
+def _apply_player_usage(
+    targets: list[dict],
+    player_rows: list[dict],
+    usage_rows: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """Blend usage shares onto targets and fill blank efficiency columns.
+
+    Join is ``(gsis_id, week)`` then ``(player_id, week)``. A usage row that
+    matches neither list is kept on its own when it has an id or a name.
+    """
+    if not usage_rows:
+        return targets, player_rows
+    tgt_gsis, tgt_pid = _index_by_id(targets)
+    st_gsis, st_pid = _index_by_id(player_rows)
+    extra_targets: list[dict] = []
+    extra_players: list[dict] = []
+    for raw in usage_rows:
+        if not isinstance(raw, dict):
+            continue
+        team = _fd(str(raw.get("team_fd") or raw.get("team") or ""))
+        if team is None:
+            continue
+        row = dict(raw)
+        row["team_fd"] = team
+        week = _week_of(row)
+        if week is None:
+            continue
+        gsis = str(row.get("gsis_id") or "").strip()
+        pid = str(row.get("player_id") or "").strip()
+        name = str(row.get("player_name") or row.get("name") or "").strip()
+        if not gsis and not pid and not name:
+            continue
+        share = _usage_share(row)
+        hit = _find_row(tgt_gsis, tgt_pid, row)
+        if hit is not None and share is not None:
+            existing = _positive_share(hit.get("target_share"))
+            hit["target_share"] = (
+                share if existing is None else 0.5 * existing + 0.5 * share
+            )
+        elif hit is None and share is not None:
+            raw_targets = row.get("targets")
+            try:
+                targets_val = (
+                    0.0 if raw_targets is None or raw_targets == "" else float(raw_targets)
+                )
+            except (TypeError, ValueError):
+                targets_val = 0.0
+            extra_targets.append(
+                {
+                    "player_name": name,
+                    "team_fd": team,
+                    "position": str(row.get("position") or "WR").strip().upper() or "WR",
+                    "week": week,
+                    "season": row.get("season") or 0,
+                    "targets": targets_val,
+                    "target_share": share,
+                    "gsis_id": gsis or None,
+                    "player_id": pid or None,
+                }
+            )
+        stat = _find_row(st_gsis, st_pid, row)
+        if stat is not None:
+            _copy_usage(stat, row)
+        else:
+            extra_players.append(row)
+    return targets + extra_targets, player_rows + extra_players
+
+
+def _sum_optional(rows: list[TeamStat], attr: str) -> float | None:
+    total = 0.0
+    seen = False
+    for row in rows:
+        raw = getattr(row, attr)
+        if raw is None:
+            continue
+        total += float(raw)
+        seen = True
+    return total if seen else None
+
+
+def _sum_pace_games(rows: list[TeamStat]) -> float | None:
+    """Sum games. A plays-per-game row with no pace_games counts as one."""
+    total = 0.0
+    seen = False
+    for row in rows:
+        if row.pace_games is not None and float(row.pace_games) > 0:
+            total += float(row.pace_games)
+            seen = True
+        elif row.plays_per_game is not None:
+            total += 1.0
+            seen = True
+    return total if seen else None
+
+
+def _plays_per_game_pool(rows: list[TeamStat]) -> float | None:
+    weighted = _weighted_mean(rows, "plays_per_game", "n")
+    if weighted is not None:
+        return weighted
+    num = 0.0
+    den = 0.0
+    for row in rows:
+        if row.plays_per_game is None:
+            continue
+        weight = float(row.pace_games) if row.pace_games else 1.0
+        num += float(row.plays_per_game) * weight
+        den += weight
+    if den <= 0:
+        return None
+    return num / den
+
+
+def _paired_rate(
+    rows: list[TeamStat], primary: str, fallback: str, n_attr: str
+) -> float | None:
+    got = _weighted_mean(rows, primary, n_attr)
+    if got is not None:
+        return got
+    got = _weighted_mean(rows, fallback, n_attr)
+    if got is not None:
+        return got
+    vals: list[float] = []
+    for row in rows:
+        val = getattr(row, primary)
+        if val is None:
+            val = getattr(row, fallback)
+        if val is not None:
+            vals.append(float(val))
+    if not vals:
+        return None
+    return sum(vals) / len(vals)

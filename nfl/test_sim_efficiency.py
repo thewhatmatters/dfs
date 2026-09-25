@@ -7,7 +7,7 @@ import unittest
 
 from nfl.players import Player
 from nfl.projections import week1_score
-from nfl.sim import simulate_games
+from nfl.sim import LEAGUE_PLAYS, offense_plays_mu, simulate_games
 from nfl.sim_efficiency import (
     COMBINED_CLAMP,
     OPP_CLAMP,
@@ -78,7 +78,10 @@ def _week(week: int, **kw) -> PlayerWeek:
         passing_yards=kw.get("passing_yards", 0.0),
         passing_tds=kw.get("passing_tds", 0.0),
         receiving_air_yards=kw.get("receiving_air_yards"),
+        target_share=kw.get("target_share"),
+        air_yards_share=kw.get("air_yards_share"),
         red_zone_targets=kw.get("red_zone_targets"),
+        red_zone_carries=kw.get("red_zone_carries"),
         goal_line_carries=kw.get("goal_line_carries"),
         gsis_id=kw.get("gsis_id"),
         player_id=kw.get("player_id"),
@@ -443,3 +446,207 @@ class FallbackTest(unittest.TestCase):
 
     def test_omitted_mode_is_placeholder(self) -> None:
         self.assertIsInstance(build_efficiency(None, None), PlaceholderEfficiency)
+
+
+class UsageHookTest(unittest.TestCase):
+    def test_player_week_maps_usage_aliases_and_negative_air(self) -> None:
+        row = player_week_from_row(
+            {
+                "gsis_id": "00-1",
+                "team": "DET",
+                "week": 1,
+                "position": "WR",
+                "rz_targets": 3,
+                "gl_carries": 2,
+                "receiving_air_yards": -12,
+            }
+        )
+        old = player_week_from_row(
+            {
+                "player_name": "Amon-Ra St. Brown",
+                "team_fd": "DET",
+                "week": 1,
+                "red_zone_targets": 4,
+                "goal_line_carries": 1,
+                "red_zone_carries": 5,
+            }
+        )
+        assert row is not None and old is not None
+        self.assertEqual(row.player_name, "")
+        self.assertEqual(row.red_zone_targets, 3)
+        self.assertEqual(row.goal_line_carries, 2)
+        self.assertAlmostEqual(row.receiving_air_yards or 0, -12)
+        self.assertEqual(old.red_zone_targets, 4)
+        self.assertEqual(old.goal_line_carries, 1)
+        self.assertEqual(old.red_zone_carries, 5)
+
+    def test_goal_line_share_replaces_the_raw_td_rate(self) -> None:
+        player = _pl(name="Derrick Henry", team="BAL", position="RB")
+        common = dict(
+            position="RB",
+            player_name="Derrick Henry",
+            team_fd="BAL",
+            carries=20,
+            rushing_yards=90,
+            rushing_tds=2,
+        )
+        raw = DataEfficiency(
+            SimInputs(player_weeks=(_week(1, **common),)),
+            before_week=2,
+        ).rates_for(player, "RB")
+        even = DataEfficiency(
+            SimInputs(
+                player_weeks=(_week(1, goal_line_carries=20 * 0.08, **common),)
+            ),
+            before_week=2,
+        ).rates_for(player, "RB")
+        high = DataEfficiency(
+            SimInputs(
+                player_weeks=(_week(1, goal_line_carries=4, **common),)
+            ),
+            before_week=2,
+        ).rates_for(player, "RB")
+        prior = position_rates("RB")["rush_td_per_carry"]
+        self.assertAlmostEqual(even["rush_td_per_carry"], prior, places=4)
+        self.assertGreater(high["rush_td_per_carry"], prior)
+        self.assertLessEqual(high["rush_td_per_carry"], prior * 2.0)
+        self.assertGreater(raw["rush_td_per_carry"], high["rush_td_per_carry"])
+
+    def test_red_zone_carry_share_is_used_when_goal_line_is_absent(self) -> None:
+        player = _pl(name="Derrick Henry", team="BAL", position="RB")
+        common = dict(
+            position="RB",
+            player_name="Derrick Henry",
+            team_fd="BAL",
+            carries=20,
+            rushing_tds=2,
+        )
+        even = DataEfficiency(
+            SimInputs(player_weeks=(_week(1, red_zone_carries=20 * 0.15, **common),)),
+            before_week=2,
+        ).rates_for(player, "RB")
+        both = DataEfficiency(
+            SimInputs(
+                player_weeks=(
+                    _week(1, red_zone_carries=10, goal_line_carries=20 * 0.08, **common),
+                )
+            ),
+            before_week=2,
+        ).rates_for(player, "RB")
+        prior = position_rates("RB")["rush_td_per_carry"]
+        self.assertAlmostEqual(even["rush_td_per_carry"], prior, places=4)
+        self.assertAlmostEqual(both["rush_td_per_carry"], prior, places=4)
+
+    def test_red_zone_target_share_sets_the_receiving_td_rate(self) -> None:
+        player = _pl(name="Amon-Ra St. Brown")
+        even = DataEfficiency(
+            SimInputs(
+                player_weeks=(
+                    _week(1, targets=10, receiving_tds=2, red_zone_targets=10 * 0.12),
+                )
+            )
+        ).rates_for(player, "WR")
+        high = DataEfficiency(
+            SimInputs(
+                player_weeks=(
+                    _week(1, targets=10, receiving_tds=2, red_zone_targets=4),
+                )
+            )
+        ).rates_for(player, "WR")
+        prior = position_rates("WR")["rec_td_per_target"]
+        self.assertAlmostEqual(even["rec_td_per_target"], prior, places=4)
+        self.assertGreater(high["rec_td_per_target"], prior)
+        self.assertLessEqual(high["rec_td_per_target"], prior * 2.0)
+
+    def test_air_yards_and_shares_move_yards_per_target(self) -> None:
+        player = _pl(name="Amon-Ra St. Brown")
+        base = dict(targets=10, receptions=7, receiving_yards=80)
+        plain = DataEfficiency(
+            SimInputs(player_weeks=(_week(1, **base),))
+        ).rates_for(player, "WR")
+        negative = DataEfficiency(
+            SimInputs(player_weeks=(_week(1, receiving_air_yards=-20, **base),))
+        ).rates_for(player, "WR")
+        shared = DataEfficiency(
+            SimInputs(
+                player_weeks=(
+                    _week(1, target_share=0.25, air_yards_share=0.40, **base),
+                )
+            )
+        ).rates_for(player, "WR")
+        self.assertLess(negative["yards_per_target"], plain["yards_per_target"])
+        self.assertGreater(shared["yards_per_target"], plain["yards_per_target"])
+
+    def test_team_stat_maps_live_names_and_pace(self) -> None:
+        row = team_stat_from_row(
+            {
+                "team_fd": "NO",
+                "side": "defense",
+                "yards_per_carry": 5.2,
+                "yards_per_dropback": 7.1,
+                "sack_rate": 6.5,
+                "pace_plays": 140,
+                "pace_games": 2,
+            }
+        )
+        assert row is not None
+        self.assertAlmostEqual(row.yards_per_carry or 0, 5.2)
+        self.assertAlmostEqual(row.yards_per_carry_allowed or 0, 5.2)
+        self.assertAlmostEqual(row.yards_per_dropback or 0, 7.1)
+        self.assertAlmostEqual(row.yards_per_dropback_allowed or 0, 7.1)
+        self.assertAlmostEqual(row.sack_rate or 0, 0.065)
+        self.assertAlmostEqual(row.plays_per_game or 0, 70)
+        self.assertIsNone(row.seconds_per_play)
+
+    def test_yards_allowed_stay_inside_both_clamps(self) -> None:
+        defense = TeamStat(
+            team_fd="NO",
+            side="defense",
+            week=1,
+            yards_per_carry_allowed=6.5,
+            yards_per_dropback_allowed=8.0,
+            pass_n=800,
+            rush_n=800,
+            n=1600,
+        )
+        eff = DataEfficiency(SimInputs(team_weeks=(defense,)), before_week=2)
+        self.assertGreater(eff.pass_multiplier("NO"), 1.0)
+        self.assertLessEqual(eff.pass_multiplier("NO"), 1.0 + OPP_CLAMP)
+        self.assertGreater(eff.rush_multiplier("NO"), 1.0)
+        self.assertLessEqual(eff.rush_multiplier("NO"), 1.0 + OPP_CLAMP)
+        scale = eff.rush_budget_scale("DET", "NO", 0.92)
+        self.assertAlmostEqual(scale, 1.0 + COMBINED_CLAMP, places=4)
+        self.assertLess(scale, 1.242)
+
+    def test_plays_per_game_blends_and_seconds_do_not(self) -> None:
+        offense = TeamStat(
+            team_fd="DET",
+            side="offense",
+            plays_per_game=70,
+            pace_games=1,
+            seconds_per_play=10,
+        )
+        defense = TeamStat(
+            team_fd="NO",
+            side="defense",
+            plays_per_game=56,
+            pace_games=1,
+            seconds_per_play=40,
+        )
+        self.assertAlmostEqual(offense_plays_mu(offense), (70 + 63 * 4) / 5)
+        self.assertAlmostEqual(
+            offense_plays_mu(offense, defense),
+            (((70 + 63 * 4) / 5) + ((56 + 63 * 4) / 5)) / 2,
+        )
+        counted = TeamStat(
+            team_fd="DET",
+            side="offense",
+            pass_n=35,
+            rush_n=25,
+            seconds_per_play=12,
+        )
+        self.assertAlmostEqual(offense_plays_mu(counted), 60)
+        self.assertAlmostEqual(
+            offense_plays_mu(TeamStat(team_fd="DET", seconds_per_play=100)),
+            LEAGUE_PLAYS,
+        )

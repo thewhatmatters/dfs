@@ -119,6 +119,9 @@ class SimFeedTest(unittest.TestCase):
         ), patch(
             "nfl.sim_feed.fetch_player_stats_weekly",
             return_value=([], {"cache_stale": False}),
+        ), patch(
+            "nfl.sim_feed.fetch_player_usage",
+            return_value=([], {"cache_stale": False}),
         ), patch("nfl.gangstash.http_json", side_effect=AssertionError("network")):
             inputs, note = resolve_sim_inputs(
                 path=None,
@@ -167,6 +170,8 @@ class SimFeedTest(unittest.TestCase):
             "nfl.sim_feed.fetch_snaps", side_effect=missing
         ), patch(
             "nfl.sim_feed.fetch_player_stats_weekly", side_effect=missing
+        ), patch(
+            "nfl.sim_feed.fetch_player_usage", side_effect=missing
         ), patch("nfl.gangstash.http_json", side_effect=AssertionError("network")):
             inputs, note = resolve_sim_inputs(path=None, season=2026, weeks=[1, 2])
         self.assertIsNone(inputs)
@@ -187,8 +192,14 @@ class SimFeedTest(unittest.TestCase):
         ), patch(
             "nfl.sim_feed.fetch_player_stats_weekly",
             return_value=([], {"cache_stale": False}),
-        ):
+        ), patch(
+            "nfl.sim_feed.fetch_player_usage",
+            return_value=([], {"cache_stale": False}),
+        ) as usage:
             inputs, _note = resolve_sim_inputs(path=None, season=2025, weeks=None)
+        usage.assert_called_once()
+        self.assertEqual(usage.call_args.kwargs["season"], 2025)
+        self.assertIsNone(usage.call_args.kwargs["weeks"])
         weekly.assert_not_called()
         det = next(row for row in inputs.team_stats if row.team_fd == "DET" and row.is_offense)
         self.assertAlmostEqual(det.neutral_pass_rate, 0.58, places=6)
@@ -213,6 +224,9 @@ class SimFeedTest(unittest.TestCase):
             return_value=([], {"cache_stale": False}),
         ), patch(
             "nfl.sim_feed.fetch_player_stats_weekly",
+            return_value=([], {"cache_stale": False}),
+        ), patch(
+            "nfl.sim_feed.fetch_player_usage",
             return_value=([], {"cache_stale": False}),
         ):
             inputs, _note = resolve_sim_inputs(path=None, season=2026, weeks=None)
@@ -269,6 +283,9 @@ class SimFeedTest(unittest.TestCase):
         ), patch(
             "nfl.sim_feed.fetch_player_stats_weekly",
             return_value=([], {"cache_stale": False}),
+        ), patch(
+            "nfl.sim_feed.fetch_player_usage",
+            return_value=([], {"cache_stale": False}),
         ), patch("nfl.gangstash.http_json", side_effect=AssertionError("network")):
             inputs, note = resolve_sim_inputs(
                 path=None,
@@ -288,7 +305,9 @@ class SimFeedTest(unittest.TestCase):
     def test_week_1_weekly_scope_has_no_team_board(self) -> None:
         with patch("nfl.sim_feed.fetch_team_stats") as stats, patch(
             "nfl.sim_feed.fetch_team_stats_weekly"
-        ) as weekly, patch("nfl.gangstash.http_json", side_effect=AssertionError("network")):
+        ) as weekly, patch("nfl.sim_feed.fetch_player_usage") as usage, patch(
+            "nfl.gangstash.http_json", side_effect=AssertionError("network")
+        ):
             inputs, note = resolve_sim_inputs(
                 path=None,
                 season=2026,
@@ -297,8 +316,121 @@ class SimFeedTest(unittest.TestCase):
             )
         stats.assert_not_called()
         weekly.assert_not_called()
+        usage.assert_not_called()
         self.assertIsNone(inputs)
         self.assertEqual(note, UNAVAILABLE_NOTE)
+
+    def test_player_usage_is_prior_weeks_only_and_merges_shares(self) -> None:
+        usage = [
+            {
+                "season": 2026,
+                "week": 1,
+                "gsis_id": "00-ARSB",
+                "team": "DET",
+                "position": "WR",
+                "targets": 10,
+                "target_share": 0.40,
+                "air_yards_share": 0.20,
+                "rz_targets": 2,
+                "receiving_air_yards": -5,
+            },
+            {
+                "season": 2026,
+                "week": 2,
+                "gsis_id": "00-LATE",
+                "team": "DET",
+                "position": "WR",
+                "targets": 8,
+                "target_share": 0.30,
+            },
+            {
+                "season": 2026,
+                "week": 1,
+                "gsis_id": "00-WOPR",
+                "team": "DET",
+                "position": "WR",
+                "wopr": 0.44,
+            },
+            {
+                "season": 2026,
+                "week": 1,
+                "gsis_id": "00-OL",
+                "team": "DET",
+                "position": "OL",
+                "targets": 0,
+                "target_share": 0,
+            },
+        ]
+        targets = [
+            {
+                "season": 2026,
+                "week": 1,
+                "position": "WR",
+                "player_name": "Amon-Ra St. Brown",
+                "team_fd": "DET",
+                "targets": 10,
+                "target_share": 0.20,
+                "gsis_id": "00-ARSB",
+                "team_targets": 30,
+            },
+            {
+                "season": 2026,
+                "week": 1,
+                "position": "WR",
+                "player_name": "Lineman",
+                "team_fd": "DET",
+                "targets": 1,
+                "target_share": 0.22,
+                "gsis_id": "00-OL",
+                "team_targets": 30,
+            },
+        ]
+        stats = [
+            {
+                "season": 2026,
+                "week": 1,
+                "player_name": "Amon-Ra St. Brown",
+                "team_fd": "DET",
+                "position": "WR",
+                "gsis_id": "00-ARSB",
+                "targets": 10,
+                "receptions": 7,
+                "receiving_yards": 80,
+            }
+        ]
+        with patch(
+            "nfl.sim_feed.fetch_team_stats", return_value=([], {"cache_stale": False})
+        ), patch(
+            "nfl.sim_feed.fetch_team_stats_weekly",
+            return_value=([], {"cache_stale": False}),
+        ), patch(
+            "nfl.sim_feed.fetch_targets",
+            return_value=(targets, {"cache_stale": False}),
+        ), patch(
+            "nfl.sim_feed.fetch_snaps", return_value=([], {"cache_stale": False})
+        ), patch(
+            "nfl.sim_feed.fetch_player_stats_weekly",
+            return_value=(stats, {"cache_stale": False}),
+        ), patch(
+            "nfl.sim_feed.fetch_player_usage",
+            return_value=(usage, {"cache_stale": False}),
+        ) as fetched, patch("nfl.gangstash.http_json", side_effect=AssertionError("network")):
+            inputs, note = resolve_sim_inputs(path=None, season=2026, weeks=[1])
+        self.assertEqual(fetched.call_args.kwargs["weeks"], [1])
+        self.assertEqual(fetched.call_args.kwargs["season"], 2026)
+        self.assertIn("usage 3", note)
+        ids = {row.gsis_id for row in inputs.player_weeks}
+        self.assertNotIn("00-LATE", ids)
+        self.assertIn("00-WOPR", ids)
+        arsb = next(row for row in inputs.targets if row.gsis_id == "00-ARSB")
+        self.assertAlmostEqual(arsb.target_share or 0, 0.275, places=6)
+        lined = next(row for row in inputs.targets if row.gsis_id == "00-OL")
+        self.assertAlmostEqual(lined.target_share or 0, 0.22, places=6)
+        week = next(row for row in inputs.player_weeks if row.gsis_id == "00-ARSB")
+        self.assertEqual(week.red_zone_targets, 2)
+        self.assertAlmostEqual(week.receiving_air_yards or 0, -5)
+        wopr = next(row for row in inputs.targets if row.gsis_id == "00-WOPR")
+        self.assertAlmostEqual(wopr.target_share or 0, 0.44 / 2.2, places=6)
 
 
 if __name__ == "__main__":

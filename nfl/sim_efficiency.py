@@ -98,7 +98,16 @@ RZ_TARGET_TD_BLEND = 0.10
 LEAGUE_RZ_TARGET_SHARE = 0.12
 GL_CARRY_TD_BLEND = 0.10
 LEAGUE_GL_CARRY_SHARE = 0.08
-LEAGUE_SACK_RATE = 0.07
+# Inside-the-20 carry share. Wider than the goal line. Used only when
+# goal-line carries are absent and red-zone carries are present.
+LEAGUE_RZ_CARRY_SHARE = 0.15
+OPPORTUNITY_TD_LO = 0.5
+OPPORTUNITY_TD_HI = 2.0
+# Weeks 1–2 league offense. Opponent yards use these, not the scoring priors.
+LEAGUE_YARDS_PER_CARRY = 4.3
+LEAGUE_YARDS_PER_DROPBACK = 6.0
+LEAGUE_AIR_YARDS_PER_ATTEMPT = 7.4
+LEAGUE_SACK_RATE = 0.065
 SACK_TO_MULT = 0.50
 
 
@@ -327,18 +336,46 @@ class _Sums:
     passing_tds: float = 0.0
     air_yards: float | None = None
     red_zone_targets: float | None = None
+    red_zone_carries: float | None = None
     goal_line_carries: float | None = None
+    rz_target_n: float = 0.0
+    rz_carry_n: float = 0.0
+    gl_carry_n: float = 0.0
+    air_share_num: float = 0.0
+    air_share_den: float = 0.0
+    tgt_share_num: float = 0.0
+    tgt_share_den: float = 0.0
 
     def add(self, week: PlayerWeek) -> "_Sums":
         air = self.air_yards
         if week.receiving_air_yards is not None:
             air = (air or 0.0) + float(week.receiving_air_yards)
         rz = self.red_zone_targets
+        rz_n = self.rz_target_n
         if week.red_zone_targets is not None:
             rz = (rz or 0.0) + float(week.red_zone_targets)
+            rz_n += float(week.targets)
+        rz_carries = self.red_zone_carries
+        rz_carry_n = self.rz_carry_n
+        if week.red_zone_carries is not None:
+            rz_carries = (rz_carries or 0.0) + float(week.red_zone_carries)
+            rz_carry_n += float(week.carries)
         gl = self.goal_line_carries
+        gl_n = self.gl_carry_n
         if week.goal_line_carries is not None:
             gl = (gl or 0.0) + float(week.goal_line_carries)
+            gl_n += float(week.carries)
+        air_num = self.air_share_num
+        air_den = self.air_share_den
+        tgt_num = self.tgt_share_num
+        tgt_den = self.tgt_share_den
+        if week.targets > 0:
+            if week.air_yards_share is not None:
+                air_num += float(week.air_yards_share) * float(week.targets)
+                air_den += float(week.targets)
+            if week.target_share is not None:
+                tgt_num += float(week.target_share) * float(week.targets)
+                tgt_den += float(week.targets)
         return _Sums(
             targets=self.targets + week.targets,
             receptions=self.receptions + week.receptions,
@@ -352,7 +389,15 @@ class _Sums:
             passing_tds=self.passing_tds + week.passing_tds,
             air_yards=air,
             red_zone_targets=rz,
+            red_zone_carries=rz_carries,
             goal_line_carries=gl,
+            rz_target_n=rz_n,
+            rz_carry_n=rz_carry_n,
+            gl_carry_n=gl_n,
+            air_share_num=air_num,
+            air_share_den=air_den,
+            tgt_share_num=tgt_num,
+            tgt_share_den=tgt_den,
         )
 
 
@@ -375,6 +420,51 @@ def _optional_factor(
     return 1.0 + blend * gap
 
 
+def _share_of(total: float | None, n: float) -> tuple[float, float]:
+    if total is None or n <= 0:
+        return 0.0, 0.0
+    return total / n, n
+
+
+def _opportunity_td_rate(
+    prior: float,
+    share: float,
+    n: float,
+    team_share: float,
+    team_n: float,
+    league_share: float,
+    league_n: float,
+    league_constant: float,
+    *,
+    player_prior: float,
+    team_prior: float,
+    league_prior: float,
+) -> float:
+    """Position prior times a shrunk opportunity-share ratio.
+
+    The raw TD rate is not in this path. A one-week spike with a normal
+    red-zone or goal-line share stays on the prior.
+    """
+    shrunk = _blend_level(
+        share,
+        n,
+        team_share,
+        team_n,
+        league_share,
+        league_n,
+        league_constant,
+        player_prior=player_prior,
+        team_prior=team_prior,
+        league_prior=league_prior,
+    )
+    if league_constant <= 0:
+        return prior
+    ratio = clamp(shrunk / league_constant, OPPORTUNITY_TD_LO, OPPORTUNITY_TD_HI)
+    if ratio == 1.0:
+        return prior
+    return prior * ratio
+
+
 @dataclass
 class _Side:
     pass_epa: float | None = None
@@ -387,6 +477,7 @@ class _Side:
     rush_n: float = 0.0
     rz_n: float = 0.0
     yards_per_carry_allowed: float | None = None
+    yards_per_dropback_allowed: float | None = None
     yards_per_attempt_allowed: float | None = None
     sack_rate: float | None = None
 
@@ -445,9 +536,24 @@ def _weighted(rows: list[TeamStat]) -> _Side:
         _rush_n,
     )
     rz, rz_n = _acc(lambda row: row.red_zone_td_rate, lambda row: float(row.n or 0))
-    ypc, _ = _acc(lambda row: row.yards_per_carry_allowed, _rush_n)
+
+    def _first(row: TeamStat, *attrs: str) -> float | None:
+        for attr in attrs:
+            val = getattr(row, attr)
+            if val is not None:
+                return val
+        return None
+
+    ypc, _ = _acc(
+        lambda row: _first(row, "yards_per_carry_allowed", "yards_per_carry"),
+        _rush_n,
+    )
+    ydb, _ = _acc(
+        lambda row: _first(row, "yards_per_dropback_allowed", "yards_per_dropback"),
+        _pass_n,
+    )
     ypa, _ = _acc(
-        lambda row: row.yards_per_attempt_allowed or row.yards_per_dropback_allowed,
+        lambda row: _first(row, "yards_per_attempt_allowed", "yards_per_pass_attempt"),
         _pass_n,
     )
     sack, _ = _acc(lambda row: row.sack_rate, _pass_n)
@@ -462,6 +568,7 @@ def _weighted(rows: list[TeamStat]) -> _Side:
         rush_n=rush_n,
         rz_n=rz_n,
         yards_per_carry_allowed=ypc,
+        yards_per_dropback_allowed=ydb,
         yards_per_attempt_allowed=ypa,
         sack_rate=sack,
     )
@@ -554,30 +661,60 @@ class DataEfficiency:
             team_prior=TEAM_PRIOR_TARGETS,
             league_prior=LEAGUE_PRIOR_TARGETS,
         )
+        air = player_sums.air_yards
+        if (
+            air is None
+            and player_sums.air_share_den > 0
+            and player_sums.tgt_share_den > 0
+            and player_sums.targets > 0
+        ):
+            tgt_share = player_sums.tgt_share_num / player_sums.tgt_share_den
+            if tgt_share > 0:
+                air_share = player_sums.air_share_num / player_sums.air_share_den
+                adot = (air_share / tgt_share) * LEAGUE_AIR_YARDS_PER_ATTEMPT
+                air = adot * player_sums.targets
         out["yards_per_target"] *= _optional_factor(
-            player_sums.air_yards,
+            air,
             player_sums.targets,
             LEAGUE_AIR_YARDS_PER_TARGET,
             AIR_YARDS_BLEND,
         )
-        out["rec_td_per_target"] = _blend_level(
-            _rate(player_sums.receiving_tds, player_sums.targets),
-            player_sums.targets,
-            _rate(team_sums.receiving_tds, team_sums.targets),
-            team_sums.targets,
-            _rate(league_sums.receiving_tds, league_sums.targets),
-            league_sums.targets,
-            base["rec_td_per_target"],
-            player_prior=PRIOR_TARGETS,
-            team_prior=TEAM_PRIOR_TARGETS,
-            league_prior=LEAGUE_PRIOR_TARGETS,
-        )
-        out["rec_td_per_target"] *= _optional_factor(
-            player_sums.red_zone_targets,
-            player_sums.targets,
-            LEAGUE_RZ_TARGET_SHARE,
-            RZ_TARGET_TD_BLEND,
-        )
+        if player_sums.red_zone_targets is not None:
+            p_share, p_n = _share_of(player_sums.red_zone_targets, player_sums.rz_target_n)
+            t_share, t_n = _share_of(team_sums.red_zone_targets, team_sums.rz_target_n)
+            l_share, l_n = _share_of(league_sums.red_zone_targets, league_sums.rz_target_n)
+            out["rec_td_per_target"] = _opportunity_td_rate(
+                base["rec_td_per_target"],
+                p_share,
+                p_n,
+                t_share,
+                t_n,
+                l_share,
+                l_n,
+                LEAGUE_RZ_TARGET_SHARE,
+                player_prior=PRIOR_TARGETS,
+                team_prior=TEAM_PRIOR_TARGETS,
+                league_prior=LEAGUE_PRIOR_TARGETS,
+            )
+        else:
+            out["rec_td_per_target"] = _blend_level(
+                _rate(player_sums.receiving_tds, player_sums.targets),
+                player_sums.targets,
+                _rate(team_sums.receiving_tds, team_sums.targets),
+                team_sums.targets,
+                _rate(league_sums.receiving_tds, league_sums.targets),
+                league_sums.targets,
+                base["rec_td_per_target"],
+                player_prior=PRIOR_TARGETS,
+                team_prior=TEAM_PRIOR_TARGETS,
+                league_prior=LEAGUE_PRIOR_TARGETS,
+            )
+            out["rec_td_per_target"] *= _optional_factor(
+                player_sums.red_zone_targets,
+                player_sums.targets,
+                LEAGUE_RZ_TARGET_SHARE,
+                RZ_TARGET_TD_BLEND,
+            )
         out["yards_per_carry"] = _blend_level(
             _rate(player_sums.rushing_yards, player_sums.carries),
             player_sums.carries,
@@ -590,24 +727,52 @@ class DataEfficiency:
             team_prior=TEAM_PRIOR_CARRIES,
             league_prior=LEAGUE_PRIOR_CARRIES,
         )
-        out["rush_td_per_carry"] = _blend_level(
-            _rate(player_sums.rushing_tds, player_sums.carries),
-            player_sums.carries,
-            _rate(team_sums.rushing_tds, team_sums.carries),
-            team_sums.carries,
-            _rate(league_sums.rushing_tds, league_sums.carries),
-            league_sums.carries,
-            base["rush_td_per_carry"],
-            player_prior=PRIOR_CARRIES,
-            team_prior=TEAM_PRIOR_CARRIES,
-            league_prior=LEAGUE_PRIOR_CARRIES,
-        )
-        out["rush_td_per_carry"] *= _optional_factor(
-            player_sums.goal_line_carries,
-            player_sums.carries,
-            LEAGUE_GL_CARRY_SHARE,
-            GL_CARRY_TD_BLEND,
-        )
+        if player_sums.goal_line_carries is not None:
+            p_share, p_n = _share_of(player_sums.goal_line_carries, player_sums.gl_carry_n)
+            t_share, t_n = _share_of(team_sums.goal_line_carries, team_sums.gl_carry_n)
+            l_share, l_n = _share_of(league_sums.goal_line_carries, league_sums.gl_carry_n)
+            league_share = LEAGUE_GL_CARRY_SHARE
+        elif player_sums.red_zone_carries is not None:
+            p_share, p_n = _share_of(player_sums.red_zone_carries, player_sums.rz_carry_n)
+            t_share, t_n = _share_of(team_sums.red_zone_carries, team_sums.rz_carry_n)
+            l_share, l_n = _share_of(league_sums.red_zone_carries, league_sums.rz_carry_n)
+            league_share = LEAGUE_RZ_CARRY_SHARE
+        else:
+            p_share = None
+            league_share = LEAGUE_GL_CARRY_SHARE
+        if p_share is None:
+            out["rush_td_per_carry"] = _blend_level(
+                _rate(player_sums.rushing_tds, player_sums.carries),
+                player_sums.carries,
+                _rate(team_sums.rushing_tds, team_sums.carries),
+                team_sums.carries,
+                _rate(league_sums.rushing_tds, league_sums.carries),
+                league_sums.carries,
+                base["rush_td_per_carry"],
+                player_prior=PRIOR_CARRIES,
+                team_prior=TEAM_PRIOR_CARRIES,
+                league_prior=LEAGUE_PRIOR_CARRIES,
+            )
+            out["rush_td_per_carry"] *= _optional_factor(
+                player_sums.goal_line_carries,
+                player_sums.carries,
+                LEAGUE_GL_CARRY_SHARE,
+                GL_CARRY_TD_BLEND,
+            )
+        else:
+            out["rush_td_per_carry"] = _opportunity_td_rate(
+                base["rush_td_per_carry"],
+                p_share,
+                p_n,
+                t_share,
+                t_n,
+                l_share,
+                l_n,
+                league_share,
+                player_prior=PRIOR_CARRIES,
+                team_prior=TEAM_PRIOR_CARRIES,
+                league_prior=LEAGUE_PRIOR_CARRIES,
+            )
         out["yards_per_attempt"] = _blend_level(
             _rate(player_sums.passing_yards, player_sums.pass_attempts),
             player_sums.pass_attempts,
@@ -645,9 +810,13 @@ class DataEfficiency:
             side.pass_success,
             LEAGUE_PASS_SUCCESS,
         )
-        if side.yards_per_attempt_allowed is not None and PASS_YPA > 0:
-            ratio = side.yards_per_attempt_allowed / PASS_YPA
-            mult = 0.5 * mult + 0.5 * ratio
+        yard = None
+        if side.yards_per_dropback_allowed is not None and LEAGUE_YARDS_PER_DROPBACK > 0:
+            yard = side.yards_per_dropback_allowed / LEAGUE_YARDS_PER_DROPBACK
+        elif side.yards_per_attempt_allowed is not None and PASS_YPA > 0:
+            yard = side.yards_per_attempt_allowed / PASS_YPA
+        if yard is not None:
+            mult = 0.5 * mult + 0.5 * yard
         if side.sack_rate is not None:
             mult *= 1.0 - SACK_TO_MULT * (side.sack_rate - LEAGUE_SACK_RATE)
         return clamp(mult, 1.0 - OPP_CLAMP, 1.0 + OPP_CLAMP)
@@ -724,11 +893,9 @@ class DataEfficiency:
             side.rush_success,
             LEAGUE_RUSH_SUCCESS,
         )
-        if side.yards_per_carry_allowed is not None:
-            league_ypc = YARDS_PER_RUSH.get("RB", 4.4)
-            if league_ypc > 0:
-                ratio = side.yards_per_carry_allowed / league_ypc
-                mult = 0.5 * mult + 0.5 * ratio
+        if side.yards_per_carry_allowed is not None and LEAGUE_YARDS_PER_CARRY > 0:
+            ratio = side.yards_per_carry_allowed / LEAGUE_YARDS_PER_CARRY
+            mult = 0.5 * mult + 0.5 * ratio
         return clamp(mult, 1.0 - OPP_CLAMP, 1.0 + OPP_CLAMP)
 
     def td_multiplier(self, team: str | None, opponent: str | None) -> float:
@@ -937,8 +1104,9 @@ class DataEfficiency:
         team = week.team_fd.upper()
         self._team_pos[(team, pos)] = self._team_pos.get((team, pos), _Sums()).add(week)
         self._league_pos[pos] = self._league_pos.get(pos, _Sums()).add(week)
-        name_key = (team, match_key(week.player_name))
-        self._by_name[name_key] = self._by_name.get(name_key, _Sums()).add(week)
+        if week.player_name:
+            name_key = (team, match_key(week.player_name))
+            self._by_name[name_key] = self._by_name.get(name_key, _Sums()).add(week)
         for ident in (week.gsis_id, week.player_id):
             if ident:
                 self._by_id[ident] = self._by_id.get(ident, _Sums()).add(week)

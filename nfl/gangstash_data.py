@@ -889,6 +889,42 @@ def parse_player_stat_row(row: dict) -> dict | None:
     }
 
 
+def fetch_player_usage(
+    *,
+    season: int,
+    week: int | None = None,
+    weeks: list[int] | None = None,
+    team: str | None = None,
+    gsis_id: str | None = None,
+    position: str | None = None,
+    refresh: bool = False,
+    cache_day: date | None = None,
+) -> tuple[list[dict], dict]:
+    """`dataset=player_usage`. `season` is required. One row per player-week.
+
+    Optional filters: `week`, `team`, `gsis_id`, `position`. Rows stay raw.
+    The sim feed passes season and weeks only.
+    """
+    if int(season) < 1:
+        raise GangstashDataError("gangstash player_usage requires season")
+    week_list = list(weeks) if weeks else ([int(week)] if week is not None else [])
+    params: dict[str, str] = {"season": str(int(season))}
+    if week_list:
+        params["week"] = ",".join(str(int(w)) for w in week_list)
+    if team:
+        params["team"] = team.strip().upper()
+    if gsis_id:
+        params["gsis_id"] = gsis_id.strip()
+    if position:
+        params["position"] = position.strip().upper()
+    return fetch_dataset(
+        dataset_id("player_usage"),
+        params,
+        refresh=refresh,
+        cache_day=cache_day,
+    )
+
+
 def fetch_dst_weekly(
     *,
     season: int,

@@ -26,7 +26,7 @@ from nfl.injuries import injury_rows_from_records
 from nfl.props import props_for_week
 from nfl.sim import simulate_games
 from nfl.gangstash import GangstashDataError, GangstashDataKeyMissing, dataset_cache_file
-from nfl.gangstash_data import fetch_player_stats_weekly
+from nfl.gangstash_data import fetch_player_stats_weekly, fetch_player_usage
 from nfl.players import Player
 from nfl.projections import week1_score
 from nfl.sim_inputs import sim_inputs_from_records
@@ -71,6 +71,26 @@ class PlayerStatsReaderTest(unittest.TestCase):
         self.assertEqual(fetch.call_args.args[0], "player_stats_weekly")
         self.assertEqual(fetch.call_args.args[1]["season"], "2026")
         self.assertEqual(fetch.call_args.args[1]["week"], "2")
+
+    def test_player_usage_query_is_optional_filters(self) -> None:
+        with patch(
+            "nfl.gangstash_data.fetch_dataset",
+            return_value=([], {"cache": "x"}),
+        ) as fetch:
+            fetch_player_usage(
+                season=2026,
+                weeks=[1],
+                team="DET",
+                gsis_id="00-ARSB",
+                position="WR",
+            )
+        self.assertEqual(fetch.call_args.args[0], "player_usage")
+        params = fetch.call_args.args[1]
+        self.assertEqual(params["season"], "2026")
+        self.assertEqual(params["week"], "1")
+        self.assertEqual(params["team"], "DET")
+        self.assertEqual(params["gsis_id"], "00-ARSB")
+        self.assertEqual(params["position"], "WR")
 
     def test_same_day_cache_skips_the_network(self) -> None:
         day = date(2026, 9, 20)
