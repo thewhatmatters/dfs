@@ -341,5 +341,78 @@ class ReportTest(unittest.TestCase):
         self.assertIsNone(resolved[0]["home_p10"])
 
 
+class SimGameResultsTest(unittest.TestCase):
+    def test_simulate_games_feeds_the_report_sim_scores(self) -> None:
+        from nfl.players import Player
+        from nfl.projections import week1_score
+        from nfl.report import fmt_points
+        from nfl.sim import GameSim, simulate_games
+
+        def player(
+            pid: str,
+            name: str,
+            team: str,
+            opponent: str,
+            implied: float,
+            implied_opp: float,
+        ) -> Player:
+            return Player(
+                pid=pid,
+                name=name,
+                position="QB",
+                salary=8000,
+                team=team,
+                opponent=opponent,
+                game="KC@BUF",
+                fppg=None,
+                injury="",
+                roster_position="",
+                implied_total=implied,
+                implied_opp=implied_opp,
+                objective=week1_score(
+                    implied,
+                    depth_rank=1,
+                    position="QB",
+                    implied_opp=implied_opp,
+                ),
+                depth_rank=1,
+            )
+
+        kc = player("qb-kc", "Patrick Mahomes", "KC", "BUF", 22.0, 25.5)
+        buf = player("qb-buf", "Josh Allen", "BUF", "KC", 25.5, 22.0)
+        n = 20
+        sim = simulate_games([kc, buf], n=n, seed=7)
+        bare = GameSim(by_pid={}, draws={})
+        self.assertEqual(bare.game_draws, ())
+        self.assertEqual(len(sim.game_draws), n)
+        self.assertEqual(len(sim.draws[kc.pid]), n)
+        for game, away, home, away_pts, home_pts in sim.game_draws:
+            self.assertEqual((game, away, home), ("KC@BUF", "KC", "BUF"))
+            self.assertIsInstance(away_pts, float)
+            self.assertIsInstance(home_pts, float)
+        summaries = summarize_game_draws(sim.game_draws)
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["source"], "sim")
+        rows = [
+            _row("Patrick Mahomes", "KC", "BUF", "QB", sim.by_pid[kc.pid].mean, 9000),
+            _row("Josh Allen", "BUF", "KC", "QB", sim.by_pid[buf.pid].mean, 8800),
+        ]
+        text = build_report(
+            rows,
+            sim.game_draws,
+            season=2026,
+            week=3,
+            run_at=RUN,
+            draws=n,
+            efficiency="data",
+        )
+        self.assertNotIn(VEGAS_LABEL, text)
+        self.assertIn("[ GAMES ]", text)
+        self.assertIn(fmt_points(summaries[0]["away_median"]), text)
+        self.assertIn(fmt_points(summaries[0]["home_median"]), text)
+        self.assertIn(fmt_points(summaries[0]["away_p10"]), text)
+        self.assertIn(fmt_points(summaries[0]["home_p90"]), text)
+
+
 if __name__ == "__main__":
     unittest.main()
