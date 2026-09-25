@@ -19,6 +19,14 @@ and prints one line. A sim-input cache marked stale exits non-zero.
 `--dry-run` writes `nfl/data/projections/` (gitignored) and does not POST.
 It does not need `GANGSTASH_PROJECTIONS_WRITER_KEY`.
 
+`--report` writes `nfl/reports/<season>-w<week>-<YYYY-MM-DD>.md` after a
+successful POST or `--dry-run` and prints that path. The same run writes
+`nfl/reports/<season>-w<week>-games.json` (team median and p10/p90) when
+the sim returned game draws. `python3 -m nfl.report --season --week`
+reads the stored `model=sim` rows. It shows those sim scores when the
+sidecar `run_at` matches, and gangstash implied totals otherwise.
+`--csv` fills a null salary from a FanDuel players list. A player whose whole game has no rows in that file shows `off slate` in the salary cell. A missing player in a listed game still shows `—`.
+
 ## Keys
 
 | env | role |

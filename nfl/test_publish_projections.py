@@ -339,6 +339,7 @@ class SimGuardTest(unittest.TestCase):
         class Result:
             def __init__(self) -> None:
                 self.by_pid = {}
+                self.game_draws = (("KC@BUF", "KC", "BUF", 21.0, 24.0),)
 
         seen: dict = {}
 
@@ -358,9 +359,11 @@ class SimGuardTest(unittest.TestCase):
             "nfl.sim_feed.resolve_sim_inputs",
             return_value=(bundle, "sim inputs: test"),
         ):
-            by_pid, mode = maybe_sim(entries, 25, 3, season=2026, refresh=True)
+            out = maybe_sim(entries, 25, 3, season=2026, refresh=True)
+        by_pid, mode = out
         self.assertEqual(by_pid, {})
         self.assertEqual(mode, "data")
+        self.assertEqual(out.game_draws, (("KC@BUF", "KC", "BUF", 21.0, 24.0),))
         self.assertIs(seen["inputs"], bundle)
         self.assertEqual(seen["n"], 25)
         self.assertEqual(seen["seed"], 3)
@@ -481,8 +484,10 @@ class SimGuardTest(unittest.TestCase):
             "nfl.sim_feed.resolve_sim_inputs",
             return_value=(bundle, "sim inputs: test"),
         ):
-            by_pid, mode = maybe_sim(entries, 40, 1, season=2026, refresh=True)
+            out = maybe_sim(entries, 40, 1, season=2026, refresh=True)
+        by_pid, mode = out
         self.assertEqual(mode, "data")
+        self.assertTrue(out.game_draws)
         direct = simulate_games(players, n=40, seed=1, inputs=bundle).by_pid
         adjusted = {
             pl.pid: pl
@@ -724,6 +729,87 @@ class WriteLocalTest(unittest.TestCase):
         self.assertEqual(body["rows"][0]["player_name"], rows[0]["player_name"])
         self.assertIn("player_name", text)
         self.assertIn("gs-depth", text)
+
+
+class ReportFlagTest(unittest.TestCase):
+    def _entries(self):
+        return build_entries(
+            [_line()],
+            [
+                _depth("Patrick Mahomes", "KC", "QB", 1, "00-0033873"),
+                _depth("Josh Allen", "BUF", "QB", 1, "00-0034857"),
+            ],
+        )
+
+    def test_dry_run_writes_report_and_sidecar(self) -> None:
+        import io
+        import tempfile
+        from contextlib import redirect_stderr, redirect_stdout
+        from pathlib import Path
+
+        from nfl.publish_projections import SimResult
+
+        entries = self._entries()
+
+        class Stats:
+            mean = 12.5
+            p10 = 6.0
+            p50 = 11.0
+            p90 = 20.0
+
+        draws = tuple(
+            ("KC@BUF", "KC", "BUF", float(i), float(i) + 3) for i in range(1, 11)
+        )
+        result = SimResult(
+            {entry.player.pid: Stats() for entry in entries},
+            "data",
+            draws,
+        )
+
+        def load(_args, _today):
+            return 2026, 3, entries
+
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as reports:
+            out = io.StringIO()
+            err = io.StringIO()
+            with patch("nfl.publish_projections.load_slate", load), patch(
+                "nfl.publish_projections.maybe_sim", return_value=result
+            ), patch(
+                "nfl.publish_projections.model_version", return_value="abc1234"
+            ), patch("nfl.publish_projections.post_projection_rows") as post, patch(
+                "nfl.report.REPORTS_DIR", Path(reports)
+            ), redirect_stdout(out), redirect_stderr(err):
+                rc = main(["--dry-run", "--report", "--sim", "10", "--out-dir", tmp])
+            written = list(Path(reports).glob("*.md"))
+            sidecar = list(Path(reports).glob("*-games.json"))
+            self.assertEqual(len(written), 1)
+            self.assertEqual(len(sidecar), 1)
+            report_text = written[0].read_text(encoding="utf-8")
+            body = json.loads(sidecar[0].read_text(encoding="utf-8"))
+            report_path = str(written[0])
+        post.assert_not_called()
+        self.assertEqual(rc, 0)
+        path = out.getvalue().strip().splitlines()[-1]
+        self.assertEqual(path, report_path)
+        self.assertIn("run_at", body)
+        self.assertAlmostEqual(body["games"][0]["away_median"], 5.5)
+        self.assertIn("draws 10", report_text)
+
+    def test_failed_post_does_not_write_the_report(self) -> None:
+        from nfl.publish_projections import PublishError, SimResult
+
+        entries = self._entries()
+        with patch("nfl.publish_projections.projections_key", return_value="sekrit"), patch(
+            "nfl.publish_projections.load_slate", return_value=(2026, 3, entries)
+        ), patch(
+            "nfl.publish_projections.maybe_sim", return_value=SimResult({}, "data")
+        ), patch(
+            "nfl.publish_projections.post_projection_rows",
+            side_effect=PublishError("nope"),
+        ), patch("nfl.report.write_report") as write:
+            rc = main(["--report", "--sim", "10"])
+        self.assertEqual(rc, 1)
+        write.assert_not_called()
 
 
 if __name__ == "__main__":
