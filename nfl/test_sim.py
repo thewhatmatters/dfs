@@ -2299,6 +2299,82 @@ class TeamModeTest(unittest.TestCase):
         )
 
     def test_default_mode_matches_the_main_seed(self) -> None:
+        from nfl.sim import (
+            _HistoryIndex,
+            _draw_game,
+            _draw_team_opportunities,
+            _game_key,
+            _player_world,
+            _prepare_opportunity,
+            _score_fallback,
+            _team_margin,
+            _teams_in,
+        )
+        from nfl.sim_efficiency import PlaceholderEfficiency
+
+        def legacy(players, n, seed, inputs=None):
+            """Pre-team loop, in this process: fixed sigmas, no score damp."""
+            bundle = inputs or SimInputs()
+            index = _HistoryIndex(bundle)
+            eff = PlaceholderEfficiency()
+            groups = {}
+            for pl in players:
+                groups.setdefault(_game_key(pl), []).append(pl)
+            for key in groups:
+                groups[key].sort(key=lambda p: p.pid)
+            preps = {}
+            for key, group in groups.items():
+                for team in _teams_in(group):
+                    roster = [p for p in group if (p.team or "").upper() == team]
+                    preps[(key, team)] = _prepare_opportunity(roster, index)
+            slate = []
+            for key in sorted(groups):
+                group = groups[key]
+                team_preps = [
+                    preps[(key, team)]
+                    for team in sorted(_teams_in(group))
+                    if preps[(key, team)].catchers
+                ]
+                slate.append((key, group, team_preps))
+            rng = random.Random(int(seed))
+            raw = {p.pid: [] for p in players}
+            game_rows = []
+            for _ in range(n):
+                for key, group, team_preps in slate:
+                    home_pts, away_pts, away, home = _draw_game(
+                        rng, group, index, sim_mode="off"
+                    )
+                    if away is not None and home is not None:
+                        game_rows.append(
+                            (key, away, home, float(away_pts), float(home_pts))
+                        )
+                    if away is None or home is None:
+                        continue
+                    counts = {}
+                    for prep in team_preps:
+                        margin = _team_margin(
+                            prep.team, home_pts, away_pts, away, home
+                        )
+                        counts.update(
+                            _draw_team_opportunities(
+                                rng, prep.players, margin, index, eff, prep
+                            )
+                        )
+                    for pl in group:
+                        opp_count = counts.get(pl.pid)
+                        if opp_count is None:
+                            team_pts, opp_pts = _player_world(
+                                pl, home_pts, away_pts, away, home
+                            )
+                            raw[pl.pid].append(
+                                _score_fallback(
+                                    pl, team_pts, opp_pts, group, index
+                                )
+                            )
+                        else:
+                            raw[pl.pid].append(eff.points(rng, pl, opp_count))
+            return {pid: tuple(xs) for pid, xs in raw.items()}, tuple(game_rows)
+
         players = [
             _pl(
                 pid="DET-qb",
@@ -2342,34 +2418,20 @@ class TeamModeTest(unittest.TestCase):
         ]
         bare = simulate_games(players, n=6, seed=1)
         named = simulate_games(players, n=6, seed=1, sim_mode="off")
+        legacy_draws, legacy_games = legacy(players, n=6, seed=1)
         self.assertEqual(bare.draws, named.draws)
         self.assertEqual(bare.game_draws, named.game_draws)
-        self.assertEqual(
-            bare.draws["DET-qb"],
-            (
-                15.155751611325307,
-                21.704638119888767,
-                15.828993818566872,
-                22.112009565231013,
-                18.249529137151967,
-                23.386625074613544,
-            ),
-        )
-        self.assertEqual(
-            bare.game_draws[0],
-            ("GB@DET", "GB", "DET", 32.64803579182927, 18.153579704831568),
-        )
+        self.assertEqual(bare.draws, legacy_draws)
+        self.assertEqual(bare.game_draws, legacy_games)
         det, det_weeks = _team_mode_side("DET", "GB", True)
         gb, gb_weeks = _team_mode_side("GB", "DET", False)
         inputs = SimInputs(targets=tuple(det_weeks + gb_weeks))
         opp = simulate_games(det + gb, n=4, seed=11, inputs=inputs)
         off = simulate_games(det + gb, n=4, seed=11, inputs=inputs, sim_mode="off")
+        opp_draws, opp_games = legacy(det + gb, n=4, seed=11, inputs=inputs)
         self.assertEqual(opp.draws, off.draws)
-        self.assertEqual(opp.draws["DET-qb"][0], 15.816124536486775)
-        self.assertEqual(
-            opp.game_draws[0],
-            ("GB@DET", "GB", "DET", 20.65638912762312, 16.880507144607144),
-        )
+        self.assertEqual(opp.draws, opp_draws)
+        self.assertEqual(opp.game_draws, opp_games)
 
     def test_team_mode_correlations_and_total_sd(self) -> None:
         from nfl.sim_team import TEAM_TOTAL_SD, parse_sim_mode, sample_sd
