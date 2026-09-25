@@ -1233,6 +1233,23 @@ class LiveSmokeTest(unittest.TestCase):
             self.assertEqual(taylor["offense_snaps"], 61)
             self.assertAlmostEqual(float(taylor["offense_pct"]), 0.94)
 
+            stats, smeta_ts = fetch_team_stats(season=2026, refresh=True)
+            self.assertTrue(smeta_ts["live"])
+            self.assertGreater(len(stats), 0)
+            sides = {row.get("side") for row in stats}
+            self.assertIn("offense", sides)
+            self.assertIn("defense", sides)
+            offense = next(row for row in stats if row.get("side") == "offense")
+            for key in (
+                "team_fd",
+                "n",
+                "epa_sum",
+                "epa_sq_sum",
+                "neutral_pass_rate",
+                "proe",
+            ):
+                self.assertIn(key, offense)
+
 
 if __name__ == "__main__":
     unittest.main()

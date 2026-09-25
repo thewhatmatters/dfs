@@ -61,6 +61,8 @@ from nfl.lines import (  # noqa: E402
 from nfl.players import filter_pool, load_fanduel_csv  # noqa: E402
 from nfl.projections import (  # noqa: E402
     attach_team_lines,
+    format_value_report,
+    on_default_board,
     print_projection_board,
     projection_board,
     score_player,
@@ -88,9 +90,14 @@ from nfl.sim import (  # noqa: E402
     ILP_OBJECTIVES,
     SIM_OBJECTIVES,
     apply_ilp_objective,
+    format_board_vs_sim,
+    format_correlation_summary,
+    format_sim_diagnostic,
     sim_header,
     simulate_games,
 )
+from nfl.sim_feed import resolve_sim_inputs  # noqa: E402
+from nfl.sim_inputs import SimInputError  # noqa: E402
 from nfl.slate_status import build_slate_status, format_slate_status  # noqa: E402
 from nfl.solver import Infeasible, Lineup, solve_many  # noqa: E402
 from nfl.snaps import (  # noqa: E402
@@ -394,11 +401,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="RNG seed for --sim (default 1)",
     )
     ap.add_argument(
+        "--sim-inputs",
+        default=None,
+        metavar="PATH",
+        help="JSON {team_stats, targets, snaps} for the layered sim. "
+        "Overrides the gangstash feed. No network. "
+        "Omit to build SimInputs from gangstash when a sim runs "
+        "(role shares if that feed is unavailable).",
+    )
+    ap.add_argument(
         "--objective",
         choices=ILP_OBJECTIVES,
         default="mean",
-        help="ILP score: mean = week1_score (default; not sim p50); "
+        help="ILP score: mean = board or sim mean (--projection-source); "
         "floor = sim p10; ceiling = sim p90.",
+    )
+    ap.add_argument(
+        "--projection-source",
+        choices=("board", "sim"),
+        default="board",
+        help="What the ILP mean objective uses. board = week1_score "
+        "(default). sim = each player's simulated mean from the same "
+        "draws as floor/ceiling. Board proj stays for comparison. "
+        "Keep the default until layer 4 and a backtest.",
     )
     ap.add_argument(
         "--cash-line",
@@ -490,7 +515,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _sim_n(args) -> int:
     n = int(args.sim or 0)
-    if args.objective in SIM_OBJECTIVES and n <= 0:
+    needs_sim = args.objective in SIM_OBJECTIVES or args.projection_source == "sim"
+    if needs_sim and n <= 0:
         return DEFAULT_DRAWS
     return n
 
@@ -882,6 +908,7 @@ def main(argv: list[str] | None = None) -> int:
             "sim": args.sim,
             "sim_seed": args.sim_seed,
             "objective": args.objective,
+            "projection_source": args.projection_source,
             "cash_line": args.cash_line,
             "n_lineups": args.n_lineups,
             "min_unique": args.min_unique,
@@ -908,21 +935,61 @@ def main(argv: list[str] | None = None) -> int:
     game_sim = None
     if sim_n > 0:
         print(sim_header(sim_n), file=sys.stderr)
-        game_sim = simulate_games(pool, n=sim_n, seed=args.sim_seed)
+        weeks = args.targets_weeks or (
+            [args.targets_week] if args.targets_week else None
+        )
+        try:
+            sim_inputs, sim_note = resolve_sim_inputs(
+                path=args.sim_inputs,
+                season=slate_day.year,
+                weeks=weeks,
+                refresh_targets=args.refresh_targets,
+                refresh_snaps=args.refresh_snaps,
+            )
+        except SimInputError as e:
+            emit("SIM_INPUTS", str(e))
+            payload["status"] = "error"
+            stamp(payload, "SIM_INPUTS", str(e))
+            _write_payload(payload, args)
+            return 1
+        print(sim_note, file=sys.stderr)
+        game_sim = simulate_games(
+            pool, n=sim_n, seed=args.sim_seed, inputs=sim_inputs
+        )
         sim_by_pid = game_sim.by_pid
+        payload["sim_diagnostic"] = format_sim_diagnostic(
+            pool, game_sim, projection_source=args.projection_source
+        )
+        print(
+            format_correlation_summary(pool, game_sim, list_pairs=False),
+            file=sys.stderr,
+        )
+        print(
+            format_board_vs_sim(
+                pool, game_sim, projection_source=args.projection_source
+            ),
+            file=sys.stderr,
+        )
     board_mode = None
     board_rows: list[dict] = []
     if args.board:
         board_mode = "all" if args.board == "all" else "default"
+        # Proj column is week1_score. Build it before a sim-mean swap.
         board_rows = projection_board(
             pool, mode=board_mode, sim_by_pid=sim_by_pid or None
         )
         payload["board"] = board_rows
-    if args.objective in SIM_OBJECTIVES:
+    value_pool = (
+        pool if args.board == "all" else [p for p in pool if on_default_board(p)]
+    )
+    payload["value_report"] = format_value_report(value_pool, sim_by_pid or None)
+    print(payload["value_report"], file=sys.stderr)
+    if args.projection_source == "sim" or args.objective in SIM_OBJECTIVES:
         pool = apply_ilp_objective(
             pool,
             args.objective,
             sim_by_pid=sim_by_pid,
+            projection_source=args.projection_source,
         )
     if args.n_lineups > 1:
         print(
@@ -960,7 +1027,14 @@ def main(argv: list[str] | None = None) -> int:
         lu = lineup.to_dict()
         if sim_by_pid:
             _attach_sim(lu, sim_by_pid)
-        _attach_totals(lu, lineup, sim_by_pid, args.cash_line, game_sim=game_sim)
+        _attach_totals(
+            lu,
+            lineup,
+            sim_by_pid,
+            args.cash_line,
+            game_sim=game_sim,
+            projection_source=args.projection_source,
+        )
         lu_dicts.append(lu)
     if len(lu_dicts) > 1:
         paired = sorted(
@@ -1018,14 +1092,23 @@ def _attach_totals(
     cash_line: float,
     *,
     game_sim=None,
+    projection_source: str = "board",
 ) -> None:
-    """lineup_proj = sum week1_score (not ILP obj).
+    """Displayed lineup Proj.
 
-    Floor/ceiling = joint-9 p10/p90 when `game_sim` is set; else sum of
-    player p10/p90 (tests that pass only a by_pid dict).
+    ``board`` (default): ``lineup_proj`` is the sum of ``week1_score``.
+    ``sim``: ``lineup_proj`` is the sum of the per-player Proj column
+    (sim mean after the objective swap). ``lineup_board`` keeps the
+    week-1 sum. Floor/ceiling = joint-9 p10/p90 when `game_sim` is set;
+    else the sum of player p10/p90.
     """
     players = list(lineup.slots.values())
-    lu["lineup_proj"] = round(sum(score_player(p) for p in players), 4)
+    board = round(sum(score_player(p) for p in players), 4)
+    if (projection_source or "board").lower() == "sim":
+        lu["lineup_board"] = board
+        lu["lineup_proj"] = round(sum(float(p.projection) for p in players), 4)
+    else:
+        lu["lineup_proj"] = board
     if not sim_by_pid and game_sim is None:
         return
     pids = [p.pid for p in players]

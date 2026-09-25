@@ -26,7 +26,7 @@ from nfl.gangstash import (
     fetch_dataset,
 )
 from nfl.names import match_key
-from nfl.teams import require_fd
+from nfl.teams import UnmappedTeam, require_fd
 
 TARGET_POSITIONS = frozenset({"RB", "WR", "TE"})
 BASE_OFFENSE_POS_GRP = "3WR 1TE"
@@ -149,6 +149,18 @@ def parse_target_row(row: dict) -> dict | None:
         "rec_yards": _int(row.get("rec_yards")),
         "gsis_id": _str(row.get("gsis_id")) or None,
         "player_id": _str(row.get("player_id")) or None,
+        "carries": _float(
+            row.get("carries")
+            if row.get("carries") is not None
+            else row.get("rushing_attempts")
+            if row.get("rushing_attempts") is not None
+            else row.get("rush_attempts")
+        ),
+        "team_carries": _float(
+            row.get("team_carries")
+            if row.get("team_carries") is not None
+            else row.get("team_rush_attempts")
+        ),
     }
 
 
@@ -669,7 +681,9 @@ def fetch_team_stats(
     refresh: bool = False,
     cache_day: date | None = None,
 ) -> tuple[list[dict], dict]:
-    """Season team stats. Cached only — not an optimizer input.
+    """Season team stats. Not an ILP input.
+
+    `--sim` reads these rows for EPA variance and pass rate. `week1_score` does not.
 
     Sends `season_type=REG` unless overridden. Rows stay raw.
     """
@@ -690,6 +704,68 @@ def fetch_team_stats(
         refresh=refresh,
         cache_day=cache_day,
     )
+
+
+def fetch_player_stats_weekly(
+    *,
+    season: int,
+    week: int | None = None,
+    weeks: list[int] | None = None,
+    refresh: bool = False,
+    cache_day: date | None = None,
+) -> tuple[list[dict], dict]:
+    """`dataset=player_stats_weekly`. `season` is required. `week` is optional.
+
+    Same cache as the other `/data` readers (`fetch_dataset`, header
+    `x-api-key` from `GANGSTASH_API_KEY`). Rows stay raw. `fd_points` is
+    the backtest actual. `carries` / `rushing_attempts` feed rush share.
+    """
+    if int(season) < 1:
+        raise GangstashDataError("gangstash player_stats_weekly requires season")
+    week_list = list(weeks) if weeks else ([int(week)] if week is not None else [])
+    params: dict[str, str] = {"season": str(int(season))}
+    if week_list:
+        params["week"] = ",".join(str(int(w)) for w in week_list)
+    return fetch_dataset(
+        dataset_id("player_stats_weekly"),
+        params,
+        refresh=refresh,
+        cache_day=cache_day,
+    )
+
+
+def parse_player_stat_row(row: dict) -> dict | None:
+    """One weekly box score. None when the name or team is blank.
+
+    Keeps `fd_points` and a carry count when those columns exist. Does not
+    raise on a missing score — the backtest skips unscored rows.
+    """
+    if not isinstance(row, dict):
+        return None
+    name = _str(row.get("player_name") or row.get("name") or row.get("player"))
+    team_raw = _str(row.get("team_fd") or row.get("team") or row.get("recent_team"))
+    if not name or not team_raw:
+        return None
+    try:
+        team = require_fd(team_raw).fd
+    except UnmappedTeam:
+        return None
+    carries = row.get("carries")
+    if carries is None:
+        carries = row.get("rushing_attempts")
+    if carries is None:
+        carries = row.get("rush_attempts")
+    return {
+        "player_name": name,
+        "team_fd": team,
+        "week": _int(row.get("week")),
+        "season": _int(row.get("season")) or 0,
+        "position": _str(row.get("position") or row.get("pos")).upper(),
+        "fd_points": _float(row.get("fd_points")),
+        "carries": _float(carries),
+        "gsis_id": _str(row.get("gsis_id")) or None,
+        "player_id": _str(row.get("player_id")) or None,
+    }
 
 
 def fetch_team_stats_weekly(

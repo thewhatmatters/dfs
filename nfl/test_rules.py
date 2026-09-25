@@ -8,6 +8,8 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 from nfl.rules import (
+    dst_event_points,
+    skill_fd_points,
     DST_SACK_TO_PRIOR,
     FANDUEL_MAX_PER_TEAM,
     FANDUEL_NFL,
@@ -151,6 +153,55 @@ class ScoringTest(unittest.TestCase):
         self.assertNotIn("fg", keys)
         self.assertNotIn("xp", keys)
         self.assertFalse(any(k.startswith("kicker") or k.startswith("fg_") for k in keys))
+
+    def test_skill_box_matches_lobby_thresholds(self):
+        sc = FANDUEL_NFL.scoring
+        under = skill_fd_points(pass_yd=299.9, rush_yd=99.9, rec_yd=99.9, receptions=1)
+        over = skill_fd_points(pass_yd=300.0, rush_yd=100.0, rec_yd=100.0, receptions=1)
+        self.assertAlmostEqual(under, 299.9 * 0.04 + 99.9 * 0.1 + 99.9 * 0.1 + 0.5, places=6)
+        self.assertAlmostEqual(
+            over - under,
+            0.1 * 0.04 + 0.1 * 0.1 + 0.1 * 0.1 + 3 + 3 + 3,
+            places=6,
+        )
+        self.assertAlmostEqual(skill_fd_points(pass_td=1), sc["pass_td"])
+        self.assertAlmostEqual(skill_fd_points(rush_td=1), sc["rush_td"])
+        self.assertAlmostEqual(skill_fd_points(rec_td=1), sc["rec_td"])
+        self.assertAlmostEqual(skill_fd_points(interceptions=1), -1.0)
+        self.assertAlmostEqual(skill_fd_points(fum_lost=1), -2.0)
+        self.assertAlmostEqual(skill_fd_points(two_pt=1), 2.0)
+        self.assertAlmostEqual(skill_fd_points(two_pt_pass=1), 2.0)
+        self.assertAlmostEqual(skill_fd_points(kr_td=1, pr_td=1, own_fum_td=1), 18.0)
+        # Exactly on the line earns the bonus. Just under does not.
+        self.assertAlmostEqual(
+            skill_fd_points(pass_yd=300) - 300 * sc["pass_yd"],
+            3.0,
+        )
+        self.assertAlmostEqual(skill_fd_points(pass_yd=299.999) - 299.999 * sc["pass_yd"], 0.0)
+        self.assertAlmostEqual(skill_fd_points(rush_yd=100) - 10.0, 3.0)
+        self.assertAlmostEqual(skill_fd_points(rush_yd=99.999) - 9.9999, 0.0, places=4)
+        self.assertAlmostEqual(skill_fd_points(rec_yd=100) - 10.0, 3.0)
+        self.assertAlmostEqual(skill_fd_points(rec_yd=99.999) - 9.9999, 0.0, places=4)
+
+    def test_dst_events_and_pa_edges(self):
+        self.assertEqual(dst_pa_points(0), 10)
+        self.assertEqual(dst_pa_points(0.99), 10)
+        self.assertEqual(dst_pa_points(1), 7)
+        self.assertEqual(dst_pa_points(6.9), 7)
+        self.assertEqual(dst_pa_points(7), 4)
+        self.assertEqual(dst_pa_points(13.9), 4)
+        self.assertEqual(dst_pa_points(14), 1)
+        self.assertEqual(dst_pa_points(20.9), 1)
+        self.assertEqual(dst_pa_points(21), 0)
+        self.assertEqual(dst_pa_points(27), 0)
+        self.assertEqual(dst_pa_points(28), -1)
+        self.assertEqual(dst_pa_points(34.9), -1)
+        self.assertEqual(dst_pa_points(35), -4)
+        self.assertAlmostEqual(
+            dst_event_points(sacks=1, interceptions=1, fum_rec=1, safeties=1, blocked=1, xpr=1),
+            1 + 2 + 2 + 2 + 2 + 2,
+        )
+        self.assertAlmostEqual(dst_event_points(return_td=1, blocked_td=1, fum_td=1), 18.0)
 
 
 class QbOppDstTest(unittest.TestCase):

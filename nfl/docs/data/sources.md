@@ -45,6 +45,7 @@ Skill pointer: `.cursor/skills/optimize-nfl-classic/references/sources.md`.
 | `SNAPS_SOURCE` | unknown `--snaps-source` | `nfl/snaps.py` | — | **stop** | `lineups` or `gangstash` |
 | `SNAPS_JOIN` | team code ↔ FanDuel abbrev (Lineups refresh or gangstash `team_fd`) | `nfl/snaps.py`, `nfl/teams.py` | — | **stop** on unmapped **team**; unmatched **names** print on stderr / JSON `snaps`, not fatal | add the abbrev to `TEAMS`; do not invent player aliases |
 | `UPLOAD_CSV` | FanDuel upload write/validate | `nfl/upload.py` | contest `FanDuel-NFL-*-entries-upload-template.csv` (or legacy QB-first lineup-upload) in `nfl/data/` | **stop** | omit `--upload` / `--n-lineups=1`; pass `template=` |
+| `SIM_INPUTS` | `--sim-inputs` JSON missing or not `{team_stats, targets, snaps}` | `nfl/sim_inputs.py` | local file only | **stop** | omit `--sim-inputs` (gangstash feed, then role shares) |
 
 ## Deferred (not wired this pass)
 
@@ -55,7 +56,7 @@ Skill pointer: `.cursor/skills/optimize-nfl-classic/references/sources.md`.
 | `PFF_PRO` | PFF Pro API | not wired |
 | `ANYTIME_TD` | anytime-TD prop strings | not scored; counted in `unmapped_props` (`nfl/props.py`) |
 | `PROPS_LINEUPS` | Lineups player-prop pages | inventoried only: `https://www.lineups.com/nfl/player-prop-bets/` — Gangstash is the overlay |
-| `TEAM_STATS` | gangstash `team_stats` / `team_stats_weekly` | fetch/cache only (`python3 -m nfl.gangstash_data`). Not an ILP input. CLI chokes: `TEAM_STATS_GANGSTASH_KEY`, `TEAM_STATS_GANGSTASH` |
+| `TEAM_STATS` | gangstash `team_stats` / `team_stats_weekly` | Not an ILP input. `--sim` reads them via `nfl/sim_feed.py` (degrade to role shares when the key and cache are missing). CLI chokes: `TEAM_STATS_GANGSTASH_KEY`, `TEAM_STATS_GANGSTASH` |
 
 Do not scrape FanDuel. Do not `--refresh-props` unless asked (refetches the Gangstash board).
 
