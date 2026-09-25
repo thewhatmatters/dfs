@@ -21,8 +21,10 @@ from nfl.sim import (
     format_sim_diagnostic,
     game_sigmas,
     has_volume_props,
+    mean_target_share,
     model_point,
     neutral_pass_rate_of,
+    passing_qb,
     pearson,
     rush_share_means,
     scripted_pass_rate,
@@ -36,8 +38,17 @@ from nfl.sim import (
     _props_draw,
     _score_world,
 )
+from nfl.sim_efficiency import (
+    INT_RATE,
+    PASS_YPA,
+    OpportunityCount,
+    PlaceholderEfficiency,
+    ReceivingLine,
+)
 from nfl.sim_inputs import (
     SimInputs,
+    SnapWeek,
+    TargetWeek,
     TeamStat,
     load_sim_inputs,
     sim_inputs_from_records,
@@ -1050,6 +1061,420 @@ class LayerSimTest(unittest.TestCase):
             self.assertNotIn("supabase", src)
             self.assertNotIn("urllib", src)
             self.assertNotIn("requests.", src)
+
+
+def _corr_mean(text: str, label: str) -> float:
+    prefix = label + " = "
+    for line in text.splitlines():
+        if line.startswith(prefix):
+            return float(line.split("=", 1)[1].split()[0])
+    raise AssertionError(f"missing {label}")
+
+
+def _week_row(name: str, week: int, share: float | None, *, position: str = "WR") -> dict:
+    targets = 0.0 if not share else round(30.0 * share, 2)
+    return {
+        "season": 2025,
+        "week": week,
+        "position": position,
+        "player_name": name,
+        "team_fd": "ARI",
+        "targets": targets,
+        "target_share": share,
+        "team_targets": 30,
+        "team_pass_attempts": 34,
+    }
+
+
+class _RecordingYards:
+    """Scores rec_yd only, so a share of 1 makes the QB equal his WR."""
+
+    def receiving_line(self, rng, position: str, targets: float) -> ReceivingLine:
+        del rng, position
+        t = max(0.0, float(targets))
+        return ReceivingLine(targets=t, receptions=t, rec_yd=t * 10.0, rec_td=0.0)
+
+    def points(self, rng, player: Player, opportunities: OpportunityCount) -> float:
+        del rng
+        if (player.position or "").upper() == "QB":
+            lines = opportunities.team_receiving or ()
+            return sum(line.rec_yd for line in lines)
+        if opportunities.receiving is None:
+            return 0.0
+        return opportunities.receiving.rec_yd
+
+
+class LiveShapeTest(unittest.TestCase):
+    """Bugs from the Sep 27 gangstash slate: signs, duplicate QBs, zero-fill."""
+
+    def test_passing_qb_is_depth_one_or_the_pass_prop(self):
+        lone = [
+            _pl(pid="a", name="Starter", position="QB", depth_rank=1),
+            _pl(pid="b", name="Backup", position="QB", depth_rank=2),
+            _pl(pid="c", name="Third", position="QB", depth_rank=3),
+        ]
+        self.assertEqual(passing_qb(lone).pid, "a")
+        propped = [
+            _pl(pid="a", name="A", position="QB", depth_rank=1, salary=7000),
+            _pl(
+                pid="b",
+                name="B",
+                position="QB",
+                depth_rank=1,
+                salary=6000,
+                prop_pass_yds=245.5,
+            ),
+        ]
+        self.assertEqual(passing_qb(propped).pid, "b")
+        salary = [
+            _pl(pid="a", name="A", position="QB", depth_rank=1, salary=7000),
+            _pl(pid="b", name="B", position="QB", depth_rank=1, salary=8000),
+        ]
+        self.assertEqual(passing_qb(salary).pid, "b")
+        prop_only = [
+            _pl(pid="a", name="A", position="QB", depth_rank=2, salary=8000),
+            _pl(
+                pid="b",
+                name="B",
+                position="QB",
+                depth_rank=3,
+                salary=5000,
+                prop_pass_tds=1.6,
+            ),
+        ]
+        self.assertEqual(passing_qb(prop_only).pid, "b")
+        by_depth = [
+            _pl(pid="a", name="A", position="QB", depth_rank=3, salary=9000),
+            _pl(pid="b", name="B", position="QB", depth_rank=2, salary=4000),
+        ]
+        self.assertEqual(passing_qb(by_depth).pid, "b")
+
+    def test_qb_pass_yards_are_the_sum_of_receiving_lines(self):
+        eff = PlaceholderEfficiency()
+        rng = random.Random(0)
+        wr = eff.receiving_line(rng, "WR", 10)
+        te = eff.receiving_line(rng, "TE", 4)
+        other = eff.receiving_line(rng, "WR", 6)
+        qb = _pl(pid="qb", name="QB", position="QB")
+        shared = OpportunityCount(
+            pass_attempts=22.0,
+            rushes=0.0,
+            team_receiving=(wr, te, other),
+        )
+        pts = eff.points(rng, qb, shared)
+        sc = FANDUEL_NFL.scoring
+        pass_yd = wr.rec_yd + te.rec_yd + other.rec_yd
+        pass_td = wr.rec_td + te.rec_td + other.rec_td
+        expected = (
+            pass_yd * sc["pass_yd"]
+            + pass_td * sc["pass_td"]
+            + 22.0 * INT_RATE * sc["int"]
+        )
+        self.assertAlmostEqual(pts, max(0.0, expected), places=6)
+        legacy = eff.points(
+            rng, qb, OpportunityCount(pass_attempts=22.0, rushes=0.0)
+        )
+        ypa = 22.0 * PASS_YPA * sc["pass_yd"] + 22.0 * 0.045 * sc["pass_td"]
+        self.assertAlmostEqual(
+            legacy,
+            ypa + 22.0 * INT_RATE * sc["int"],
+            places=4,
+        )
+        self.assertNotAlmostEqual(pts, legacy, places=2)
+
+        inputs = sim_inputs_from_records(
+            targets=[
+                _week_row("Only WR", week, 1.0) for week in (1, 2)
+            ],
+        )
+        wr_only = _pl(
+            pid="wr",
+            name="Only WR",
+            position="WR",
+            team="ARI",
+            opponent="SEA",
+            game="SEA@ARI",
+            total=47.0,
+            spread=-3.0,
+            implied_total=25.0,
+            depth_rank=1,
+        )
+        starter = _pl(
+            pid="qb",
+            name="Starter",
+            position="QB",
+            team="ARI",
+            opponent="SEA",
+            game="SEA@ARI",
+            total=47.0,
+            spread=-3.0,
+            implied_total=25.0,
+            depth_rank=1,
+            salary=8000,
+        )
+        gs = simulate_games(
+            [starter, wr_only],
+            n=40,
+            seed=1,
+            inputs=inputs,
+            efficiency=_RecordingYards(),
+        )
+        self.assertEqual(gs.draws["qb"], gs.draws["wr"])
+        self.assertGreater(gs.by_pid["qb"].mean, 0.0)
+
+    def test_backup_qbs_are_zero_when_a_starter_exists(self):
+        targets = []
+        for name, shares in (
+            ("Michael Wilson", (0.22, 0.18, 0.24)),
+            ("Marvin Harrison", (0.28, 0.0, 0.0)),
+        ):
+            for week, share in enumerate(shares, start=1):
+                targets.append(_week_row(name, week, share))
+        inputs = sim_inputs_from_records(targets=targets)
+        common = dict(
+            team="ARI",
+            opponent="SEA",
+            game="SEA@ARI",
+            total=47.0,
+            spread=-3.0,
+            implied_total=25.0,
+        )
+        starter = _pl(
+            pid="qb1",
+            name="Jacoby Brissett",
+            position="QB",
+            depth_rank=1,
+            salary=7500,
+            **common,
+        )
+        beck = _pl(
+            pid="qb2",
+            name="Carson Beck",
+            position="QB",
+            depth_rank=2,
+            salary=6000,
+            **common,
+        )
+        minshew = _pl(
+            pid="qb3",
+            name="Gardner Minshew II",
+            position="QB",
+            depth_rank=3,
+            salary=5500,
+            **common,
+        )
+        wilson = _pl(
+            pid="wr1",
+            name="Michael Wilson",
+            position="WR",
+            depth_rank=2,
+            **common,
+        )
+        pool = [starter, beck, minshew, wilson]
+        gs = simulate_games(pool, n=400, seed=1, inputs=inputs)
+        self.assertGreater(gs.by_pid["qb1"].p50, gs.by_pid["qb2"].p90)
+        self.assertEqual(set(gs.draws["qb2"]), {0.0})
+        self.assertEqual(set(gs.draws["qb3"]), {0.0})
+        self.assertNotEqual(gs.draws["qb1"], gs.draws["qb2"])
+        self.assertGreater(gs.by_pid["qb1"].p10, 1.0)
+
+    def test_zero_filled_weeks_do_not_dilute_share(self):
+        star = [
+            TargetWeek(
+                season=2025,
+                week=1,
+                position="WR",
+                player_name="Marvin Harrison",
+                team_fd="ARI",
+                targets=8.4,
+                target_share=0.28,
+                team_targets=30,
+            ),
+            TargetWeek(
+                season=2025,
+                week=2,
+                position="WR",
+                player_name="Marvin Harrison",
+                team_fd="ARI",
+                targets=0,
+                target_share=0.0,
+                team_targets=30,
+            ),
+            TargetWeek(
+                season=2025,
+                week=3,
+                position="WR",
+                player_name="Marvin Harrison",
+                team_fd="ARI",
+                targets=0,
+                target_share=None,
+                team_targets=30,
+            ),
+        ]
+        self.assertAlmostEqual(mean_target_share(star), 0.28, places=6)
+        played = [
+            SnapWeek(
+                season=2025,
+                week=2,
+                position="WR",
+                player_name="Marvin Harrison",
+                team_fd="ARI",
+                offense_pct=0.80,
+            )
+        ]
+        self.assertAlmostEqual(mean_target_share(star, played), 0.14, places=6)
+        dnp = [
+            SnapWeek(
+                season=2025,
+                week=2,
+                position="WR",
+                player_name="Marvin Harrison",
+                team_fd="ARI",
+                offense_pct=0.0,
+            )
+        ]
+        self.assertAlmostEqual(mean_target_share(star, dnp), 0.28, places=6)
+
+        targets = []
+        for week, share in enumerate((0.28, 0.0, 0.0), start=1):
+            targets.append(_week_row("Marvin Harrison", week, share))
+        for week in (1, 2, 3):
+            targets.append(_week_row("Kendrick Bourne", week, 0.12))
+        inputs = sim_inputs_from_records(targets=targets)
+        common = dict(
+            team="ARI",
+            opponent="SEA",
+            game="SEA@ARI",
+            total=47.0,
+            spread=-3.0,
+            implied_total=25.0,
+        )
+        mhj = _pl(
+            pid="mhj",
+            name="Marvin Harrison Jr.",
+            position="WR",
+            depth_rank=1,
+            **common,
+        )
+        bourne = _pl(
+            pid="bourne",
+            name="Kendrick Bourne",
+            position="WR",
+            depth_rank=3,
+            **common,
+        )
+        gs = simulate_games([mhj, bourne], n=600, seed=2, inputs=inputs)
+        self.assertGreater(gs.by_pid["mhj"].p50, gs.by_pid["bourne"].p50)
+        self.assertGreater(gs.by_pid["mhj"].mean, gs.by_pid["bourne"].mean)
+
+    def test_starter_correlations_keep_sign_when_bench_flips_the_mean(self):
+        targets = []
+        # Shares swap hard, same shape as nfl/testdata/sim_layers.json, so
+        # Dirichlet competition beats the shared pass-volume factor.
+        for week, share in enumerate((0.45, 0.12, 0.40, 0.15), start=1):
+            targets.append(_week_row("Amon-Ra St. Brown", week, share))
+        for week, share in enumerate((0.12, 0.42, 0.14, 0.38), start=1):
+            targets.append(_week_row("Jameson Williams", week, share))
+        for week, share in enumerate((0.18, 0.10, 0.22, 0.12), start=1):
+            targets.append(
+                _week_row("Sam LaPorta", week, share, position="TE")
+            )
+        inputs = sim_inputs_from_records(
+            team_stats=[
+                {
+                    "team_fd": "ARI",
+                    "side": "offense",
+                    "neutral_pass_rate": 0.57,
+                    "n": 400,
+                    "epa_sum": 40,
+                    "epa_sq_sum": 560,
+                }
+            ],
+            targets=targets,
+        )
+        common = dict(
+            team="ARI",
+            opponent="SEA",
+            game="SEA@ARI",
+            total=48.0,
+            spread=-2.0,
+            implied_total=25.0,
+            implied_opp=23.0,
+        )
+        starter = _pl(
+            pid="qb",
+            name="Starter QB",
+            position="QB",
+            depth_rank=1,
+            salary=8000,
+            **common,
+        )
+        backup = _pl(
+            pid="qb2",
+            name="Backup QB",
+            position="QB",
+            depth_rank=2,
+            salary=5000,
+            **common,
+        )
+        wr1 = _pl(
+            pid="wr1",
+            name="Amon-Ra St. Brown",
+            position="WR",
+            depth_rank=1,
+            **common,
+        )
+        wr2 = _pl(
+            pid="wr2",
+            name="Jameson Williams",
+            position="WR",
+            depth_rank=2,
+            **common,
+        )
+        te = _pl(
+            pid="te",
+            name="Sam LaPorta",
+            position="TE",
+            depth_rank=1,
+            **common,
+        )
+        bench = [
+            _pl(
+                pid=f"bench{i}",
+                name=f"Bench WR {i}",
+                position="WR",
+                depth_rank=4 + (i % 3),
+                salary=4000,
+                **common,
+            )
+            for i in range(10)
+        ]
+        pool = [starter, backup, wr1, wr2, te, *bench]
+        gs = simulate_games(pool, n=2500, seed=1, inputs=inputs)
+        text = format_sim_diagnostic(pool, gs)
+        self.assertGreater(_corr_mean(text, "QB–WR starters mean r"), 0.15)
+        self.assertLess(_corr_mean(text, "WR–WR starters mean r"), -0.05)
+        self.assertGreater(_corr_mean(text, "QB–TE starters mean r"), 0.10)
+        self.assertGreater(
+            pearson(list(gs.draws["qb"]), list(gs.draws["wr1"])), 0.15
+        )
+        self.assertGreater(
+            pearson(list(gs.draws["qb"]), list(gs.draws["wr2"])), 0.15
+        )
+        self.assertLess(
+            pearson(list(gs.draws["wr1"]), list(gs.draws["wr2"])), -0.05
+        )
+        # Bench WRs track team points, which move against pass rate.
+        self.assertLess(
+            _corr_mean(text, "QB–WR mean r"),
+            _corr_mean(text, "QB–WR starters mean r"),
+        )
+        self.assertGreater(
+            _corr_mean(text, "WR–WR mean r"),
+            _corr_mean(text, "WR–WR starters mean r"),
+        )
+        self.assertEqual(set(gs.draws["qb2"]), {0.0})
+        self.assertIn("starters: depth-1 QB, WR depth 1–3, TE depth 1", text)
 
 
 if __name__ == "__main__":

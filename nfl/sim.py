@@ -9,9 +9,10 @@ share that world:
    (or pass rate minus PROE) shifts with the drawn margin: trailing teams
    pass more, leading teams run more.
 3. Opportunity — target shares (WR/TE/RB) and RB rush shares drawn jointly
-   (Dirichlet) from weekly history so same-team catchers compete and the
-   QB moves with his catchers. Missing history keeps the deterministic
-   role share (team points × depth × position share × usage).
+   (Dirichlet) from games played so same-team catchers compete. The
+   starter QB's passing yards and TDs are the sum of those same receiving
+   lines. Backups get no team passing volume. Missing history keeps the
+   deterministic role share (team points × depth × position share × usage).
 
 Efficiency (yards per opportunity, TD rates) is ``PlaceholderEfficiency``
 in ``nfl/sim_efficiency.py``. Layer 4 replaces that class; it is not a
@@ -47,7 +48,13 @@ from nfl.projections import (
     usage_factor,
 )
 from nfl.rules import DST_SACK_TO_PRIOR, FANDUEL_NFL, dst_pa_points, dst_projection
-from nfl.sim_efficiency import EfficiencyModel, OpportunityCount, PlaceholderEfficiency
+from nfl.sim_efficiency import (
+    EfficiencyModel,
+    OpportunityCount,
+    PlaceholderEfficiency,
+    ReceivingLine,
+    expected_receiving_line,
+)
 from nfl.sim_inputs import SimInputs, SnapWeek, TargetWeek, TeamStat
 
 DEFAULT_DRAWS = 10_000
@@ -295,6 +302,7 @@ def simulate_games(
                         [p for p in group if (p.team or "").upper() == team],
                         margin,
                         index,
+                        eff,
                     )
                 )
             for pl in group:
@@ -634,14 +642,20 @@ def scripted_pass_rate(neutral: float, margin: float) -> float:
     return _clamp_rate(neutral + SCRIPT_PASS_PER_POINT * (-float(margin)))
 
 
-def mean_target_share(weeks: list[TargetWeek]) -> float:
-    """Average weekly share. ``targets / team_targets`` when share is blank."""
-    shares: list[float] = []
-    for week in weeks:
-        if week.target_share is not None:
-            shares.append(float(week.target_share))
-        elif week.team_targets and week.team_targets > 0:
-            shares.append(float(week.targets) / float(week.team_targets))
+def mean_target_share(
+    weeks: list[TargetWeek],
+    snaps: list[SnapWeek] | None = None,
+) -> float:
+    """Mean share over games played. Zero-filled DNPs are dropped.
+
+    A week counts when it has targets or a positive ``target_share``.
+    With no snap row, a zero-target week is a DNP and is left out, so a
+    player who missed a week is not diluted by that zero. A snap week
+    with ``offense_pct > 0`` counts even at zero targets (he played).
+    ``offense_pct == 0`` drops a zero-target week. No played weeks → 0,
+    and the player stays on the depth role share.
+    """
+    shares = _played_shares(weeks, snaps)
     if not shares:
         return 0.0
     return sum(shares) / len(shares)
@@ -763,7 +777,12 @@ def format_correlation_summary(
     *,
     list_pairs: bool = True,
 ) -> str:
-    """Same-team correlation block. QB–WR should be +, WR–WR should be −."""
+    """Same-team correlation block.
+
+    All-pairs means include bench WRs. Starter means are depth-1 QB vs
+    WR depth 1–3 and TE depth 1. Those starter signs are the check:
+    QB–WR positive, WR–WR negative.
+    """
     pairs = _same_team_pairs(players, game_sim)
     lines: list[str] = ["same-team correlations"]
     if list_pairs:
@@ -781,6 +800,26 @@ def format_correlation_summary(
         + (_fmt_mean(wr_wr))
         + f"  (n={len(wr_wr)})"
     )
+    starter_pairs = _same_team_pairs(players, game_sim, starters_only=True)
+    sqb_wr = [r for kind, _a, _b, r in starter_pairs if kind == "QB-WR"]
+    swr_wr = [r for kind, _a, _b, r in starter_pairs if kind == "WR-WR"]
+    sqb_te = [r for kind, _a, _b, r in starter_pairs if kind == "QB-TE"]
+    lines.append(
+        "QB–WR starters mean r = "
+        + (_fmt_mean(sqb_wr))
+        + f"  (n={len(sqb_wr)})"
+    )
+    lines.append(
+        "WR–WR starters mean r = "
+        + (_fmt_mean(swr_wr))
+        + f"  (n={len(swr_wr)})"
+    )
+    lines.append(
+        "QB–TE starters mean r = "
+        + (_fmt_mean(sqb_te))
+        + f"  (n={len(sqb_te)})"
+    )
+    lines.append("starters: depth-1 QB, WR depth 1–3, TE depth 1")
     if game_sim.opportunity_teams:
         teams = ", ".join(sorted(game_sim.opportunity_teams))
         lines.append(f"opportunity shares on: {teams}")
@@ -801,7 +840,10 @@ def _fmt_mean(xs: list[float]) -> str:
 def _same_team_pairs(
     players: list[Player],
     game_sim: GameSim,
+    *,
+    starters_only: bool = False,
 ) -> list[tuple[str, str, str, float]]:
+    """QB–WR and WR–WR pairs. Starters: depth-1 QB, WR 1–3, TE 1 (QB–TE)."""
     by_team: dict[str, list[Player]] = {}
     for pl in players:
         if pl.pid not in game_sim.draws:
@@ -812,6 +854,13 @@ def _same_team_pairs(
         group = sorted(by_team[team], key=lambda p: p.pid)
         qbs = [p for p in group if (p.position or "").upper() == "QB"]
         wrs = [p for p in group if (p.position or "").upper() == "WR"]
+        tes = [p for p in group if (p.position or "").upper() == "TE"]
+        if starters_only:
+            qbs = [p for p in qbs if p.depth_rank == 1]
+            wrs = [p for p in wrs if p.depth_rank in (1, 2, 3)]
+            tes = [p for p in tes if p.depth_rank == 1]
+        else:
+            tes = []
         for qb in qbs:
             for wr in wrs:
                 r = pearson(
@@ -819,6 +868,12 @@ def _same_team_pairs(
                     list(game_sim.draws[wr.pid]),
                 )
                 out.append(("QB-WR", qb.name or qb.pid, wr.name or wr.pid, r))
+            for te in tes:
+                r = pearson(
+                    list(game_sim.draws[qb.pid]),
+                    list(game_sim.draws[te.pid]),
+                )
+                out.append(("QB-TE", qb.name or qb.pid, te.name or te.pid, r))
         for i, a in enumerate(wrs):
             for b in wrs[i + 1 :]:
                 r = pearson(
@@ -877,6 +932,45 @@ def _layered_pids(
     return pids
 
 
+def passing_qb(players: list[Player]) -> Player | None:
+    """The one QB who receives the team's pass attempts.
+
+    Prefer a lone depth-1. Several depth-1 QBs: the one with a passing
+    prop (``prop_pass_yds`` or ``prop_pass_tds``), else higher salary,
+    else pid. No depth-1: the QB with a passing prop, else the lowest
+    depth rank. Everyone else is a backup and scores ~0 on this path.
+    """
+    qbs = [p for p in players if (p.position or "").upper() == "QB"]
+    if not qbs:
+        return None
+    depth1 = [p for p in qbs if p.depth_rank == 1]
+    if len(depth1) == 1:
+        return depth1[0]
+    if len(depth1) > 1:
+        return min(depth1, key=_qb_tie_break)
+    with_prop = [p for p in qbs if _has_pass_prop(p)]
+    if with_prop:
+        return min(with_prop, key=_qb_tie_break)
+    return min(qbs, key=_qb_depth_key)
+
+
+def _has_pass_prop(player: Player) -> bool:
+    return player.prop_pass_yds is not None or player.prop_pass_tds is not None
+
+
+def _qb_tie_break(player: Player) -> tuple:
+    return (
+        0 if _has_pass_prop(player) else 1,
+        -(player.salary or 0),
+        player.pid,
+    )
+
+
+def _qb_depth_key(player: Player) -> tuple:
+    rank = player.depth_rank if player.depth_rank is not None else 10**9
+    return (rank, -(player.salary or 0), player.pid)
+
+
 def _catchers(
     team: str,
     group: list[Player],
@@ -888,19 +982,74 @@ def _catchers(
             continue
         if (pl.position or "").upper() not in {"WR", "TE", "RB"}:
             continue
-        if mean_target_share(index.target_weeks(pl)) > 0:
+        if mean_target_share(index.target_weeks(pl), index.snap_weeks(pl)) > 0:
             out.append(pl)
     return out
 
 
-def _weekly_shares(weeks: list[TargetWeek]) -> list[float]:
+def _snap_pct_by_week(snaps: list[SnapWeek] | None) -> dict[int, float]:
+    out: dict[int, float] = {}
+    if not snaps:
+        return out
+    for snap in snaps:
+        if snap.offense_pct is None:
+            continue
+        val = float(snap.offense_pct)
+        prev = out.get(snap.week)
+        if prev is None or val > prev:
+            out[snap.week] = val
+    return out
+
+
+def _week_played(week: TargetWeek, snap_pct: float | None) -> bool:
+    has_volume = week.targets > 0 or (
+        week.target_share is not None and week.target_share > 0
+    )
+    if has_volume:
+        return True
+    if snap_pct is None:
+        return False
+    return snap_pct > 0
+
+
+def _share_value(week: TargetWeek) -> float:
+    if week.target_share is not None:
+        return float(week.target_share)
+    if week.team_targets and week.team_targets > 0:
+        return float(week.targets) / float(week.team_targets)
+    return 0.0
+
+
+def _played_shares(
+    weeks: list[TargetWeek],
+    snaps: list[SnapWeek] | None = None,
+) -> list[float]:
+    by_week = _snap_pct_by_week(snaps)
     shares: list[float] = []
     for week in weeks:
-        if week.target_share is not None:
-            shares.append(float(week.target_share))
-        elif week.team_targets and week.team_targets > 0:
-            shares.append(float(week.targets) / float(week.team_targets))
+        if not _week_played(week, by_week.get(week.week)):
+            continue
+        shares.append(_share_value(week))
     return shares
+
+
+def _weekly_shares(
+    weeks: list[TargetWeek],
+    snaps: list[SnapWeek] | None = None,
+) -> list[float]:
+    return _played_shares(weeks, snaps)
+
+
+def _realize_receiving(
+    eff: EfficiencyModel,
+    rng: random.Random,
+    position: str,
+    targets: float,
+) -> ReceivingLine:
+    fn = getattr(eff, "receiving_line", None)
+    if fn is None:
+        return expected_receiving_line(position, targets)
+    return fn(rng, position, targets)
 
 
 def _draw_team_opportunities(
@@ -908,12 +1057,16 @@ def _draw_team_opportunities(
     team_players: list[Player],
     margin: float,
     index: _HistoryIndex,
+    eff: EfficiencyModel,
 ) -> dict[str, OpportunityCount]:
     """Plays, scripted pass rate, joint shares. Empty if no target history.
 
     RNG order (stable): one plays gaussian, then target-share gammas in
     pid order (plus an "other" bucket), then rush-share gammas in pid
-    order only when some RB has snaps.
+    order only when some RB has snaps, then receiving lines (catchers in
+    that same order, then the other bucket). ``PlaceholderEfficiency``
+    does not consume the RNG. Only ``passing_qb`` gets pass attempts and
+    QB rushes; other QBs are explicit zeros.
     """
     if not team_players:
         return {}
@@ -928,8 +1081,14 @@ def _draw_team_opportunities(
     rush_attempts = plays * (1.0 - pass_rate)
     team_targets = pass_attempts * index.targets_per_attempt(team)
 
-    means = [mean_target_share(index.target_weeks(pl)) for pl in catchers]
-    series = [_weekly_shares(index.target_weeks(pl)) for pl in catchers]
+    means = [
+        mean_target_share(index.target_weeks(pl), index.snap_weeks(pl))
+        for pl in catchers
+    ]
+    series = [
+        _weekly_shares(index.target_weeks(pl), index.snap_weeks(pl))
+        for pl in catchers
+    ]
     kappa = share_kappa(series)
     mean_sum = sum(means)
     if mean_sum > 1.0:
@@ -942,6 +1101,7 @@ def _draw_team_opportunities(
         simplex_means.append(other)
     drawn = draw_simplex(rng, simplex_means, kappa)
     target_share = {pl.pid: drawn[i] for i, pl in enumerate(catchers)}
+    other_share = drawn[-1] if other > 1e-6 else 0.0
 
     rbs = [pl for pl in catchers if (pl.position or "").upper() == "RB"]
     snap_means = {pl.pid: index.snap_mean(pl) for pl in rbs}
@@ -960,21 +1120,36 @@ def _draw_team_opportunities(
     qb_rushes = rush_attempts * QB_RUSH_SHARE
     rb_pool = rush_attempts * (1.0 - QB_RUSH_SHARE)
     out: dict[str, OpportunityCount] = {}
+    lines: list[ReceivingLine] = []
     for pl in catchers:
         rushes = 0.0
         if pl.pid in rush_share:
             rushes = rb_pool * rush_share[pl.pid]
+        targets = team_targets * target_share[pl.pid]
+        line = _realize_receiving(eff, rng, pl.position or "WR", targets)
+        lines.append(line)
         out[pl.pid] = OpportunityCount(
-            targets=team_targets * target_share[pl.pid],
+            targets=targets,
             rushes=rushes,
+            receiving=line,
         )
+    other_targets = team_targets * other_share
+    if other_targets > 0.0:
+        lines.append(_realize_receiving(eff, rng, "WR", other_targets))
+    team_lines = tuple(lines)
+    starter = passing_qb(team_players)
     for pl in team_players:
         if (pl.position or "").upper() != "QB":
             continue
-        out[pl.pid] = OpportunityCount(
-            pass_attempts=pass_attempts,
-            rushes=qb_rushes,
-        )
+        if starter is not None and pl.pid == starter.pid:
+            out[pl.pid] = OpportunityCount(
+                pass_attempts=pass_attempts,
+                rushes=qb_rushes,
+                team_receiving=team_lines,
+            )
+        else:
+            # In the dict so the backup is not scored off team points.
+            out[pl.pid] = OpportunityCount()
     return out
 
 

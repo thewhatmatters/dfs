@@ -89,14 +89,20 @@ The default targets-per-attempt is `0.90` when no week has both `team_targets` a
 
 Concentration `κ` comes from each player's weekly shares: `Var = μ(1−μ)/(κ+1)`. The team uses the median `κ`, clamped to `[2, 80]`. Fewer than two weeks uses `κ = 10`.
 
-Same-team pass catchers therefore compete (negative share correlation). The QB is scored from the same `pass_attempts`, so he moves with his catchers (positive correlation) even while the catchers move against each other.
+Weekly shares are the mean over **games played**. A week with `targets > 0` or `target_share > 0` counts. A zero-target week is dropped, so a missed week does not dilute the share. A snap row with `offense_pct > 0` keeps a zero-target week (he played and was not targeted). `offense_pct == 0` drops that zero-target week. No played weeks → share 0, and the player stays on the depth role share. κ uses the same played weeks.
+
+Same-team pass catchers therefore compete (negative share correlation).
+
+**One QB gets the passing volume.** That is the depth-1 QB. If several players are depth 1, the one with `prop_pass_yds` or `prop_pass_tds` wins, then higher salary, then pid. If nobody is depth 1, the QB with a passing prop wins, else the lowest depth rank. Every other QB on that team is scored at 0 on this path (they are not given the role-share team-points formula).
+
+The starter's passing yards and passing TDs are the **sum of the receiving lines** realized for his catchers and for the other bucket in that same world. A catcher's points use his own line. Those are one draw, not a separate yards-per-attempt roll for the QB. Rush yards and interceptions stay on the QB's own attempt and rush counts. A leading script still pushes rush points up and pass points down, so an RB can move against his QB.
 
 **RB rush share**
 
 - If any RB on that path has `offense_pct` weeks, rush shares are a Dirichlet around those means (RBs without snaps keep a depth weight).
 - If no snaps are present, rush shares are fixed depth weights: `depth_prior × expected snap share`, normalized across the RBs. No extra random draw.
 
-The QB keeps 8% of team rushes. RBs split the rest. Snaps are optional; an empty `snaps` list is valid.
+The starter QB keeps 8% of team rushes. RBs split the rest. Snaps are optional; an empty `snaps` list is valid.
 
 Players with no target weeks stay on the deterministic role share, including an RB who only has snaps. Snaps change rush mix only for RBs who already have target weeks.
 
@@ -104,17 +110,20 @@ Players with no target weeks stay on the deterministic role share, including an 
 
 ### Efficiency (placeholder, layer 4 later)
 
-`PlaceholderEfficiency` in `nfl/sim_efficiency.py` turns opportunities into expected FanDuel points: yards per attempt / target / rush and TD rates, plus the 100- and 300-yard bonuses when that expectation crosses the line. It does **not** consume the RNG and it does **not** calibrate medians to prop lines.
+`PlaceholderEfficiency` in `nfl/sim_efficiency.py` turns opportunities into expected FanDuel points: yards per target / rush and TD rates, plus the 100- and 300-yard bonuses when that expectation crosses the line. It does **not** consume the RNG and it does **not** calibrate medians to prop lines.
 
-Layer 4 replaces this class. The call is:
+`receiving_line(rng, position, targets)` realizes one allocation. Catcher points use that line. QB passing yards and TDs sum the lines from the same world, including the other bucket (WR rates). A standalone `points` call with no `team_receiving` still uses `7.1` yards per attempt so single-player checks keep a QB formula.
+
+Layer 4 replaces this class. The calls are:
 
 ```python
-points(rng, player, OpportunityCount(pass_attempts, targets, rushes)) -> float
+receiving_line(rng, position, targets) -> ReceivingLine
+points(rng, player, OpportunityCount(...)) -> float
 ```
 
-`rng` and the player's `prop_*` fields are there for that replacement (residual yards, lumpy TD counts, prop medians).
+`rng` and the player's `prop_*` fields are there for that replacement (residual yards, lumpy TD counts, prop medians). Layer 4 must draw inside `receiving_line` and leave `points` reading the attached line, or the QB will not match his catchers.
 
-Until then, a catcher's points are linear in his targets, which is why the share draw shows up cleanly in the correlations. A leading script also pushes rush points up and pass points down, so an RB can move against his QB even though they share the game.
+Until then, a catcher's points are linear in his targets, which is why the share draw shows up cleanly in the correlations.
 
 ## Gangstash feed
 
@@ -150,9 +159,18 @@ No `--sim-inputs`, or inputs that do not match anyone's name:
 
 ## Diagnostic
 
-`format_sim_diagnostic` prints each player's p10 / p50 / p90 and a same-team correlation block. With weekly target history on a team, QB–WR mean correlation is positive and WR–WR mean correlation is negative.
+`format_sim_diagnostic` prints each player's p10 / p50 / p90 and a same-team correlation block.
 
-The optimizer writes the full text to JSON `sim_diagnostic` and prints the two mean lines on stderr. `--sim-inputs PATH` loads the JSON. A bad file is `choke SIM_INPUTS`.
+Two summaries:
+
+| Line | Pairs |
+|------|--------|
+| `QB–WR mean r` / `WR–WR mean r` | every QB with every WR, and every WR pair, including backups and bench players with no target history |
+| `QB–WR starters mean r` / `WR–WR starters mean r` / `QB–TE starters mean r` | depth-1 QB vs WR depth 1–3, those WRs with each other, and depth-1 QB vs TE depth 1 |
+
+Starters with target history should show QB–WR positive and WR–WR negative. The all-pairs means can flip on a full roster: bench WRs with no target weeks stay on team points, and team points move against pass rate (a trailing script passes more while the team is behind). Those bench pairs outnumber the starters. Read the starter lines for the sign check.
+
+The optimizer writes the full text to JSON `sim_diagnostic` and prints the mean lines (all pairs and starters) on stderr. `--sim-inputs PATH` loads the JSON. A bad file is `choke SIM_INPUTS`.
 
 ```bash
 python3 -m nfl.optimize --csv "nfl/data/<players-list>.csv" --sim \
@@ -163,4 +181,4 @@ Fixture: `nfl/testdata/sim_layers.json` (DET offense/defense EPA sums, four week
 
 ## Seeds
 
-One `random.Random(seed)` for the slate. Games run in game-id order, players in pid order. Inside an opportunity team the order is: plays gaussian, target-share gammas (pid order, then the other bucket), rush-share gammas only when snaps exist. Empty inputs add no draws beyond the total and the spread, so seeds match the pre-layer sim.
+One `random.Random(seed)` for the slate. Games run in game-id order, players in pid order. Inside an opportunity team the order is: plays gaussian, target-share gammas (pid order, then the other bucket), rush-share gammas only when snaps exist, then receiving lines in that same catcher order (other bucket last). The placeholder receiving line does not call the RNG, so share draws match the previous seed. Empty inputs add no draws beyond the total and the spread, so seeds match the pre-layer sim.
