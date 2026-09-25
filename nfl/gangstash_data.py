@@ -491,14 +491,18 @@ class GangstashGameLine:
 
 
 def parse_game_line(row: dict) -> GangstashGameLine | None:
-    """Live ``game_lines`` or nflverse-shaped ``closing_lines``.
+    """Live ``game_lines`` or ``closing_lines``.
 
-    ``spread`` is the home line (negative = home favored), the same sign as
-    the Odds API. ``closing_lines`` is nflverse-sourced: ``spread_line`` is
+    ``spread`` and live ``home_line`` are the home line (negative = home
+    favored), the same sign as the Odds API. Neither is flipped.
+    ``closing_lines`` may also be nflverse-shaped: ``spread_line`` is
     positive when the home team is favored, so the stored home spread is
-    ``-spread_line``. Home and away implied totals, including
-    ``home_implied_tt`` / ``away_implied_tt``, win when both are present.
-    Teams may be ``home_team_fd`` or nflverse ``home_team``.
+    ``-spread_line``. Home and away implied totals win when both are
+    present, including ``implied_home_total`` / ``implied_away_total`` and
+    ``home_implied_tt`` / ``away_implied_tt``. Teams may be ``home_team_fd``
+    or ``home_team``. A row that still has no spread and total returns
+    None so one bad close does not abort the week. ``kickoff`` is accepted
+    as ``commence_time`` when it is a real timestamp; null stays empty.
     """
     if not isinstance(row, dict):
         return None
@@ -508,9 +512,11 @@ def parse_game_line(row: dict) -> GangstashGameLine | None:
     total = _float(row.get("total"))
     spread_line = _float(row.get("spread_line"))
     total_line = _float(row.get("total_line"))
+    home_line = _float(row.get("home_line"))
     home_impl = _first_float(
         row,
         (
+            "implied_home_total",
             "home_implied_total",
             "home_implied",
             "home_implied_tt",
@@ -521,6 +527,7 @@ def parse_game_line(row: dict) -> GangstashGameLine | None:
     away_impl = _first_float(
         row,
         (
+            "implied_away_total",
             "away_implied_total",
             "away_implied",
             "away_implied_tt",
@@ -537,13 +544,11 @@ def parse_game_line(row: dict) -> GangstashGameLine | None:
         and total_line is None
         and home_impl is None
         and away_impl is None
+        and home_line is None
     ):
         return None
     if not home_raw or not away_raw:
-        raise GangstashDataError(
-            "gangstash game_lines row missing home_team_fd/away_team_fd "
-            f"(keys {sorted(row)})"
-        )
+        return None
     if home_impl is not None and away_impl is not None:
         total = home_impl + away_impl
         # Home spread is negative when home is favored.
@@ -553,13 +558,18 @@ def parse_game_line(row: dict) -> GangstashGameLine | None:
         spread = -spread_line
         if total_line is not None:
             total = total_line
+    elif spread is None and home_line is not None and total is not None:
+        # Live closing_lines home_line already uses the Odds sign.
+        spread = home_line
     if spread is None or total is None:
-        raise GangstashDataError(
-            f"gangstash game_lines row {away_raw}@{home_raw} missing spread/total "
-            f"(keys {sorted(row)})"
-        )
-    home = require_fd(home_raw)
-    away = require_fd(away_raw)
+        return None
+    try:
+        home = require_fd(home_raw)
+        away = require_fd(away_raw)
+    except UnmappedTeam:
+        return None
+    kickoff = _str(row.get("kickoff")) or None
+    commence = _str(row.get("commence_time")) or kickoff
     return GangstashGameLine(
         home_fd=home.fd,
         away_fd=away.fd,
@@ -567,7 +577,7 @@ def parse_game_line(row: dict) -> GangstashGameLine | None:
         total=total,
         home_moneyline=_float(row.get("home_moneyline")),
         away_moneyline=_float(row.get("away_moneyline")),
-        commence_time=_str(row.get("commence_time")) or None,
+        commence_time=commence,
     )
 
 
@@ -589,10 +599,13 @@ def fetch_closing_lines(
 ) -> tuple[list[dict], dict]:
     """`dataset=closing_lines`. Past weeks prefer this over ``game_lines``.
 
-    Rows may carry ``spread`` and ``total``, nflverse ``spread_line`` (positive
+    Rows may carry ``spread`` and ``total``, live ``home_line`` (negative
+    when home is favored) plus ``total``, nflverse ``spread_line`` (positive
     when home is favored) and ``total_line``, or home and away implied team
-    totals. Implied totals win. ``parse_game_line`` stores the home spread
-    with the Odds sign (negative when home is favored).
+    totals (``implied_home_total`` / ``implied_away_total``). Implied totals
+    win. ``parse_game_line`` stores the home spread with the Odds sign
+    (negative when home is favored). ``kickoff`` may be null. A row that
+    still cannot form a spread and total is skipped.
     """
     if int(season) < 1 or int(week) < 1:
         raise GangstashDataError("gangstash closing_lines needs season and week")
@@ -873,6 +886,61 @@ def parse_player_stat_row(row: dict) -> dict | None:
         "carries": _float(carries),
         "gsis_id": _str(row.get("gsis_id")) or None,
         "player_id": _str(row.get("player_id")) or None,
+    }
+
+
+def fetch_dst_weekly(
+    *,
+    season: int,
+    week: int | None = None,
+    weeks: list[int] | None = None,
+    team: str | None = None,
+    refresh: bool = False,
+    cache_day: date | None = None,
+) -> tuple[list[dict], dict]:
+    """`dataset=dst_weekly`. `season` is required. `week` and `team` are optional.
+
+    Team defense actuals. `fd_points` is the FanDuel DEF score. Rows stay raw.
+    """
+    if int(season) < 1:
+        raise GangstashDataError("gangstash dst_weekly requires season")
+    week_list = list(weeks) if weeks else ([int(week)] if week is not None else [])
+    params: dict[str, str] = {"season": str(int(season))}
+    if week_list:
+        params["week"] = ",".join(str(int(w)) for w in week_list)
+    if team:
+        params["team"] = team.strip().upper()
+    return fetch_dataset(
+        dataset_id("dst_weekly"),
+        params,
+        refresh=refresh,
+        cache_day=cache_day,
+    )
+
+
+def parse_dst_row(row: dict) -> dict | None:
+    """One team-week of DEF actuals. None when it looks like a player row.
+
+    Join key is ``(team_fd)`` after the season/week query. ``fd_points`` is
+    required. A skill row with ``player_name`` is left to the player index.
+    """
+    if not isinstance(row, dict):
+        return None
+    if _str(row.get("player_name") or row.get("name") or row.get("player")):
+        return None
+    team_raw = _str(row.get("team_fd") or row.get("team"))
+    fd_points = _float(row.get("fd_points"))
+    if not team_raw or fd_points is None:
+        return None
+    try:
+        team = require_fd(team_raw).fd
+    except UnmappedTeam:
+        return None
+    return {
+        "team_fd": team,
+        "week": _int(row.get("week")),
+        "season": _int(row.get("season")) or 0,
+        "fd_points": fd_points,
     }
 
 

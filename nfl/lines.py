@@ -852,8 +852,18 @@ def _lines_from_rows(
     raw: list[dict],
     slate: list[tuple[str, str, str]],
 ) -> dict[str, TeamLine]:
+    """Map rows onto the slate. An unparseable close is a lines error.
+
+    ``_ingest_week_lines`` catches that and tries ``game_lines``.
+    """
+    try:
+        games = map_game_lines(raw)
+    except GangstashDataError as e:
+        raise LinesError(str(e)) from e
+    if not games:
+        raise LinesError("line rows had no parseable spread/total")
     return team_lines_from_gangstash(
-        map_game_lines(raw),
+        games,
         slate,
         start=_HISTORICAL_START,
         end=_HISTORICAL_END,

@@ -48,6 +48,7 @@ DATASET_ENV = {
     "player_stats_weekly": "GANGSTASH_PLAYER_STATS_WEEKLY_DATASET",
     "closing_lines": "GANGSTASH_CLOSING_LINES_DATASET",
     "injuries": "GANGSTASH_INJURIES_DATASET",
+    "dst_weekly": "GANGSTASH_DST_WEEKLY_DATASET",
 }
 
 

@@ -730,6 +730,102 @@ class GameLinesTest(unittest.TestCase):
         self.assertAlmostEqual(row.spread, -2.5)
         self.assertAlmostEqual(row.home_moneyline or 0, -130)
 
+    def test_live_closing_row_uses_home_line_and_implied_totals(self) -> None:
+        games = (
+            ("SF", "MIA", -12.5, 44.5, 28.50, 16.00),
+            ("BAL", "NO", -8.5, 45.5, 27.00, 18.50),
+            ("PHI", "TEN", -7.0, 39.5, 23.25, 16.25),
+        )
+        for home, away, home_line, total, home_impl, away_impl in games:
+            row = parse_game_line(
+                {
+                    "season": 2026,
+                    "week": 2,
+                    "home_team": home,
+                    "away_team": away,
+                    "home_line": home_line,
+                    "total": total,
+                    "implied_home_total": home_impl,
+                    "implied_away_total": away_impl,
+                    "is_final": True,
+                    "kickoff": None,
+                }
+            )
+            self.assertIsNotNone(row)
+            assert row is not None
+            self.assertEqual(row.home_fd, home)
+            self.assertEqual(row.away_fd, away)
+            self.assertIsNone(row.commence_time)
+            implied_home = (row.total - row.spread) / 2
+            implied_away = (row.total + row.spread) / 2
+            self.assertAlmostEqual(implied_home, home_impl, places=2)
+            self.assertAlmostEqual(implied_away, away_impl, places=2)
+            self.assertGreater(implied_home, implied_away)
+
+        line_only = parse_game_line(
+            {
+                "home_team": "SF",
+                "away_team": "MIA",
+                "home_line": -12.5,
+                "total": 44.5,
+                "kickoff": None,
+            }
+        )
+        assert line_only is not None
+        self.assertAlmostEqual(line_only.spread, -12.5, places=4)
+        self.assertAlmostEqual((line_only.total - line_only.spread) / 2, 28.5, places=4)
+
+        contradicted = parse_game_line(
+            {
+                "home_team": "SF",
+                "away_team": "MIA",
+                "home_line": 3.0,
+                "total": 40.0,
+                "implied_home_total": 28.5,
+                "implied_away_total": 16.0,
+            }
+        )
+        assert contradicted is not None
+        self.assertAlmostEqual(contradicted.spread, -12.5, places=4)
+        self.assertAlmostEqual(contradicted.total, 44.5, places=4)
+        self.assertIsNone(
+            parse_game_line(
+                {"home_team": "CAR", "away_team": "ATL", "season": 2026, "week": 2}
+            )
+        )
+
+    def test_unparseable_closing_row_falls_back_to_game_lines(self) -> None:
+        closing = [
+            {"home_team": "CAR", "away_team": "ATL", "season": 2026, "week": 2, "kickoff": None}
+        ]
+        game = [
+            {
+                "home_team_fd": "PHI",
+                "away_team_fd": "DAL",
+                "season": 2026,
+                "week": 2,
+                "spread": -3.5,
+                "total": 45.5,
+            }
+        ]
+        players = [_pl()]
+        with patch(
+            "nfl.lines.fetch_closing_lines",
+            return_value=(closing, {"live": False}),
+        ), patch(
+            "nfl.lines.fetch_game_lines",
+            return_value=(game, {"live": False}),
+        ) as game_fetch:
+            by_team = ingest_slate_lines(
+                players,
+                slate_day=date(2026, 9, 13),
+                source="gangstash",
+                season=2026,
+                week=2,
+            )
+        game_fetch.assert_called_once()
+        self.assertAlmostEqual(by_team["PHI"].total, 45.5, places=4)
+
     def test_implied_totals_derive_spread_and_total(self) -> None:
         row = parse_game_line(
             {

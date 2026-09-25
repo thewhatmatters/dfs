@@ -78,6 +78,7 @@ python3 -m nfl.gangstash_data team-stats-weekly --season 2026 --week 1,2
 | `GANGSTASH_PLAYER_STATS_WEEKLY_DATASET` | `player_stats_weekly` | `dataset=` value |
 | `GANGSTASH_CLOSING_LINES_DATASET` | `closing_lines` | `dataset=` value |
 | `GANGSTASH_INJURIES_DATASET` | `injuries` | `dataset=` value |
+| `GANGSTASH_DST_WEEKLY_DATASET` | `dst_weekly` | `dataset=` value |
 
 ## Queries this client sends
 
@@ -85,11 +86,12 @@ python3 -m nfl.gangstash_data team-stats-weekly --season 2026 --week 1,2
 |---------|--------|--------|
 | `targets` | `season` (required), `week` (single or `1,2`), optional `position` (`WR`/`TE`/`RB`), `team` | season is the FanDuel CSV year. 2026 weeks 1–2 are loaded (640 rows) |
 | `game_lines` | `date=YYYY-MM-DD` (ET kickoff) **or** `season` + one `week` | optimizer sends the slate **date** only, unless `--week` is set |
-| `closing_lines` | `season` + one `week` | preferred for a past `--week` and for `nfl.backtest`. Not deployed yet (Unknown dataset is printed, then `game_lines`). Implied team totals are enough when spread and total are absent |
+| `closing_lines` | `season` + one `week` | preferred for a past `--week` and for `nfl.backtest`. Live rows use `home_line` (negative = home favored), `total`, `implied_home_total`, `implied_away_total`. `kickoff` may be null. A row that still will not parse is skipped and the week falls through to `game_lines` |
 | `depth_charts` | optional `team`, `position` (that is `pos_abb`), `pos_grp`, `season`, `week` | optimizer requests `pos_grp=3WR 1TE`. A chart with no `week` column is the current chart |
 | `injuries` | `season` + one `week` | not deployed. Backtest uses the FanDuel CSV indicator and ignores an Unknown dataset |
 | `team_stats` | `season` (required), `season_type` (default `REG`), optional `side` (`offense`/`defense`), `team` | not scored |
-| `team_stats_weekly` | `season` + `week` (single or comma list), optional `team` | not scored. Adds `week`, `opponent`, `game_id` on each row |
+| `team_stats_weekly` | `season` + `week` (single or comma list), optional `team` | backtest pools weeks before the target into team EPA variance. The optimizer still overlays rates on the season board |
+| `dst_weekly` | `season` (required), optional `week`, optional `team` | DEF actuals for the backtest. Join is `(season, week, team)`. `fd_points` is the FanDuel score |
 | `snaps` | `season` (required), `week` (single or `1,2`), optional `position` (`WR`/`TE`/`RB`), `team` (FD or nflverse; `JAC` and `JAX` both work) | 2026 weeks 1–2 are 2,994 rows (185 RB, 335 WR, 220 TE). `offense_pct` is a 0–1 fraction |
 
 ## Response fields
@@ -127,24 +129,33 @@ dropped when `commence_time` is present. A missing slate game is
 (stop — no silent FPPG).
 
 **`closing_lines`:** same join as `game_lines`. A past week
-(`nfl.optimize --week`, `nfl.backtest`) tries this dataset first. The
-dataset is nflverse-sourced. Rows may send `home_implied_total` /
-`home_implied_tt` and `away_implied_total` / `away_implied_tt` instead of
-`spread` and `total`. When both implied totals are present they win: total
-is the sum, and home spread is away implied minus home implied (negative
-when home is favored). Otherwise nflverse `spread_line` is positive when
-the home team is favored, so the stored home spread is `-spread_line` and
-the total is `total_line` (not the final-score `total` column). A plain
-`spread` column is already the Odds sign and is not flipped. An empty close
-falls through to `game_lines`. The live API currently returns Unknown
-dataset. The backtest prints `closing_lines: not available (Unknown dataset)`
-and does not treat that as a quiet skip. If `game_lines` also fails and no
-`--lines-file` was given, the backtest stops unless `--allow-missing-lines`.
+(`nfl.optimize --week`, `nfl.backtest`) tries this dataset first. Live rows
+use `home_team`, `away_team`, `home_line` (negative when home is favored,
+the Odds sign, not flipped), `total`, `implied_home_total`,
+`implied_away_total`, and `kickoff` (null on the rows seen so far). Implied
+totals win when both are present: total is the sum, and home spread is away
+implied minus home implied. nflverse-shaped rows may still send
+`home_implied_total` / `home_implied_tt` and `spread_line` (positive when
+home is favored, stored as `-spread_line`) with `total_line` rather than the
+final-score `total`. A plain `spread` column is already the Odds sign and is
+not flipped. A row that still has no spread and total is skipped. If the
+close then does not cover the slate, the week uses `game_lines` instead of
+raising. Unknown dataset is still printed (`closing_lines: not available
+(Unknown dataset)`) and is not a quiet skip. If `game_lines` also fails and
+no `--lines-file` was given, the backtest stops unless
+`--allow-missing-lines`. A line failure is `choke LINES`, including a
+spread/total parse error. It is not `choke PLAYER_STATS_WEEKLY`. When every
+kickoff is null, prop snapshots use Sunday 17:00 UTC of that 2026 week
+(Thursday would drop Friday–Sunday scrapes). Depth snapshots stay on the
+Thursday guess.
 `--lines-file` (CSV or JSON) still wins over both. A file with `season`,
 `week`, `home_team`, `away_team`, `spread_line`, and `total_line` is an
-nflverse schedule: `game_id`, `gameday`, `gametime`, `home_line`,
-`away_line`, moneylines, `*_spread_odds`, `under_odds`, `over_odds`, and
-`home_implied_tt` / `away_implied_tt` are ignored. `JAX`→`JAC`, `LA`→`LAR`.
+nflverse schedule: `game_id`, `gameday`, `gametime`, `away_line`,
+moneylines, `*_spread_odds`, `under_odds`, `over_odds`, and
+`home_implied_tt` / `away_implied_tt` are ignored. On that file, `home_line`
+stays ignored because `spread_line` is the schedule column (positive when
+home is favored). The live closing API is the path that reads `home_line`
+as the Odds sign. `JAX`→`JAC`, `LA`→`LAR`.
 A missing required column, or zero games after the season/week filter, is
 an error. A simple file (no nflverse schedule columns) still errors on a
 column the reader does not know.

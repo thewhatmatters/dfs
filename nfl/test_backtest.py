@@ -1244,5 +1244,232 @@ def week2_fixture_report() -> str:
     return report.to_text()
 
 
+class LiveBacktestFixesTest(unittest.TestCase):
+    def test_null_kickoff_uses_sunday_and_drops_postgame_props(self) -> None:
+        from datetime import datetime, timezone
+
+        from nfl.backtest import earliest_kickoff, prop_kickoff
+
+        rows = [{"home_team": "SF", "away_team": "MIA", "kickoff": None}]
+        self.assertIsNone(earliest_kickoff(rows))
+        self.assertEqual(
+            earliest_kickoff([{"gameday": "2026-09-20"}]),
+            datetime(2026, 9, 20, 17, 0, tzinfo=timezone.utc),
+        )
+        stamp, note = prop_kickoff(rows, season=2026, week=2)
+        self.assertEqual(stamp, datetime(2026, 9, 20, 17, 0, tzinfo=timezone.utc))
+        self.assertIn("week schedule", note or "")
+        kept = props_for_week(
+            [
+                {
+                    "season": 2026,
+                    "week": 2,
+                    "scraped_at": "2026-09-20T12:00:00Z",
+                    "player_name": "Early",
+                },
+                {
+                    "season": 2026,
+                    "week": 2,
+                    "scraped_at": "2026-09-21T12:00:00Z",
+                    "player_name": "Late",
+                },
+            ],
+            season=2026,
+            week=2,
+            kickoff=stamp,
+        )
+        self.assertEqual([row["player_name"] for row in kept], ["Early"])
+
+    def test_dst_weekly_is_a_def_row(self) -> None:
+        defense = _pl(
+            pid="dst:DET",
+            name="Detroit Lions",
+            position="D",
+            team="DET",
+            salary=0,
+            fppg=None,
+        )
+        dst = {
+            "season": 2026,
+            "week": 2,
+            "team": "DET",
+            "fd_points": 9.0,
+            "sacks": 3,
+            "ints": 1,
+            "points_allowed": 17,
+            "points_allowed_fd": 4,
+        }
+        report = run_backtest(
+            [defense],
+            [dst],
+            season=2026,
+            week=2,
+            n=20,
+            seed=1,
+            sim_inputs=None,
+        )
+        positions = [row.position for row in report.rows]
+        self.assertIn("DEF", positions)
+        def_row = next(row for row in report.rows if row.position == "DEF")
+        self.assertEqual(def_row.n, 1)
+        self.assertIn("DEF", report.to_text())
+        starter_pos = [row.position for row in report.starters]
+        self.assertIn("DEF", starter_pos)
+
+    def test_unparseable_closing_falls_back_without_blaming_player_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "players.csv"
+            csv_path.write_text(
+                "Id,Position,Nickname,Salary,Team,Opponent,Game,FPPG,Injury Indicator,Roster Position\n"
+                "1,QB,Jared Goff,8000,DET,NO,NO@DET,,,\n",
+                encoding="utf-8",
+            )
+            closing = [
+                {
+                    "season": 2026,
+                    "week": 2,
+                    "home_team": "CAR",
+                    "away_team": "ATL",
+                    "kickoff": None,
+                }
+            ]
+            game = [
+                {
+                    "home_team_fd": "DET",
+                    "away_team_fd": "NO",
+                    "season": 2026,
+                    "week": 2,
+                    "spread": -3.0,
+                    "total": 47.0,
+                }
+            ]
+            with patch(
+                "nfl.backtest.fetch_player_stats_weekly",
+                return_value=([_actual("Jared Goff", "DET", 18.0, pass_attempts=30)], {}),
+            ), patch(
+                "nfl.backtest.fetch_dst_weekly",
+                return_value=([], {}),
+            ), patch(
+                "nfl.backtest.fetch_closing_lines",
+                return_value=(closing, {}),
+            ), patch(
+                "nfl.backtest.fetch_game_lines",
+                return_value=(game, {}),
+            ), patch(
+                "nfl.backtest.fetch_week_injuries",
+                return_value=([], {}),
+            ), patch(
+                "nfl.backtest.fetch_depth_charts",
+                return_value=([_depth("Jared Goff", "DET", "QB", 1)], {}),
+            ), patch(
+                "nfl.backtest.load_optimizer_targets",
+                return_value=([], {}),
+            ), patch(
+                "nfl.backtest.load_optimizer_snaps",
+                return_value=([], {}),
+            ), patch(
+                "nfl.backtest.fetch_props",
+                return_value=([], {}),
+            ), patch(
+                "nfl.backtest.resolve_sim_inputs",
+                return_value=(None, ""),
+            ), patch("nfl.gangstash.http_json", side_effect=AssertionError("network")):
+                err = io.StringIO()
+                buf = io.StringIO()
+                with redirect_stderr(err), redirect_stdout(buf):
+                    code = main(
+                        ["--csv", str(csv_path), "--season", "2026", "--week", "2", "--n", "15"]
+                    )
+        self.assertEqual(code, 0)
+        self.assertNotIn("PLAYER_STATS_WEEKLY", err.getvalue())
+        self.assertIn("QB", buf.getvalue())
+        self.assertIn("kickoff missing", buf.getvalue())
+
+    def test_no_csv_pool_scores_starters_hindsight_and_def(self) -> None:
+        closing = [
+            {
+                "season": 2026,
+                "week": 2,
+                "home_team": "DET",
+                "away_team": "NO",
+                "home_line": -3.0,
+                "total": 47.0,
+                "implied_home_total": 25.0,
+                "implied_away_total": 22.0,
+                "is_final": True,
+                "kickoff": None,
+            }
+        ]
+        depth = [
+            _depth("Jared Goff", "DET", "QB", 1),
+            _depth("Amon-Ra St. Brown", "DET", "WR", 1),
+            _depth("Jahmyr Gibbs", "DET", "RB", 1),
+            _depth("Sam LaPorta", "DET", "TE", 1),
+            _depth("Derek Carr", "NO", "QB", 1),
+            _depth("Chris Olave", "NO", "WR", 1),
+            _depth("Alvin Kamara", "NO", "RB", 1),
+            _depth("Juwan Johnson", "NO", "TE", 1),
+        ]
+        actual = [
+            _actual("Jared Goff", "DET", 18.0, pass_attempts=32, offense_snaps=60),
+            _actual("Amon-Ra St. Brown", "DET", 14.0, targets=8),
+        ]
+        dst = [
+            {
+                "season": 2026,
+                "week": 2,
+                "team": "DET",
+                "fd_points": 8.0,
+                "sacks": 2,
+                "points_allowed": 20,
+            }
+        ]
+        with patch(
+            "nfl.backtest.fetch_player_stats_weekly",
+            return_value=(actual, {}),
+        ), patch(
+            "nfl.backtest.fetch_dst_weekly",
+            return_value=(dst, {}),
+        ), patch(
+            "nfl.backtest.fetch_closing_lines",
+            return_value=(closing, {}),
+        ), patch(
+            "nfl.backtest.fetch_game_lines",
+            side_effect=AssertionError("game_lines"),
+        ), patch(
+            "nfl.backtest.fetch_week_injuries",
+            return_value=([], {}),
+        ), patch(
+            "nfl.backtest.fetch_depth_charts",
+            return_value=(depth, {}),
+        ), patch(
+            "nfl.backtest.load_optimizer_targets",
+            return_value=([], {}),
+        ), patch(
+            "nfl.backtest.load_optimizer_snaps",
+            return_value=([], {}),
+        ), patch(
+            "nfl.backtest.fetch_props",
+            return_value=([], {}),
+        ), patch(
+            "nfl.backtest.resolve_sim_inputs",
+            return_value=(None, ""),
+        ) as sim, patch("nfl.gangstash.http_json", side_effect=AssertionError("network")):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = main(["--season", "2026", "--week", "2", "--n", "20"])
+        self.assertEqual(code, 0)
+        self.assertEqual(sim.call_args.kwargs["team_stats_scope"], "weekly")
+        self.assertEqual(sim.call_args.kwargs["weeks"], [1])
+        text = buf.getvalue()
+        self.assertIn("salary omitted", text)
+        self.assertIn("value blank", text)
+        self.assertIn("pool: full", text)
+        self.assertIn("pool: starters", text)
+        self.assertIn("pool: hindsight", text)
+        self.assertIn("DEF", text)
+        self.assertIn("QB", text)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -262,6 +262,19 @@ def week_kickoff_guess(season: int, week: int) -> datetime | None:
     return datetime(2026, 9, 10, tzinfo=timezone.utc) + timedelta(days=7 * (int(week) - 1))
 
 
+def week_prop_cutoff(season: int, week: int) -> datetime | None:
+    """Sunday 17:00 UTC of the 2026 week.
+
+    Closing rows often have a null kickoff. Using Thursday as the prop
+    cutoff would drop Friday–Sunday pre-game scrapes. Depth snapshots stay
+    on the Thursday guess; only the prop filter uses this later stamp.
+    """
+    thursday = week_kickoff_guess(season, week)
+    if thursday is None:
+        return None
+    return thursday + timedelta(days=3, hours=17)
+
+
 def depth_rows_for_backtest(
     fetched: list[dict],
     *,

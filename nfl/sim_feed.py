@@ -46,11 +46,14 @@ def resolve_sim_inputs(
     weeks: list[int] | None,
     refresh_targets: bool = False,
     refresh_snaps: bool = False,
+    team_stats_scope: str = "season",
 ) -> tuple[SimInputs | None, str]:
     """File override, else the gangstash feed.
 
     A bad ``path`` raises ``SimInputError``. An unavailable feed returns
-    ``(None, note)`` and does not raise.
+    ``(None, note)`` and does not raise. ``team_stats_scope="weekly"`` is
+    the backtest path: team inputs are pooled ``team_stats_weekly`` rows
+    for ``weeks`` only. The season board is not fetched.
     """
     if path:
         return load_sim_inputs(path), f"sim inputs: file {path}"
@@ -59,6 +62,7 @@ def resolve_sim_inputs(
         weeks=weeks,
         refresh_targets=refresh_targets,
         refresh_snaps=refresh_snaps,
+        team_stats_scope=team_stats_scope,
     )
 
 
@@ -68,15 +72,23 @@ def load_gangstash_sim_inputs(
     weeks: list[int] | None,
     refresh_targets: bool = False,
     refresh_snaps: bool = False,
+    team_stats_scope: str = "season",
 ) -> tuple[SimInputs | None, str]:
     """Season team stats, optional weekly rates, target weeks, RB snaps.
 
     Each dataset is independent. A missing key with no cache skips that
     dataset. If nothing usable comes back, the note is ``UNAVAILABLE_NOTE``.
+    ``team_stats_scope="weekly"`` skips the season board and pools weekly
+    sums for ``weeks`` (weeks before the backtest target). An empty week
+    list leaves team inputs empty so dispersion stays at the league default.
     """
-    stats_rows, stats_meta, stats_err = _pull(
-        lambda: fetch_team_stats(season=season, refresh=False)
-    )
+    weekly_only = (team_stats_scope or "season").strip().lower() == "weekly"
+    if weekly_only:
+        stats_rows, stats_meta, stats_err = [], {}, None
+    else:
+        stats_rows, stats_meta, stats_err = _pull(
+            lambda: fetch_team_stats(season=season, refresh=False)
+        )
     # ``weeks=[]`` is a backtest of week 1: no prior week exists. Do not
     # pull the season-to-date board (that includes the week being scored).
     # ``weeks is None`` keeps the optimizer's "every completed week" pull.
@@ -120,7 +132,10 @@ def load_gangstash_sim_inputs(
         target_rows, target_meta, target_err = [], {}, None
         snap_rows, snap_meta, snap_err = [], {}, None
         stat_rows, stat_meta, stat_err = [], {}, None
-    team_stats = _team_stats(stats_rows, weekly_rows)
+    if weekly_only:
+        team_stats = _pooled_weekly_rows(weekly_rows)
+    else:
+        team_stats = _team_stats(stats_rows, weekly_rows)
     targets = _targets(target_rows)
     snaps = _snaps(snap_rows)
     carries = _carries(stat_rows)
@@ -156,6 +171,8 @@ def load_gangstash_sim_inputs(
         f"player_weeks {len(inputs.player_weeks)}  "
         f"team_weeks {len(inputs.team_weeks)}"
     )
+    if weekly_only:
+        note += "  team_stats_scope weekly"
     if stale:
         note += "  stale cache"
     if skipped:
@@ -315,6 +332,165 @@ def _as_row(stat: TeamStat) -> dict:
         "sack_rate": stat.sack_rate,
         "air_yards_per_attempt_allowed": stat.air_yards_per_attempt_allowed,
     }
+
+
+def _pooled_weekly_rows(rows: list[dict]) -> list[dict]:
+    """Sum weekly team rows into one offense and one defense board per team.
+
+    ``epa_var`` stays empty so ``epa_variance`` uses the pooled sums. A
+    missing square-sum drops that variance (league default) instead of
+    mixing a partial second moment. Rates are play-weighted.
+    """
+    parsed: list[TeamStat] = []
+    for row in rows:
+        mapped = _mapped_team_row(row)
+        if mapped is None:
+            continue
+        stat = team_stat_from_row(mapped)
+        if stat is not None:
+            parsed.append(stat)
+    grouped: dict[tuple[str, str], list[TeamStat]] = {}
+    for stat in parsed:
+        side = (stat.side or "offense").strip().lower() or "offense"
+        grouped.setdefault((stat.team_fd, side), []).append(stat)
+    return [_as_row(_pool_team_side(team, side, items)) for (team, side), items in grouped.items()]
+
+
+def _pool_team_side(team: str, side: str, rows: list[TeamStat]) -> TeamStat:
+    n = _sum_counts(rows, "n")
+    pass_n = _sum_counts(rows, "pass_n")
+    rush_n = _sum_counts(rows, "rush_n")
+    early_pass_n = _sum_counts(rows, "early_down_pass_n")
+    early_rush_n = _sum_counts(rows, "early_down_rush_n")
+    epa_sum = _sum_epa(rows, "epa_sum", "epa_per_play", "n")
+    pass_epa_sum = _sum_epa(rows, "pass_epa_sum", "pass_epa_per_play", "pass_n")
+    rush_epa_sum = _sum_epa(rows, "rush_epa_sum", "rush_epa_per_play", "rush_n")
+    return TeamStat(
+        team_fd=team,
+        side=side,
+        pass_rate=_weighted_mean(rows, "pass_rate", "n"),
+        neutral_pass_rate=_weighted_mean(rows, "neutral_pass_rate", "n"),
+        proe=_weighted_mean(rows, "proe", "n"),
+        epa_per_play=(epa_sum / n) if epa_sum is not None and n else None,
+        epa_var=None,
+        n=n,
+        epa_sum=epa_sum,
+        epa_sq_sum=_sum_squares(rows, "epa_sq_sum", "n"),
+        pass_n=pass_n,
+        rush_n=rush_n,
+        pass_epa_sum=pass_epa_sum,
+        pass_epa_sq_sum=_sum_squares(rows, "pass_epa_sq_sum", "pass_n"),
+        rush_epa_sum=rush_epa_sum,
+        rush_epa_sq_sum=_sum_squares(rows, "rush_epa_sq_sum", "rush_n"),
+        pass_epa_var=None,
+        rush_epa_var=None,
+        week=None,
+        pass_epa_per_play=(
+            (pass_epa_sum / pass_n) if pass_epa_sum is not None and pass_n else None
+        ),
+        rush_epa_per_play=(
+            (rush_epa_sum / rush_n) if rush_epa_sum is not None and rush_n else None
+        ),
+        pass_success_rate=_weighted_mean(rows, "pass_success_rate", "pass_n"),
+        rush_success_rate=_weighted_mean(rows, "rush_success_rate", "rush_n"),
+        success_rate=_weighted_mean(rows, "success_rate", "n"),
+        explosive_rate=_weighted_mean(rows, "explosive_rate", "n"),
+        red_zone_td_rate=_weighted_mean(rows, "red_zone_td_rate", "n"),
+        third_down_rate=_weighted_mean(rows, "third_down_rate", "n"),
+        early_down_pass_epa_per_play=_weighted_mean(
+            rows, "early_down_pass_epa_per_play", "early_down_pass_n"
+        ),
+        early_down_pass_n=early_pass_n,
+        early_down_pass_success_rate=_weighted_mean(
+            rows, "early_down_pass_success_rate", "early_down_pass_n"
+        ),
+        early_down_rush_epa_per_play=_weighted_mean(
+            rows, "early_down_rush_epa_per_play", "early_down_rush_n"
+        ),
+        early_down_rush_n=early_rush_n,
+        early_down_rush_success_rate=_weighted_mean(
+            rows, "early_down_rush_success_rate", "early_down_rush_n"
+        ),
+        plays_per_game=_weighted_mean(rows, "plays_per_game", "n"),
+        seconds_per_play=_weighted_mean(rows, "seconds_per_play", "n"),
+        neutral_plays_per_game=_weighted_mean(rows, "neutral_plays_per_game", "n"),
+        neutral_seconds_per_play=_weighted_mean(rows, "neutral_seconds_per_play", "n"),
+        yards_per_carry_allowed=_weighted_mean(rows, "yards_per_carry_allowed", "rush_n"),
+        yards_per_dropback_allowed=_weighted_mean(
+            rows, "yards_per_dropback_allowed", "pass_n"
+        ),
+        yards_per_attempt_allowed=_weighted_mean(
+            rows, "yards_per_attempt_allowed", "pass_n"
+        ),
+        sack_rate=_weighted_mean(rows, "sack_rate", "pass_n"),
+        air_yards_per_attempt_allowed=_weighted_mean(
+            rows, "air_yards_per_attempt_allowed", "pass_n"
+        ),
+    )
+
+
+def _sum_counts(rows: list[TeamStat], attr: str) -> int | None:
+    total = 0
+    any_count = False
+    for row in rows:
+        raw = getattr(row, attr)
+        if raw is None:
+            continue
+        total += int(raw)
+        any_count = True
+    return total if any_count else None
+
+
+def _sum_epa(
+    rows: list[TeamStat], sum_attr: str, per_attr: str, n_attr: str
+) -> float | None:
+    """Sum EPA. ``epa_per_play * n`` fills a missing sum. A play count with neither is a gap."""
+    total = 0.0
+    any_part = False
+    for row in rows:
+        count = getattr(row, n_attr) or 0
+        direct = getattr(row, sum_attr)
+        per = getattr(row, per_attr)
+        if direct is not None:
+            total += float(direct)
+            any_part = True
+        elif per is not None and count:
+            total += float(per) * int(count)
+            any_part = True
+        elif count:
+            return None
+    return total if any_part else None
+
+
+def _sum_squares(rows: list[TeamStat], sq_attr: str, n_attr: str) -> float | None:
+    """Square-sum only when every row that has plays also has the square sum."""
+    total = 0.0
+    any_part = False
+    for row in rows:
+        count = getattr(row, n_attr) or 0
+        sq = getattr(row, sq_attr)
+        if sq is None:
+            if count:
+                return None
+            continue
+        total += float(sq)
+        any_part = True
+    return total if any_part else None
+
+
+def _weighted_mean(rows: list[TeamStat], val_attr: str, n_attr: str) -> float | None:
+    num = 0.0
+    den = 0.0
+    for row in rows:
+        val = getattr(row, val_attr)
+        count = getattr(row, n_attr)
+        if val is None or not count:
+            continue
+        num += float(val) * int(count)
+        den += int(count)
+    if den <= 0:
+        return None
+    return num / den
 
 
 def _mapped_team_row(row: dict) -> dict | None:

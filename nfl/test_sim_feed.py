@@ -218,6 +218,88 @@ class SimFeedTest(unittest.TestCase):
             inputs, _note = resolve_sim_inputs(path=None, season=2026, weeks=None)
         self.assertEqual(inputs.team_stats[0].team_fd, "JAC")
 
+    def test_weekly_scope_pools_prior_weeks_and_skips_the_season_board(self) -> None:
+        season = [
+            {
+                "team_fd": "DET",
+                "side": "offense",
+                "n": 400,
+                "epa_sum": 800,
+                "epa_sq_sum": 5000,
+                "epa_var": 99,
+                "pass_rate": 0.9,
+            }
+        ]
+        weekly = [
+            {
+                "team_fd": "DET",
+                "side": "offense",
+                "week": 1,
+                "n": 60,
+                "epa_sum": 6,
+                "epa_sq_sum": 30,
+                "pass_rate": 0.55,
+                "pass_n": 35,
+                "rush_n": 25,
+            },
+            {
+                "team_fd": "DET",
+                "side": "offense",
+                "week": 2,
+                "n": 70,
+                "epa_sum": 70,
+                "epa_sq_sum": 200,
+                "pass_rate": 0.80,
+                "pass_n": 40,
+                "rush_n": 30,
+            },
+        ]
+        with patch(
+            "nfl.sim_feed.fetch_team_stats",
+            return_value=(season, {"cache_stale": False}),
+        ) as stats, patch(
+            "nfl.sim_feed.fetch_team_stats_weekly",
+            return_value=(weekly, {"cache_stale": False}),
+        ), patch(
+            "nfl.sim_feed.fetch_targets",
+            return_value=([], {"cache_stale": False}),
+        ), patch(
+            "nfl.sim_feed.fetch_snaps",
+            return_value=([], {"cache_stale": False}),
+        ), patch(
+            "nfl.sim_feed.fetch_player_stats_weekly",
+            return_value=([], {"cache_stale": False}),
+        ), patch("nfl.gangstash.http_json", side_effect=AssertionError("network")):
+            inputs, note = resolve_sim_inputs(
+                path=None,
+                season=2026,
+                weeks=[1],
+                team_stats_scope="weekly",
+            )
+        stats.assert_not_called()
+        self.assertIn("weekly", note)
+        det = next(row for row in inputs.team_stats if row.team_fd == "DET" and row.is_offense)
+        self.assertEqual(det.n, 60)
+        self.assertAlmostEqual(det.pass_rate or 0, 0.55, places=6)
+        self.assertAlmostEqual(det.epa_variance() or 0, (30 - (6.0 ** 2) / 60) / 59, places=6)
+        self.assertEqual(len(inputs.team_weeks), 1)
+        self.assertEqual(inputs.team_weeks[0].week, 1)
+
+    def test_week_1_weekly_scope_has_no_team_board(self) -> None:
+        with patch("nfl.sim_feed.fetch_team_stats") as stats, patch(
+            "nfl.sim_feed.fetch_team_stats_weekly"
+        ) as weekly, patch("nfl.gangstash.http_json", side_effect=AssertionError("network")):
+            inputs, note = resolve_sim_inputs(
+                path=None,
+                season=2026,
+                weeks=[],
+                team_stats_scope="weekly",
+            )
+        stats.assert_not_called()
+        weekly.assert_not_called()
+        self.assertIsNone(inputs)
+        self.assertEqual(note, UNAVAILABLE_NOTE)
+
 
 if __name__ == "__main__":
     unittest.main()
