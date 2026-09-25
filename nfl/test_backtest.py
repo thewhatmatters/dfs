@@ -1516,6 +1516,12 @@ class LiveBacktestFixesTest(unittest.TestCase):
             text.splitlines()[0],
             "backtest season 2026 week 2  n 1  sim efficiency: placeholder",
         )
+        self.assertIn(
+            "sim inputs missing; sim efficiency data fell back to placeholder",
+            text,
+        )
+        from nfl.sim_inputs import SimInputs
+
         data = run_backtest(
             [defense],
             [dst],
@@ -1523,7 +1529,7 @@ class LiveBacktestFixesTest(unittest.TestCase):
             week=2,
             n=20,
             seed=1,
-            sim_inputs=None,
+            sim_inputs=SimInputs(),
             efficiency="data",
         )
         self.assertEqual(

@@ -47,3 +47,5 @@ Still not drawn: fumbles lost, two-point conversions, return TDs. DEF events oth
 2. Otherwise build the projection from team pass/rush volume × role share × `skill_fd_points`, with the bonus as `P(yards ≥ line) × 3` on the mean and as a per-game +3 in the sim.
 3. Keep printing today's `week1_score` beside it until a weeks-1–2 backtest shows the new mean error by position, and the optimal lineup's actual `fd_points` sum versus the projected sum.
 4. Only then consider making `--projection-source sim` the default.
+
+The default ILP mean is now `--projection-source sim` (10000 draws, `--sim-efficiency data`). `--projection-source board` opts out. Missing sim inputs fall back to the board and to placeholder efficiency. Steps 1–3 above are still not applied.

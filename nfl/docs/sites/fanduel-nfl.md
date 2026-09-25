@@ -163,7 +163,7 @@ Independent `week1_score` stays the **printed Proj**. The ILP objective adds a h
 
 Product binaries: `bonus ≤ x_qb`, `bonus ≤ x_wr`. RB/DST do not get the premium (Hampton rushing is not Herbert pass volume). Displayed picker Proj remains `week1_score` — do not lie on the board. Notes: `stack premium on`.
 
-This is **not** a full game copula / PBP copula / SaberSim. Do not fake a cash-150 ceiling. `--sim` is a layered game draw (Vegas total+spread, scripted volume, joint opportunity shares). Layers and inputs: [`../data/sim.md`](../data/sim.md). The ILP `mean` objective stays `week1_score` unless `--projection-source sim` (simulated mean; board kept for comparison). Default is `board`. A board-optimal sum near 70 is the share model, not a missing bonus; see [`../data/projection-scale.md`](../data/projection-scale.md). Shares are unchanged.
+This is **not** a full game copula / PBP copula / SaberSim. Do not fake a cash-150 ceiling. `--sim` is a layered game draw (Vegas total+spread, scripted volume, joint opportunity shares). Layers and inputs: [`../data/sim.md`](../data/sim.md). The ILP `mean` objective is the simulated mean (`--projection-source sim`, the default). `--projection-source board` keeps `week1_score`. Missing sim inputs fall back to the board. A board-optimal sum near 70 is the share model, not a missing bonus; see [`../data/projection-scale.md`](../data/projection-scale.md). Shares are unchanged.
 
 Helpers:
 

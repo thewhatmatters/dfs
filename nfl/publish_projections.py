@@ -13,9 +13,10 @@ Read key: GANGSTASH_API_KEY (existing /data and /props clients).
 `--sim N` also posts model=sim. Draws and percentiles come from
 `simulate_games` with the same gangstash `SimInputs` the optimizer
 builds for `--projection-source sim`. `mean` is that simulated mean.
-`--sim-efficiency` matches the optimizer (default `placeholder`).
+`--sim-efficiency` matches the optimizer (default `data`).
 The run log prints that mode, and each sim row stores it on
-`inputs.sim_efficiency`. Missing sim publishes the board and says so.
+`inputs.sim_efficiency`. Missing sim inputs fall back to placeholder
+and the board, and the log says so. The nightly publish still posts.
 """
 
 from __future__ import annotations
@@ -209,7 +210,7 @@ def maybe_sim(
     season: int,
     refresh: bool,
     week: int | None = None,
-    sim_efficiency: str = "placeholder",
+    sim_efficiency: str = "data",
 ) -> dict | None:
     """pid → SimStats for model=sim.
 
@@ -251,22 +252,42 @@ def maybe_sim(
     print(note, file=sys.stderr)
     if "stale cache" in note:
         raise StaleInputs("sim inputs cache is stale")
-    from nfl.sim_efficiency import build_efficiency
+    from nfl.sim_efficiency import resolve_run_efficiency
 
-    result = fn(
-        [e.player for e in entries],
-        n=int(n),
-        seed=int(seed),
-        inputs=sim_inputs,
-        efficiency=build_efficiency(
-            sim_efficiency,
-            sim_inputs,
-            before_week=week,
-        ),
+    efficiency, _used, efficiency_note = resolve_run_efficiency(
+        sim_efficiency,
+        sim_inputs,
+        before_week=week,
     )
+    if efficiency_note:
+        print(efficiency_note, file=sys.stderr)
+    if sim_inputs is None:
+        print(
+            "sim inputs missing; sim fell back to board; publishing board only",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        result = fn(
+            [e.player for e in entries],
+            n=int(n),
+            seed=int(seed),
+            inputs=sim_inputs,
+            efficiency=efficiency,
+        )
+    except Exception as e:
+        print(
+            f"sim failed ({e}); sim fell back to board; publishing board only",
+            file=sys.stderr,
+        )
+        return None
     by_pid = getattr(result, "by_pid", None)
     if not isinstance(by_pid, dict):
-        raise PublishError("simulate_games did not return by_pid")
+        print(
+            "sim fell back to board; publishing board only",
+            file=sys.stderr,
+        )
+        return None
     return by_pid
 
 
@@ -691,7 +712,7 @@ def projection_rows(
     run_at: str,
     model_version: str,
     sim_by_pid: dict | None = None,
-    sim_efficiency: str = "placeholder",
+    sim_efficiency: str = "data",
 ) -> list[dict]:
     rows: list[dict] = []
     for entry in entries:
@@ -931,10 +952,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument(
         "--sim-efficiency",
         choices=("placeholder", "data"),
-        default="placeholder",
-        help="layer-4 efficiency for --sim: placeholder (default) keeps "
-        "league averages; data uses shrunk gangstash rates. Same flag as "
-        "nfl.optimize.",
+        default="data",
+        help="layer-4 efficiency for --sim (default data). placeholder keeps "
+        "league averages. Missing sim inputs fall back to placeholder and "
+        "the board, and the log says so. Same flag as nfl.optimize.",
     )
     ap.add_argument(
         "--dry-run",

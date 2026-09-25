@@ -124,9 +124,11 @@ class FlagsTest(unittest.TestCase):
         self.assertEqual(seed.sim_seed, 7)
         default_seed = parse_args(["--csv", "x.csv"])
         self.assertEqual(default_seed.sim_seed, 1)
-        self.assertEqual(default_seed.sim_efficiency, "placeholder")
-        data_eff = parse_args(["--csv", "x.csv", "--sim-efficiency", "data"])
-        self.assertEqual(data_eff.sim_efficiency, "data")
+        self.assertEqual(default_seed.sim_efficiency, "data")
+        placeholder = parse_args(
+            ["--csv", "x.csv", "--sim-efficiency", "placeholder"]
+        )
+        self.assertEqual(placeholder.sim_efficiency, "placeholder")
         self.assertIsNone(default_seed.sim_inputs)
         loaded = parse_args(
             ["--csv", "x.csv", "--sim-inputs", "nfl/testdata/sim_layers.json"]
@@ -140,26 +142,39 @@ class FlagsTest(unittest.TestCase):
         self.assertEqual(floor.objective, "floor")
         ceil = parse_args(["--csv", "x.csv", "--objective=ceiling"])
         self.assertEqual(ceil.objective, "ceiling")
-        self.assertEqual(_sim_n(off), 0)
+        self.assertEqual(_sim_n(off), DEFAULT_DRAWS)
         self.assertEqual(_sim_n(floor), DEFAULT_DRAWS)
         self.assertEqual(
             _sim_n(parse_args(["--csv", "x.csv", "--objective", "floor", "--sim", "500"])),
             500,
         )
-        # --sim=0 is off only for mean; floor still runs default draws.
+        # --sim=0 does not turn off the default sim projection source.
+        # floor still runs default draws. Board is the opt-out.
         self.assertEqual(
             _sim_n(parse_args(["--csv", "x.csv", "--objective", "floor", "--sim", "0"])),
             DEFAULT_DRAWS,
         )
         self.assertEqual(
             _sim_n(parse_args(["--csv", "x.csv", "--sim", "0"])),
+            DEFAULT_DRAWS,
+        )
+        self.assertEqual(
+            _sim_n(
+                parse_args(
+                    ["--csv", "x.csv", "--projection-source", "board", "--sim", "0"]
+                )
+            ),
             0,
         )
 
-    def test_projection_source_defaults_to_board(self):
+    def test_projection_source_defaults_to_sim(self):
         off = parse_args(["--csv", "x.csv"])
-        self.assertEqual(off.projection_source, "board")
-        self.assertEqual(_sim_n(off), 0)
+        self.assertEqual(off.projection_source, "sim")
+        self.assertEqual(off.sim_efficiency, "data")
+        self.assertEqual(_sim_n(off), DEFAULT_DRAWS)
+        board = parse_args(["--csv", "x.csv", "--projection-source", "board"])
+        self.assertEqual(board.projection_source, "board")
+        self.assertEqual(_sim_n(board), 0)
         chosen = parse_args(["--csv", "x.csv", "--projection-source", "sim"])
         self.assertEqual(chosen.projection_source, "sim")
         self.assertEqual(_sim_n(chosen), DEFAULT_DRAWS)
@@ -181,6 +196,33 @@ class FlagsTest(unittest.TestCase):
         )
         with self.assertRaises(SystemExit):
             parse_args(["--csv", "x.csv", "--projection-source", "fppg"])
+
+    def test_missing_inputs_fall_back_to_board_and_placeholder(self):
+        from nfl.sim_efficiency import (
+            EFFICIENCY_FALLBACK_NOTE,
+            SOURCE_FALLBACK_NOTE,
+            PlaceholderEfficiency,
+            projection_source_for_run,
+            resolve_run_efficiency,
+        )
+        from nfl.sim_inputs import SimInputs
+
+        model, mode, note = resolve_run_efficiency("data", None)
+        self.assertIsInstance(model, PlaceholderEfficiency)
+        self.assertEqual(mode, "placeholder")
+        self.assertEqual(note, EFFICIENCY_FALLBACK_NOTE)
+        source, source_note = projection_source_for_run("sim", None)
+        self.assertEqual(source, "board")
+        self.assertEqual(source_note, SOURCE_FALLBACK_NOTE)
+        kept, kept_note = projection_source_for_run("sim", SimInputs())
+        self.assertEqual(kept, "sim")
+        self.assertIsNone(kept_note)
+        present, present_mode, present_note = resolve_run_efficiency(
+            "data", SimInputs()
+        )
+        self.assertEqual(present_mode, "data")
+        self.assertIsNone(present_note)
+        self.assertEqual(type(present).__name__, "DataEfficiency")
 
     def test_cash_line_n_lineups_min_unique_defaults(self):
         off = parse_args(["--csv", "x.csv"])

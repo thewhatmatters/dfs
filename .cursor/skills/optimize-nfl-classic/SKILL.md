@@ -17,8 +17,8 @@ Solve the highest-projection legal FanDuel NFL classic lineup for a slate CSV.
 
 Loads contest rules from this repo, filters the FanDuel export, joins gangstash
 lines, depth, targets, and snaps (fallbacks: oddsapi, ourlads/espn, lineups) + ESPN injuries + Gangstash props (cached), and runs the PuLP ILP
-(greedy if PuLP is missing). Default objective is **week1_score** (implied×depth×share×usage, volume props a
-±20% tilt — not an override). No FPPG. No stdin interview. No question card.
+(greedy if PuLP is missing). Default objective is the simulated mean (`--projection-source sim`, 10000 draws, `--sim-efficiency data`). `--projection-source board` keeps **week1_score** (implied×depth×share×usage, volume props a
+±20% tilt — not an override). Missing sim inputs fall back to that board. No FPPG. No stdin interview. No question card.
 
 ## How to run
 
@@ -76,9 +76,11 @@ Repo-root `scripts/optimize.py` is the **NCAAF** shim — do not use it here.
 | `--min-salary=N` | house spend floor (default 58000; 0 disables) |
 | `--board` | print pool projections on stderr; JSON `board` |
 | `--board=all` | same board, full pool |
-| `--sim` | Game Monte Carlo (Vegas total+spread; teammates share the world; default 10000; `--sim=0` off). Lineup Fl/Cl = joint 9 p10/p90. Not a PBP copula / not SaberSim. Mean ILP stays implied×depth×share×usage with ±20% prop tilt |
+| `--sim` | Game Monte Carlo (Vegas total+spread; teammates share the world). Default projection source is sim, so an omitted `--sim` runs 10000 draws. `--projection-source board` does not draw unless `--sim N`. `--sim=0` does not turn off a sim projection source. Lineup Fl/Cl = joint 9 p10/p90. Not a PBP copula / not SaberSim |
 | `--sim-seed=1` | RNG seed for `--sim` |
-| `--objective=mean\|floor\|ceiling` | ILP score. **Default `mean`** = week1_score. `floor` = sim p10. `ceiling` = sim p90 |
+| `--sim-efficiency=data\|placeholder` | Default `data`. Missing sim inputs fall back to placeholder and the log says so |
+| `--projection-source=sim\|board` | Default `sim` (ILP mean = simulated mean). `board` opts out and keeps week1_score |
+| `--objective=mean\|floor\|ceiling` | ILP score. **Default `mean`** = sim mean. `floor` = sim p10. `ceiling` = sim p90. Board opt-out mean = week1_score |
 | `--n-lineups=N` | unique 9s (default 1; max 150). Only if the user named a count |
 | `--min-unique=N` | min different players vs **every** locked 9 (default 2 when n=1; **3 when n>1**). `--min-unique=2` restores the old default |
 | `--max-exposure=F` | max fraction of the set any one player may appear in (default **0.60 when n>1**; 1.0 when n=1). `--max-exposure=1` disables. Running count in the ILP — stops 100% chalk RBs |
