@@ -20,7 +20,7 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from dataclasses import dataclass, replace
-from datetime import date
+from datetime import date, datetime, timezone
 
 from nfl.gangstash import (
     GangstashError,
@@ -147,6 +147,72 @@ def _as_line(value: object) -> float | None:
 
 def _scraped_at(row: dict) -> str:
     return str(row.get("scraped_at") or "")
+
+
+def _as_int(value: object) -> int | None:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_stamp(value: object) -> datetime | None:
+    """ISO timestamp. Naive values are treated as UTC."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    text = text.replace("Z", "+00:00")
+    try:
+        stamp = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp
+
+
+def props_for_week(
+    rows: list[dict],
+    *,
+    season: int | None,
+    week: int | None,
+    kickoff: datetime | None = None,
+) -> list[dict]:
+    """Props that were knowable before this week.
+
+    ``week is None`` keeps the live board (optimizer). A historical week
+    keeps only rows whose ``season`` and ``week`` match, and only the
+    latest ``scraped_at`` strictly before ``kickoff``. Rows with no week
+    are the current board and are dropped. No surviving snapshot is an
+    empty list — do not fill the week from a later board.
+    """
+    if week is None:
+        return [row for row in rows if isinstance(row, dict)]
+    kept: list[tuple[datetime | None, dict]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_season = _as_int(row.get("season"))
+        row_week = _as_int(row.get("week"))
+        if row_season is None or row_week is None:
+            continue
+        if season is not None and row_season != int(season):
+            continue
+        if row_week != int(week):
+            continue
+        stamp = parse_stamp(row.get("scraped_at"))
+        if kickoff is not None and (stamp is None or stamp >= kickoff):
+            continue
+        kept.append((stamp, row))
+    if not kept:
+        return []
+    dated = [stamp for stamp, _row in kept if stamp is not None]
+    if not dated:
+        return [row for _stamp, row in kept]
+    latest = max(dated)
+    return [row for stamp, row in kept if stamp == latest]
 
 
 def rows_to_props(rows: list[dict]) -> tuple[dict[str, PlayerProp], dict]:

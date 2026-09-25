@@ -16,7 +16,7 @@ from pathlib import Path
 from nfl.http import HttpError, http_json
 from nfl.names import match_key
 from nfl.players import Player
-from nfl.teams import lookup_odds
+from nfl.teams import UnmappedTeam, lookup_odds, require_fd
 
 ESPN_INJURIES = "https://site.web.api.espn.com/apis/site/v2/sports/football/nfl/injuries"
 CACHE_DIR = Path(__file__).resolve().parent / "data" / "espn-injuries"
@@ -89,6 +89,43 @@ def parse_injuries(payload: dict) -> list[InjuryRow]:
             if not fd:
                 continue
             out.append(InjuryRow(name=name, team=fd, status=status))
+    return out
+
+
+def injury_rows_from_records(
+    rows: list[dict],
+    *,
+    season: int,
+    week: int,
+) -> list[InjuryRow]:
+    """Gangstash ``dataset=injuries`` rows for one season and week.
+
+    A row with no ``season`` or ``week`` is a live dump and is dropped so
+    today's report is not applied to a past week.
+    """
+    out: list[InjuryRow] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_season = row.get("season")
+        row_week = row.get("week")
+        if row_season in (None, "") or row_week in (None, ""):
+            continue
+        try:
+            if int(row_season) != int(season) or int(row_week) != int(week):
+                continue
+        except (TypeError, ValueError):
+            continue
+        name = str(row.get("player_name") or row.get("name") or "").strip()
+        status = str(row.get("status") or "").strip()
+        team_raw = str(row.get("team_fd") or row.get("team") or "").strip()
+        if not name or not status or not team_raw:
+            continue
+        try:
+            team = require_fd(team_raw).fd
+        except UnmappedTeam:
+            continue
+        out.append(InjuryRow(name=name, team=team, status=status))
     return out
 
 

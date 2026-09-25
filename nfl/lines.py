@@ -7,7 +7,9 @@ JAC↔JAX, WAS↔WSH. FanDuel book else median of US books.
 
 `--lines-source=gangstash` reads `dataset=game_lines` (BettingPros consensus)
 and maps `home_team_fd` / `away_team_fd` through the same FanDuel abbrevs.
-`--lines-json` still replays a file and ignores the live source.
+The optimizer passes gangstash. `--lines-file` (CSV or JSON) and
+`--lines-json` replay a file and ignore the live source. A past `--week`
+prefers `dataset=closing_lines`, then `game_lines`.
 
 implied_home = (total - home_spread) / 2
 implied_away = (total + home_spread) / 2
@@ -15,6 +17,7 @@ implied_away = (total + home_spread) / 2
 
 from __future__ import annotations
 
+import csv
 import json
 import re
 import statistics
@@ -27,9 +30,14 @@ from zoneinfo import ZoneInfo
 
 from nfl import env as envmod
 from nfl.gangstash import GangstashDataError, GangstashDataKeyMissing, GangstashTruncated
-from nfl.gangstash_data import GangstashGameLine, fetch_game_lines, map_game_lines
+from nfl.gangstash_data import (
+    GangstashGameLine,
+    fetch_closing_lines,
+    fetch_game_lines,
+    map_game_lines,
+)
 from nfl.http import HttpAuthError, HttpError, http_json
-from nfl.teams import lookup_odds, require_fd, require_mapped
+from nfl.teams import UnmappedTeam, lookup_odds, require_fd, require_mapped
 
 ODDS_URL = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds"
 CACHE_DIR = Path(__file__).resolve().parent / "data" / "odds-lines"
@@ -361,15 +369,53 @@ def parse_odds_games(
     return {fd: out[fd] for fd in {h for _, _, h in slate} | {a for _, a, _ in slate}}
 
 
+def _fd_cell(raw: object) -> str:
+    text = str(raw or "").strip()
+    if not text:
+        return ""
+    try:
+        return require_fd(text).fd
+    except UnmappedTeam:
+        return text.upper()
+
+
+def _file_spread_total(row: dict) -> tuple[float | None, float | None]:
+    spread = _num(row.get("spread"))
+    total = _num(row.get("total") if "total" in row else row.get("overUnder"))
+    if spread is not None and total is not None:
+        return spread, total
+    home_impl = _num(
+        row.get("home_implied")
+        or row.get("home_implied_total")
+        or row.get("implied_home")
+        or row.get("home_team_total")
+    )
+    away_impl = _num(
+        row.get("away_implied")
+        or row.get("away_implied_total")
+        or row.get("implied_away")
+        or row.get("away_team_total")
+    )
+    if home_impl is None or away_impl is None:
+        return spread, total
+    return away_impl - home_impl, home_impl + away_impl
+
+
 def parse_simple_games(
     payload: list[dict],
     slate: list[tuple[str, str, str]],
+    *,
+    source: str = "lines-json",
 ) -> dict[str, TeamLine]:
-    """Replay JSON: [{away, home, spread, total, ...}] with FanDuel abbrevs."""
+    """Replay JSON or CSV rows with FanDuel abbrevs.
+
+    ``spread`` + ``total``, or home and away implied totals. ``home`` /
+    ``away`` or ``home_team_fd`` / ``away_team_fd``.
+    """
     index: dict[tuple[str, str], dict] = {}
     for row in payload:
-        away = str(row.get("away") or "").strip().upper()
-        home = str(row.get("home") or "").strip().upper()
+        away = _fd_cell(row.get("away") or row.get("away_team_fd"))
+        home = _fd_cell(row.get("home") or row.get("home_team_fd"))
         if not away or not home:
             continue
         index[(away, home)] = row
@@ -380,8 +426,7 @@ def parse_simple_games(
         if row is None:
             missing.append(game)
             continue
-        spread = _num(row.get("spread"))
-        total = _num(row.get("total") if "total" in row else row.get("overUnder"))
+        spread, total = _file_spread_total(row)
         if spread is None or total is None:
             missing.append(game)
             continue
@@ -394,7 +439,8 @@ def parse_simple_games(
             home_ml=_num(row.get("home_moneyline") or row.get("homeMoneyline")),
             away_ml=_num(row.get("away_moneyline") or row.get("awayMoneyline")),
             provider=str(row.get("provider") or "file"),
-            source="lines-json",
+            source=source,
+            commence_time=str(row.get("commence_time") or "") or None,
         )
         out[away_fd] = out[home_fd]
     if missing:
@@ -408,6 +454,7 @@ def load_lines_json(
     *,
     start: datetime | None = None,
     end: datetime | None = None,
+    source: str = "lines-json",
 ) -> dict[str, TeamLine]:
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     if isinstance(raw, dict) and "games" in raw:
@@ -417,7 +464,33 @@ def load_lines_json(
     first = raw[0]
     if "bookmakers" in first and "home_team" in first:
         return parse_odds_games(raw, slate, start=start, end=end)
-    return parse_simple_games(raw, slate)
+    return parse_simple_games(raw, slate, source=source)
+
+
+def load_lines_csv(
+    path: Path,
+    slate: list[tuple[str, str, str]],
+) -> dict[str, TeamLine]:
+    """CSV with ``home,away,spread,total`` or implied-total columns."""
+    with Path(path).open(newline="", encoding="utf-8") as fh:
+        rows = [dict(row) for row in csv.DictReader(fh)]
+    if not rows:
+        raise LinesError(f"{path} has no line rows")
+    return parse_simple_games(rows, slate, source="lines-file")
+
+
+def load_lines_file(
+    path: Path,
+    slate: list[tuple[str, str, str]],
+    *,
+    start: datetime | None = None,
+    end: datetime | None = None,
+) -> dict[str, TeamLine]:
+    """CSV or JSON. Wins over the live lines source."""
+    path = Path(path)
+    if path.suffix.lower() == ".csv":
+        return load_lines_csv(path, slate)
+    return load_lines_json(path, slate, start=start, end=end, source="lines-file")
 
 
 def _odds_key() -> str:
@@ -514,17 +587,77 @@ def _ingest_gangstash_lines(
     )
 
 
+_HISTORICAL_START = datetime(2000, 1, 1, tzinfo=timezone.utc)
+_HISTORICAL_END = datetime(2100, 1, 1, tzinfo=timezone.utc)
+
+
+def _lines_from_rows(
+    raw: list[dict],
+    slate: list[tuple[str, str, str]],
+) -> dict[str, TeamLine]:
+    return team_lines_from_gangstash(
+        map_game_lines(raw),
+        slate,
+        start=_HISTORICAL_START,
+        end=_HISTORICAL_END,
+    )
+
+
+def _ingest_week_lines(
+    slate: list[tuple[str, str, str]],
+    *,
+    season: int,
+    week: int,
+    refresh: bool,
+) -> dict[str, TeamLine]:
+    """Past week: ``closing_lines`` first, then ``game_lines``."""
+    key_misses: list[Exception] = []
+    other: list[Exception] = []
+    for fetch in (
+        lambda: fetch_closing_lines(season=season, week=week, refresh=refresh),
+        lambda: fetch_game_lines(season=season, week=week, refresh=refresh),
+    ):
+        try:
+            raw, _meta = fetch()
+        except GangstashDataKeyMissing as e:
+            key_misses.append(e)
+            continue
+        except (GangstashTruncated, GangstashDataError) as e:
+            other.append(e)
+            continue
+        if not raw:
+            continue
+        try:
+            return _lines_from_rows(list(raw), slate)
+        except LinesError as e:
+            other.append(e)
+            continue
+    if key_misses and not other:
+        raise LinesGangstashKeyMissing(
+            "GANGSTASH_API_KEY is not set and no closing or game-lines cache exists"
+        )
+    detail = str(other[-1]) if other else "empty closing_lines and game_lines"
+    raise LinesGangstashError(
+        f"no closing_lines or game_lines for season {season} week {week}: {detail}"
+    )
+
+
 def ingest_slate_lines(
     players,
     *,
     lines_json: Path | None = None,
+    lines_file: Path | None = None,
     slate_day: date | None = None,
     refresh: bool = False,
     source: str = "oddsapi",
+    season: int | None = None,
+    week: int | None = None,
 ) -> dict[str, TeamLine]:
     """Return TeamLine keyed by FanDuel abbrev for every slate team.
 
-    `source` is `oddsapi` (default) or `gangstash`. `--lines-json` wins.
+    `source` is `oddsapi` or `gangstash`. `--lines-file` wins, then
+    `--lines-json`. A set ``week`` on the gangstash path prefers
+    ``closing_lines`` and falls back to ``game_lines``.
     """
     slate = slate_from_players(players)
     fd_teams = {a for _, a, _ in slate} | {h for _, _, h in slate}
@@ -532,10 +665,19 @@ def ingest_slate_lines(
     day = slate_day or date(2026, 9, 13)
     start, end = slate_window(day)
 
+    if lines_file is not None:
+        return load_lines_file(lines_file, slate, start=start, end=end)
     if lines_json is not None:
         return load_lines_json(lines_json, slate, start=start, end=end)
 
     src = (source or "oddsapi").strip().lower()
+    if src == "gangstash" and week is not None:
+        return _ingest_week_lines(
+            slate,
+            season=int(season or day.year),
+            week=int(week),
+            refresh=refresh,
+        )
     if src == "gangstash":
         return _ingest_gangstash_lines(slate, slate_day=day, refresh=refresh)
     if src != "oddsapi":

@@ -123,6 +123,8 @@ The starter QB keeps 8% of team rushes. Snaps and carries are optional; an empty
 
 Players with no target weeks stay on the deterministic role share, including an RB who only has snaps. Snaps change rush mix only for RBs who already have target weeks.
 
+The passing QB on that path does not. Role share was team points × 0.50, so an implied 17.5 starter landed near 8.8 with a p90 near 11.4. That QB is now the pass-yard and pass-TD anchors (neutral pass rate, not the drawn margin) scaled by drawn team points / implied, plus a rush floor of max(12 yards, 0.8 × implied) or the rush-yard prop. Other QBs on the team score 0. The scale keeps the QB linear in team points, so a teammate on the role share stays highly correlated with him.
+
 **Inputs:** `targets` rows: `season`, `week`, `position`, `player_name`, `team_fd`, `targets`, `target_share`, `team_targets`, `team_pass_attempts`, `gsis_id` (optional `player_id`). `snaps` rows: the same identity fields plus `offense_pct` (fraction, or a percent above `1.5`).
 
 ### Efficiency (placeholder, layer 4 later)
@@ -211,4 +213,4 @@ One `random.Random(seed)` for the slate. Games run in game-id order, players in 
 python3 -m nfl.backtest --csv "nfl/data/<players-list>.csv" --season 2026 --week 2
 ```
 
-The reader is `fetch_player_stats_weekly` (`dataset=player_stats_weekly&season=&week=`, header `x-api-key`, same-day cache as the other `/data` datasets). Game lines, props, and the sim feed are optional. An empty result is named in a `missing:` line (`game_lines`, `props`, `sim_inputs`) and the week still scores. Week 2 currently has no props and no game lines; that is a missing-input report, not a crash. The optimizer default stays `--projection-source board`.
+The reader is `fetch_player_stats_weekly` (`dataset=player_stats_weekly&season=&week=`, header `x-api-key`, same-day cache as the other `/data` datasets). The board and the sim are built with the same joins as the optimizer for that week: `closing_lines` (then `game_lines`), week injuries, depth, prior-week targets and snaps, and props. An empty source is named on `missing:` and the week still scores. Targets and snaps are weeks `1..W-1` only. Props keep the latest `scraped_at` strictly before kickoff for that season and week; a row with no week, or a later week's board, is dropped. `--lines-file` (CSV or JSON) supplies historical lines and wins over the network. `--starters-only` prints depth-1 players who played, plus DEF; the default prints that slice and the full pool. The optimizer default stays `--projection-source board`.

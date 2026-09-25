@@ -184,12 +184,58 @@ def _write_depth_csv(rows: list[DepthRow], dest: Path) -> None:
             )
 
 
+def scope_depth_rows(
+    rows: list[dict],
+    *,
+    season: int | None = None,
+    week: int | None = None,
+) -> tuple[list[dict], str]:
+    """Keep one week's chart when rows carry ``week``.
+
+    A payload with no ``week`` column is the current chart. The note says
+    so. When a week is requested and some rows are dated, undated rows and
+    other weeks are dropped.
+    """
+    if week is None:
+        return [row for row in rows if isinstance(row, dict)], ""
+    dated = False
+    for row in rows:
+        if isinstance(row, dict) and row.get("week") not in (None, ""):
+            dated = True
+            break
+    if not dated:
+        return [row for row in rows if isinstance(row, dict)], (
+            "depth chart has no week column; using the current chart"
+        )
+    kept: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        raw_week = row.get("week")
+        raw_season = row.get("season")
+        try:
+            if int(raw_week) != int(week):
+                continue
+            if (
+                season is not None
+                and raw_season not in (None, "")
+                and int(raw_season) != int(season)
+            ):
+                continue
+        except (TypeError, ValueError):
+            continue
+        kept.append(row)
+    return kept, ""
+
+
 def ingest_gangstash_slate_depth(
     slate_teams: set[str],
     *,
     refresh: bool = False,
     out_csv: Path | None = None,
     cache_day: date | None = None,
+    season: int | None = None,
+    week: int | None = None,
 ) -> list[DepthRow]:
     """Map gangstash depth_charts onto slate FanDuel teams.
 
@@ -205,7 +251,13 @@ def ingest_gangstash_slate_depth(
         if t
     }
     try:
-        raw, _meta = fetch_depth_charts(refresh=refresh, cache_day=cache_day)
+        raw, _meta = fetch_depth_charts(
+            refresh=refresh,
+            cache_day=cache_day,
+            season=season,
+            week=week,
+        )
+        raw, _note = scope_depth_rows(list(raw), season=season, week=week)
     except GangstashDataKeyMissing as e:
         raise GangstashDepthKeyMissing(str(e)) from e
     except (GangstashTruncated, GangstashDataError) as e:

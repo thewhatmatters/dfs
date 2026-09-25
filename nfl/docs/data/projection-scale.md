@@ -39,7 +39,7 @@ Still not drawn: fumbles lost, two-point conversions, return TDs. DEF events oth
 
 ## Backtest status
 
-`python3 -m nfl.backtest --csv … --season 2026 --week 2` reads gangstash `player_stats_weekly` `fd_points` and prints mean error and MAE by position for the board and the sim. Missing props or game lines are named and skipped. Shares and the ±20% prop cap are still unchanged. The sim, not the board, now anchors starter passing yards and TDs to the implied total (or a passing prop) and caps team rush attempts with team_stats, the script, snap share, carry share, and rush-yard props.
+`python3 -m nfl.backtest --csv … --season 2026 --week 2` reads gangstash `player_stats_weekly` `fd_points` and prints mean error and MAE by position for the board and the sim, for the full pool and for depth-1 players who played. It joins depth, injuries, prior-week targets and snaps, and week-scoped lines and props the same way the optimizer does. A missing source is named and skipped. Shares and the ±20% prop cap are still unchanged. The sim, not the board, now anchors starter passing yards and TDs to the implied total (or a passing prop) and caps team rush attempts with team_stats, the script, snap share, carry share, and rush-yard props.
 
 ## Proposed fix (not applied)
 

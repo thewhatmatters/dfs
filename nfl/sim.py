@@ -17,7 +17,10 @@ share that world:
    passing yards and TDs are the sum of those same receiving lines after
    they are scaled to the pass anchor. Backups get no team passing volume.
    A rush-yard prop sets that RB's rush-yard mean. Missing history keeps
-   the deterministic role share (team points × depth × position share × usage).
+   the deterministic role share (team points × depth × position share × usage)
+   except the passing QB: that QB is scored from the pass-yard and pass-TD
+   anchors (scaled by drawn team points / implied) plus a rush-yard floor.
+   Other QBs on that team score 0.
 
 Efficiency (yards per opportunity, TD rates) is ``PlaceholderEfficiency``
 in ``nfl/sim_efficiency.py``. Layer 4 replaces that class; it is not a
@@ -54,8 +57,18 @@ from nfl.projections import (
     score_player,
     usage_factor,
 )
-from nfl.rules import DST_SACK_TO_PRIOR, FANDUEL_NFL, dst_pa_points, dst_projection
+from nfl.rules import (
+    DST_SACK_TO_PRIOR,
+    FANDUEL_NFL,
+    dst_pa_points,
+    dst_projection,
+    skill_fd_points,
+)
 from nfl.sim_efficiency import (
+    INT_RATE,
+    PASS_YPA,
+    QB_RUSH_TD_RATE,
+    QB_YPC,
     YARDS_PER_RUSH,
     EfficiencyModel,
     OpportunityCount,
@@ -107,6 +120,12 @@ KAPPA_MIN = 2.0
 KAPPA_MAX = 80.0
 # QB keeps this fraction of team rushes; RBs split the rest.
 QB_RUSH_SHARE = 0.08
+# Role-share path (no catcher history) used to score a depth-1 QB as
+# implied × 0.50. Implied 17.5 landed near 8.8 with p90 near 11.4.
+# The passing QB on that path now uses the pass anchors plus this rush
+# floor: max(12, 0.8 × implied) yards, or the rush-yard prop.
+QB_RUSH_YARDS_FLOOR = 12.0
+QB_RUSH_YARDS_PER_IMPLIED = 0.8
 # Passing yards ≈ implied total × scripted pass rate × this.
 # 22-pt team at a 0.57 pass rate → about 220 yards.
 PASS_YARDS_PER_POINT = 17.5
@@ -308,7 +327,9 @@ def simulate_games(
             if away is None or home is None:
                 for pl in group:
                     team_pts, opp_pts = _solo_world(rng, pl)
-                    raw[pl.pid].append(_score_world(pl, team_pts, opp_pts))
+                    raw[pl.pid].append(
+                        _score_fallback(pl, team_pts, opp_pts, group, index)
+                    )
                 continue
             counts: dict[str, OpportunityCount] = {}
             for team in sorted(_teams_in(group)):
@@ -330,7 +351,9 @@ def simulate_games(
                     team_pts, opp_pts = _player_world(
                         pl, home_pts, away_pts, away, home
                     )
-                    raw[pl.pid].append(_score_world(pl, team_pts, opp_pts))
+                    raw[pl.pid].append(
+                        _score_fallback(pl, team_pts, opp_pts, group, index)
+                    )
                 else:
                     raw[pl.pid].append(eff.points(rng, pl, opp_count))
     draws = {pid: tuple(xs) for pid, xs in raw.items()}
@@ -539,6 +562,67 @@ def _solo_world(rng: random.Random, player: Player) -> tuple[float, float]:
         TEAM_POINTS_FLOOR,
     )
     return team_pts, implied_opp
+
+
+def starter_qb_rush_yards(player: Player) -> float:
+    """Rush-yard mean for a passing QB who is not on the opportunity path."""
+    if player.prop_rush_yds is not None:
+        return max(0.0, float(player.prop_rush_yds))
+    implied = float(player.implied_total or 0.0)
+    return max(QB_RUSH_YARDS_FLOOR, implied * QB_RUSH_YARDS_PER_IMPLIED)
+
+
+def starter_qb_points(
+    player: Player,
+    team_pts: float,
+    index: _HistoryIndex | None = None,
+) -> float:
+    """FanDuel points for the passing QB when catcher history is missing.
+
+    Anchors use the neutral pass rate (not the drawn margin) and scale by
+    ``team_pts / implied``, so the score stays linear in team points.
+    """
+    implied = float(player.implied_total or 0.0)
+    scale = (float(team_pts) / implied) if implied > 0 else 1.0
+    offense = None
+    if index is not None:
+        offense = index.offense((player.team or "").upper())
+    rate = neutral_pass_rate_of(offense)
+    yards = pass_yard_anchor(implied, rate, player.prop_pass_yds) * scale
+    tds = pass_td_anchor(implied, rate, player.prop_pass_tds) * scale
+    rush = starter_qb_rush_yards(player) * scale
+    attempts = (yards / PASS_YPA) if PASS_YPA else 0.0
+    rushes = (rush / QB_YPC) if QB_YPC else 0.0
+    return max(
+        0.0,
+        skill_fd_points(
+            pass_yd=yards,
+            pass_td=tds,
+            interceptions=attempts * INT_RATE,
+            rush_yd=rush,
+            rush_td=rushes * QB_RUSH_TD_RATE,
+        ),
+    )
+
+
+def _score_fallback(
+    player: Player,
+    team_pts: float,
+    opp_pts: float,
+    group: list[Player],
+    index: _HistoryIndex | None,
+) -> float:
+    """Role share, except the passing QB (anchors) and his backups (0)."""
+    if (player.position or "").upper() != "QB":
+        return _score_world(player, team_pts, opp_pts)
+    team = (player.team or "").upper()
+    mates = [p for p in group if (p.team or "").upper() == team] or [player]
+    starter = passing_qb(mates)
+    if starter is None:
+        return _score_world(player, team_pts, opp_pts)
+    if starter.pid != player.pid:
+        return 0.0
+    return starter_qb_points(player, team_pts, index)
 
 
 def _score_world(player: Player, team_pts: float, opp_pts: float) -> float:

@@ -75,14 +75,19 @@ python3 -m nfl.gangstash_data team-stats-weekly --season 2026 --week 1,2
 | `GANGSTASH_TEAM_STATS_DATASET` | `team_stats` | `dataset=` value |
 | `GANGSTASH_TEAM_STATS_WEEKLY_DATASET` | `team_stats_weekly` | `dataset=` value |
 | `GANGSTASH_SNAPS_DATASET` | `snaps` | `dataset=` value |
+| `GANGSTASH_PLAYER_STATS_WEEKLY_DATASET` | `player_stats_weekly` | `dataset=` value |
+| `GANGSTASH_CLOSING_LINES_DATASET` | `closing_lines` | `dataset=` value |
+| `GANGSTASH_INJURIES_DATASET` | `injuries` | `dataset=` value |
 
 ## Queries this client sends
 
 | dataset | query | notes |
 |---------|--------|--------|
 | `targets` | `season` (required), `week` (single or `1,2`), optional `position` (`WR`/`TE`/`RB`), `team` | season is the FanDuel CSV year. 2026 weeks 1–2 are loaded (640 rows) |
-| `game_lines` | `date=YYYY-MM-DD` (ET kickoff) **or** `season` + one `week` | optimizer sends the slate **date** only. Week 3 is 16 games |
-| `depth_charts` | optional `team`, `position` (that is `pos_abb`), `pos_grp` | optimizer requests `pos_grp=3WR 1TE` |
+| `game_lines` | `date=YYYY-MM-DD` (ET kickoff) **or** `season` + one `week` | optimizer sends the slate **date** only, unless `--week` is set |
+| `closing_lines` | `season` + one `week` | preferred for a past `--week` and for `nfl.backtest`. Falls back to `game_lines`. Implied team totals are enough when spread and total are absent |
+| `depth_charts` | optional `team`, `position` (that is `pos_abb`), `pos_grp`, `season`, `week` | optimizer requests `pos_grp=3WR 1TE`. A chart with no `week` column is the current chart |
+| `injuries` | `season` + one `week` | backtest only. A row with no week is not applied to a past slate |
 | `team_stats` | `season` (required), `season_type` (default `REG`), optional `side` (`offense`/`defense`), `team` | not scored |
 | `team_stats_weekly` | `season` + `week` (single or comma list), optional `team` | not scored. Adds `week`, `opponent`, `game_id` on each row |
 | `snaps` | `season` (required), `week` (single or `1,2`), optional `position` (`WR`/`TE`/`RB`), `team` (FD or nflverse; `JAC` and `JAX` both work) | 2026 weeks 1–2 are 2,994 rows (185 RB, 335 WR, 220 TE). `offense_pct` is a 0–1 fraction |
@@ -120,6 +125,18 @@ formula as the Odds API (`nfl/lines.py`). Rows outside the slate window are
 dropped when `commence_time` is present. A missing slate game is
 `LINES_GANGSTASH` (stop). No key and no cache is `LINES_GANGSTASH_KEY`
 (stop — no silent FPPG).
+
+**`closing_lines`:** same join as `game_lines`. A past week
+(`nfl.optimize --week`, `nfl.backtest`) tries this dataset first. Rows may
+send `home_implied_total` and `away_implied_total` instead of `spread` and
+`total`. Total is the sum. Home spread is away implied minus home implied
+(negative when home is favored). An empty close falls through to
+`game_lines`. `--lines-file` (CSV or JSON) still wins over both.
+
+**`injuries`:** `player_name`, `team_fd`, `status`, `season`, `week`. The
+backtest drops Out / Doubtful / IR / Suspension for that week only. It does
+not apply the live ESPN report to a past week. An empty payload is
+`missing: injuries` and the week still scores.
 
 **`depth_charts`** (latest ESPN via nflverse): `team`, `team_fd`, `pos_grp`,
 `pos_abb`, `pos_name`, `pos_slot`, `pos_rank`, `player_name`, `gsis_id`,

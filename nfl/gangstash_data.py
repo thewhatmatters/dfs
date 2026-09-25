@@ -58,6 +58,16 @@ def _float(val) -> float | None:
         return None
 
 
+def _first_float(row: dict, keys: tuple[str, ...]) -> float | None:
+    for key in keys:
+        if key not in row:
+            continue
+        val = _float(row.get(key))
+        if val is not None:
+            return val
+    return None
+
+
 def fetch_targets(
     *,
     season: int,
@@ -491,13 +501,26 @@ def parse_game_line(row: dict) -> GangstashGameLine | None:
     away_raw = _str(row.get("away_team_fd"))
     spread = _float(row.get("spread"))
     total = _float(row.get("total"))
+    home_impl = _first_float(
+        row,
+        ("home_implied_total", "home_implied", "implied_home", "home_team_total"),
+    )
+    away_impl = _first_float(
+        row,
+        ("away_implied_total", "away_implied", "implied_away", "away_team_total"),
+    )
     if not home_raw and not away_raw and spread is None and total is None:
-        return None
+        if home_impl is None and away_impl is None:
+            return None
     if not home_raw or not away_raw:
         raise GangstashDataError(
             "gangstash game_lines row missing home_team_fd/away_team_fd "
             f"(keys {sorted(row)})"
         )
+    if (spread is None or total is None) and home_impl is not None and away_impl is not None:
+        total = home_impl + away_impl
+        # Home spread is negative when home is favored.
+        spread = away_impl - home_impl
     if spread is None or total is None:
         raise GangstashDataError(
             f"gangstash game_lines row {away_raw}@{home_raw} missing spread/total "
@@ -523,6 +546,29 @@ def map_game_lines(rows: list[dict]) -> list[GangstashGameLine]:
         if parsed is not None:
             out.append(parsed)
     return out
+
+
+def fetch_closing_lines(
+    *,
+    season: int,
+    week: int,
+    refresh: bool = False,
+    cache_day: date | None = None,
+) -> tuple[list[dict], dict]:
+    """`dataset=closing_lines`. Past weeks prefer this over ``game_lines``.
+
+    Rows may carry ``spread`` and ``total``, or home and away implied team
+    totals. ``parse_game_line`` derives the home spread and total from the
+    implied pair when the spread and total are absent.
+    """
+    if int(season) < 1 or int(week) < 1:
+        raise GangstashDataError("gangstash closing_lines needs season and week")
+    return fetch_dataset(
+        dataset_id("closing_lines"),
+        {"season": str(int(season)), "week": str(int(week))},
+        refresh=refresh,
+        cache_day=cache_day,
+    )
 
 
 def fetch_game_lines(
@@ -642,10 +688,17 @@ def fetch_depth_charts(
     team: str | None = None,
     position: str | None = None,
     pos_grp: str | None = BASE_OFFENSE_POS_GRP,
+    season: int | None = None,
+    week: int | None = None,
     refresh: bool = False,
     cache_day: date | None = None,
 ) -> tuple[list[dict], dict]:
-    """`dataset=depth_charts`. `position` is pos_abb. Default pos_grp is 3WR 1TE."""
+    """`dataset=depth_charts`. `position` is pos_abb. Default pos_grp is 3WR 1TE.
+
+    ``season`` and ``week`` are sent when the caller has them. A chart with
+    no ``week`` column is the current chart; the caller decides whether to
+    use it.
+    """
     params: dict[str, str] = {}
     if team:
         params["team"] = team.strip().upper()
@@ -653,6 +706,10 @@ def fetch_depth_charts(
         params["position"] = position.strip().upper()
     if pos_grp:
         params["pos_grp"] = pos_grp.strip()
+    if season is not None:
+        params["season"] = str(int(season))
+    if week is not None:
+        params["week"] = str(int(week))
     return fetch_dataset(
         dataset_id("depth_charts"),
         params,
@@ -701,6 +758,24 @@ def fetch_team_stats(
     return fetch_dataset(
         dataset_id("team_stats"),
         params,
+        refresh=refresh,
+        cache_day=cache_day,
+    )
+
+
+def fetch_week_injuries(
+    *,
+    season: int,
+    week: int,
+    refresh: bool = False,
+    cache_day: date | None = None,
+) -> tuple[list[dict], dict]:
+    """`dataset=injuries` for one season and week. Rows stay raw."""
+    if int(season) < 1 or int(week) < 1:
+        raise GangstashDataError("gangstash injuries needs season and week")
+    return fetch_dataset(
+        dataset_id("injuries"),
+        {"season": str(int(season)), "week": str(int(week))},
         refresh=refresh,
         cache_day=cache_day,
     )

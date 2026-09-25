@@ -13,8 +13,12 @@ GET https://vmzgpslqoeuqmdchdekm.supabase.co/functions/v1/props
 x-api-key: $GANGSTASH_API_KEY
 ```
 
-Optional query params: `player_name`, `prop` (exact match). The optimizer
-calls the unfiltered board.
+Optional query params: `player_name`, `prop` (exact match), `season`,
+`week`. The optimizer calls the unfiltered board (`week` omitted). The
+backtest requests `season` and `week`, then keeps the latest `scraped_at`
+strictly before that week's kickoff. Rows with no week, and rows from
+another week, are dropped. Snapshots start at week 3; weeks 1–2 stay
+`missing: props` rather than borrowing a later board.
 
 Response: `{ "data": [ { "id", "player_name", "prop", "line", "scraped_at" } ], "truncated": bool }`.
 

@@ -46,6 +46,8 @@ DATASET_ENV = {
     "team_stats_weekly": "GANGSTASH_TEAM_STATS_WEEKLY_DATASET",
     "snaps": "GANGSTASH_SNAPS_DATASET",
     "player_stats_weekly": "GANGSTASH_PLAYER_STATS_WEEKLY_DATASET",
+    "closing_lines": "GANGSTASH_CLOSING_LINES_DATASET",
+    "injuries": "GANGSTASH_INJURIES_DATASET",
 }
 
 
@@ -145,12 +147,18 @@ def _live(
     *,
     player_name: str | None,
     prop: str | None,
+    season: int | None = None,
+    week: int | None = None,
 ) -> dict:
     params: dict[str, str] = {}
     if player_name:
         params["player_name"] = player_name
     if prop:
         params["prop"] = prop
+    if season is not None:
+        params["season"] = str(int(season))
+    if week is not None:
+        params["week"] = str(int(week))
     url = ENDPOINT
     if params:
         url += "?" + urllib.parse.urlencode(params)
@@ -171,10 +179,22 @@ def fetch_props(
     cache_day: date | None = None,
     player_name: str | None = None,
     prop: str | None = None,
+    season: int | None = None,
+    week: int | None = None,
 ) -> tuple[list[dict], dict]:
-    """Return (rows, meta). Meta includes cache path, stale flag, truncated."""
+    """Return (rows, meta). Meta includes cache path, stale flag, truncated.
+
+    ``season`` and ``week`` request one week's snapshots. That call does not
+    read the unfiltered day cache (a later week's board must not fill an
+    earlier week).
+    """
     day = cache_day or date.today()
-    filtered = bool((player_name or "").strip() or (prop or "").strip())
+    filtered = bool(
+        (player_name or "").strip()
+        or (prop or "").strip()
+        or season is not None
+        or week is not None
+    )
     today_path = _cache_file(day)
 
     if not refresh and not filtered and today_path.is_file() and today_path.stat().st_size > 2:
@@ -188,7 +208,12 @@ def fetch_props(
         }
 
     try:
-        payload = _live(player_name=player_name, prop=prop)
+        payload = _live(
+            player_name=player_name,
+            prop=prop,
+            season=season,
+            week=week,
+        )
     except GangstashKeyMissing:
         if refresh or filtered:
             raise
