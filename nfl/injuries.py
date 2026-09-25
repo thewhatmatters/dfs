@@ -9,20 +9,39 @@ Use site.web.api — site.api is often HTTP 403 from datacenter/residential egre
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 
 from nfl.http import HttpError, http_json
 from nfl.names import match_key
 from nfl.players import Player
-from nfl.teams import lookup_odds
+from nfl.projections import score_player
+from nfl.teams import UnmappedTeam, lookup_odds, require_fd
 
 ESPN_INJURIES = "https://site.web.api.espn.com/apis/site/v2/sports/football/nfl/injuries"
 CACHE_DIR = Path(__file__).resolve().parent / "data" / "espn-injuries"
 DROP_STATUSES = frozenset(
     {"out", "doubtful", "injured reserve", "ir", "suspension", "suspended"}
 )
+# FanDuel Injury Indicator, plus the words gangstash/ESPN use for the same
+# states. Q is questionable and stays the starter. NA matches the optimizer
+# pool filter (inactive, not a body part).
+INACTIVE_CODES = frozenset({"O", "D", "IR", "NA", "SUSP"})
+_CODE_WORDS = {
+    "o": "O",
+    "out": "O",
+    "d": "D",
+    "doubtful": "D",
+    "ir": "IR",
+    "injured reserve": "IR",
+    "na": "NA",
+    "q": "Q",
+    "questionable": "Q",
+    "susp": "SUSP",
+    "suspension": "SUSP",
+    "suspended": "SUSP",
+}
 
 
 class InjuryError(Exception):
@@ -89,6 +108,117 @@ def parse_injuries(payload: dict) -> list[InjuryRow]:
             if not fd:
                 continue
             out.append(InjuryRow(name=name, team=fd, status=status))
+    return out
+
+
+def injury_rows_from_records(
+    rows: list[dict],
+    *,
+    season: int,
+    week: int,
+) -> list[InjuryRow]:
+    """Gangstash ``dataset=injuries`` rows for one season and week.
+
+    A row with no ``season`` or ``week`` is a live dump and is dropped so
+    today's report is not applied to a past week.
+    """
+    out: list[InjuryRow] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        row_season = row.get("season")
+        row_week = row.get("week")
+        if row_season in (None, "") or row_week in (None, ""):
+            continue
+        try:
+            if int(row_season) != int(season) or int(row_week) != int(week):
+                continue
+        except (TypeError, ValueError):
+            continue
+        name = str(row.get("player_name") or row.get("name") or "").strip()
+        status = str(row.get("status") or "").strip()
+        team_raw = str(row.get("team_fd") or row.get("team") or "").strip()
+        if not name or not status or not team_raw:
+            continue
+        try:
+            team = require_fd(team_raw).fd
+        except UnmappedTeam:
+            continue
+        out.append(InjuryRow(name=name, team=team, status=status))
+    return out
+
+
+def injury_code(status: str) -> str:
+    """FanDuel letter for a CSV indicator or a gangstash/ESPN status word."""
+    text = (status or "").strip()
+    if not text:
+        return ""
+    mapped = _CODE_WORDS.get(text.casefold())
+    if mapped:
+        return mapped
+    return text.upper()
+
+
+def is_inactive(player: Player) -> bool:
+    """O, D, IR, or NA. Questionable is still active."""
+    return injury_code(player.injury) in INACTIVE_CODES
+
+
+def stamp_injuries(players: list[Player], rows: list[InjuryRow]) -> list[Player]:
+    """Write gangstash statuses onto matching players. CSV codes stay otherwise."""
+    by_key = {
+        (r.team, match_key(r.name)): injury_code(r.status)
+        for r in rows
+        if injury_code(r.status)
+    }
+    out: list[Player] = []
+    for pl in players:
+        code = by_key.get((pl.team, match_key(pl.name)))
+        if not code:
+            out.append(pl)
+            continue
+        out.append(replace(pl, injury=code))
+    return out
+
+
+def handoff_chart(players: list[Player]) -> list[Player]:
+    """Promote the next healthy charted player when a starter is O, D, IR, or NA.
+
+    Ranks are rewritten inside each team and position. Inactive charted
+    players lose the slot. Unlisted players do not jump the chart.
+    Questionable keeps the pre-game rank. Objectives are rescored.
+    """
+    groups: dict[tuple[str, str], list[Player]] = {}
+    for pl in players:
+        pos = (pl.position or "").upper()
+        if pos in {"D", "DEF"}:
+            continue
+        groups.setdefault(((pl.team or "").upper(), pos), []).append(pl)
+    new_rank: dict[str, int | None] = {}
+    for group in groups.values():
+        charted = [pl for pl in group if pl.depth_rank is not None]
+        if not charted:
+            continue
+        healthy = [pl for pl in charted if not is_inactive(pl)]
+        healthy.sort(
+            key=lambda pl: (
+                int(pl.depth_rank or 0),
+                -(pl.salary or 0),
+                pl.pid,
+            )
+        )
+        for index, pl in enumerate(healthy, start=1):
+            new_rank[pl.pid] = index
+        for pl in charted:
+            if pl.pid not in new_rank:
+                new_rank[pl.pid] = None
+    out: list[Player] = []
+    for pl in players:
+        if pl.pid not in new_rank or new_rank[pl.pid] == pl.depth_rank:
+            out.append(pl)
+            continue
+        patched = replace(pl, depth_rank=new_rank[pl.pid])
+        out.append(replace(patched, objective=score_player(patched)))
     return out
 
 

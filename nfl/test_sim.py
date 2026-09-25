@@ -1389,6 +1389,11 @@ class LiveShapeTest(unittest.TestCase):
             _pl(pid="b", name="B", position="QB", depth_rank=2, salary=4000),
         ]
         self.assertEqual(passing_qb(by_depth).pid, "b")
+        inactive = [
+            _pl(pid="a", name="Out", position="QB", depth_rank=1, injury="D"),
+            _pl(pid="b", name="Next", position="QB", depth_rank=2, injury=""),
+        ]
+        self.assertEqual(passing_qb(inactive).pid, "b")
 
     def test_qb_pass_yards_are_the_sum_of_receiving_lines(self):
         eff = PlaceholderEfficiency()
@@ -1935,6 +1940,87 @@ class LevelAnchorTest(unittest.TestCase):
         )
         self.assertLess(prop_gs.by_pid["rb1"].mean, 16.0)
         self.assertLess(prop_gs.by_pid["rb1"].mean, solo.by_pid["rb1"].mean)
+
+
+class LowTotalQbTest(unittest.TestCase):
+    def test_starter_without_catcher_history_clears_the_role_share(self):
+        """Implied 17.5 used to be team points × 0.50 (about 8.8, p90 about 11.4)."""
+        common = dict(
+            team="MIA",
+            opponent="NE",
+            game="NE@MIA",
+            implied_total=17.5,
+            implied_opp=24.0,
+            total=41.5,
+            spread=6.5,
+        )
+        qb = _pl(
+            pid="willis",
+            name="Malik Willis",
+            position="QB",
+            salary=7000,
+            depth_rank=1,
+            **common,
+        )
+        backup = _pl(
+            pid="backup",
+            name="Backup QB",
+            position="QB",
+            salary=5000,
+            depth_rank=2,
+            **common,
+        )
+        wr = _pl(pid="wr", name="MIA WR", position="WR", depth_rank=1, **common)
+        role_share = 17.5 * POS_FD_SHARE["QB"]
+        self.assertAlmostEqual(role_share, 8.75, places=2)
+        gs = simulate_games([qb, backup, wr], n=800, seed=1)
+        self.assertGreater(gs.by_pid["willis"].mean, 12.0)
+        self.assertLess(gs.by_pid["willis"].mean, 17.0)
+        self.assertGreater(gs.by_pid["willis"].p90, role_share + 2.0)
+        self.assertLess(gs.by_pid["backup"].mean, 0.5)
+        self.assertGreater(
+            pearson(list(gs.draws["willis"]), list(gs.draws["wr"])), 0.9
+        )
+
+    def test_starter_with_catcher_history_clears_the_role_share(self):
+        """Receiver target history used to leave the QB on team points × 0.50.
+
+        Implied 17.5 was about 8.75 mean and p90 about 11.4. The opportunity
+        path keeps the implied-total pass anchor and a rush floor.
+        """
+        common = dict(
+            team="MIA",
+            opponent="NE",
+            game="NE@MIA",
+            implied_total=17.5,
+            implied_opp=24.0,
+            total=41.5,
+            spread=6.5,
+        )
+        qb = _pl(
+            pid="willis",
+            name="Malik Willis",
+            position="QB",
+            salary=7000,
+            depth_rank=1,
+            **common,
+        )
+        wr = _pl(
+            pid="wr",
+            name="Jaylen Waddle",
+            position="WR",
+            depth_rank=1,
+            **common,
+        )
+        inputs = sim_inputs_from_records(
+            targets=_skill_rows("Jaylen Waddle", "WR", 0.28, "MIA"),
+        )
+        role_share = 17.5 * POS_FD_SHARE["QB"]
+        self.assertAlmostEqual(role_share, 8.75, places=2)
+        gs = simulate_games([qb, wr], n=800, seed=1, inputs=inputs)
+        self.assertGreater(gs.by_pid["willis"].mean, 12.0)
+        self.assertLess(gs.by_pid["willis"].mean, 20.0)
+        self.assertGreater(gs.by_pid["willis"].p90, role_share + 2.0)
 
 
 if __name__ == "__main__":

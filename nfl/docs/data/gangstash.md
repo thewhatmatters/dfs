@@ -75,14 +75,19 @@ python3 -m nfl.gangstash_data team-stats-weekly --season 2026 --week 1,2
 | `GANGSTASH_TEAM_STATS_DATASET` | `team_stats` | `dataset=` value |
 | `GANGSTASH_TEAM_STATS_WEEKLY_DATASET` | `team_stats_weekly` | `dataset=` value |
 | `GANGSTASH_SNAPS_DATASET` | `snaps` | `dataset=` value |
+| `GANGSTASH_PLAYER_STATS_WEEKLY_DATASET` | `player_stats_weekly` | `dataset=` value |
+| `GANGSTASH_CLOSING_LINES_DATASET` | `closing_lines` | `dataset=` value |
+| `GANGSTASH_INJURIES_DATASET` | `injuries` | `dataset=` value |
 
 ## Queries this client sends
 
 | dataset | query | notes |
 |---------|--------|--------|
 | `targets` | `season` (required), `week` (single or `1,2`), optional `position` (`WR`/`TE`/`RB`), `team` | season is the FanDuel CSV year. 2026 weeks 1–2 are loaded (640 rows) |
-| `game_lines` | `date=YYYY-MM-DD` (ET kickoff) **or** `season` + one `week` | optimizer sends the slate **date** only. Week 3 is 16 games |
-| `depth_charts` | optional `team`, `position` (that is `pos_abb`), `pos_grp` | optimizer requests `pos_grp=3WR 1TE` |
+| `game_lines` | `date=YYYY-MM-DD` (ET kickoff) **or** `season` + one `week` | optimizer sends the slate **date** only, unless `--week` is set |
+| `closing_lines` | `season` + one `week` | preferred for a past `--week` and for `nfl.backtest`. Not deployed yet (Unknown dataset is printed, then `game_lines`). Implied team totals are enough when spread and total are absent |
+| `depth_charts` | optional `team`, `position` (that is `pos_abb`), `pos_grp`, `season`, `week` | optimizer requests `pos_grp=3WR 1TE`. A chart with no `week` column is the current chart |
+| `injuries` | `season` + one `week` | not deployed. Backtest uses the FanDuel CSV indicator and ignores an Unknown dataset |
 | `team_stats` | `season` (required), `season_type` (default `REG`), optional `side` (`offense`/`defense`), `team` | not scored |
 | `team_stats_weekly` | `season` + `week` (single or comma list), optional `team` | not scored. Adds `week`, `opponent`, `game_id` on each row |
 | `snaps` | `season` (required), `week` (single or `1,2`), optional `position` (`WR`/`TE`/`RB`), `team` (FD or nflverse; `JAC` and `JAX` both work) | 2026 weeks 1–2 are 2,994 rows (185 RB, 335 WR, 220 TE). `offense_pct` is a 0–1 fraction |
@@ -120,6 +125,36 @@ formula as the Odds API (`nfl/lines.py`). Rows outside the slate window are
 dropped when `commence_time` is present. A missing slate game is
 `LINES_GANGSTASH` (stop). No key and no cache is `LINES_GANGSTASH_KEY`
 (stop — no silent FPPG).
+
+**`closing_lines`:** same join as `game_lines`. A past week
+(`nfl.optimize --week`, `nfl.backtest`) tries this dataset first. The
+dataset is nflverse-sourced. Rows may send `home_implied_total` /
+`home_implied_tt` and `away_implied_total` / `away_implied_tt` instead of
+`spread` and `total`. When both implied totals are present they win: total
+is the sum, and home spread is away implied minus home implied (negative
+when home is favored). Otherwise nflverse `spread_line` is positive when
+the home team is favored, so the stored home spread is `-spread_line` and
+the total is `total_line` (not the final-score `total` column). A plain
+`spread` column is already the Odds sign and is not flipped. An empty close
+falls through to `game_lines`. The live API currently returns Unknown
+dataset. The backtest prints `closing_lines: not available (Unknown dataset)`
+and does not treat that as a quiet skip. If `game_lines` also fails and no
+`--lines-file` was given, the backtest stops unless `--allow-missing-lines`.
+`--lines-file` (CSV or JSON) still wins over both. A file with `season`,
+`week`, `home_team`, `away_team`, `spread_line`, and `total_line` is an
+nflverse schedule: `game_id`, `gameday`, `gametime`, `home_line`,
+`away_line`, moneylines, `*_spread_odds`, `under_odds`, `over_odds`, and
+`home_implied_tt` / `away_implied_tt` are ignored. `JAX`→`JAC`, `LA`→`LAR`.
+A missing required column, or zero games after the season/week filter, is
+an error. A simple file (no nflverse schedule columns) still errors on a
+column the reader does not know.
+
+**`injuries`:** not deployed (Unknown dataset). The backtest does not list
+that as missing and does not stop. It reads the FanDuel CSV Injury Indicator
+(`O` / `D` / `IR` / `Q` / `NA`). `O`, `D`, `IR`, and `NA` hand the chart
+slot to the next healthy player. `Q` keeps the pre-game projection. If this
+dataset later returns `player_name`, `team_fd`, `status`, `season`, `week`,
+those rows are applied for that week.
 
 **`depth_charts`** (latest ESPN via nflverse): `team`, `team_fd`, `pos_grp`,
 `pos_abb`, `pos_name`, `pos_slot`, `pos_rank`, `player_name`, `gsis_id`,

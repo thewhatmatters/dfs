@@ -61,10 +61,11 @@ TEAMS: dict[str, TeamRef] = {
     )
 }
 
-# FanDuel uses JAC/WAS; ESPN/Odds often JAX/WSH.
+# FanDuel uses JAC/WAS/LAR. ESPN/Odds use JAX/WSH. nflverse uses JAX and LA (Rams).
 ALIASES: dict[str, str] = {
     "JAX": "JAC",
     "WSH": "WAS",
+    "LA": "LAR",
 }
 
 

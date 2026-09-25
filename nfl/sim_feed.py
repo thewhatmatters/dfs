@@ -77,6 +77,10 @@ def load_gangstash_sim_inputs(
     stats_rows, stats_meta, stats_err = _pull(
         lambda: fetch_team_stats(season=season, refresh=False)
     )
+    # ``weeks=[]`` is a backtest of week 1: no prior week exists. Do not
+    # pull the season-to-date board (that includes the week being scored).
+    # ``weeks is None`` keeps the optimizer's "every completed week" pull.
+    prior = weeks is None or bool(weeks)
     weekly_rows: list[dict] = []
     weekly_meta: dict = {}
     weekly_err: str | None = None
@@ -84,28 +88,38 @@ def load_gangstash_sim_inputs(
         weekly_rows, weekly_meta, weekly_err = _pull(
             lambda: fetch_team_stats_weekly(season=season, weeks=weeks, refresh=False)
         )
-    target_rows, target_meta, target_err = _pull(
-        lambda: fetch_targets(
-            season=season,
-            weeks=weeks,
-            refresh=refresh_targets,
+        weekly_rows = _rows_in_weeks(weekly_rows, weeks)
+    if prior:
+        target_rows, target_meta, target_err = _pull(
+            lambda: fetch_targets(
+                season=season,
+                weeks=weeks,
+                refresh=refresh_targets,
+            )
         )
-    )
-    snap_rows, snap_meta, snap_err = _pull(
-        lambda: fetch_snaps(
-            season=season,
-            weeks=weeks,
-            position="RB",
-            refresh=refresh_snaps,
+        snap_rows, snap_meta, snap_err = _pull(
+            lambda: fetch_snaps(
+                season=season,
+                weeks=weeks,
+                position="RB",
+                refresh=refresh_snaps,
+            )
         )
-    )
-    stat_rows, stat_meta, stat_err = _pull(
-        lambda: fetch_player_stats_weekly(
-            season=season,
-            weeks=weeks,
-            refresh=False,
+        stat_rows, stat_meta, stat_err = _pull(
+            lambda: fetch_player_stats_weekly(
+                season=season,
+                weeks=weeks,
+                refresh=False,
+            )
         )
-    )
+        if weeks:
+            target_rows = _rows_in_weeks(target_rows, weeks)
+            snap_rows = _rows_in_weeks(snap_rows, weeks)
+            stat_rows = _rows_in_weeks(stat_rows, weeks)
+    else:
+        target_rows, target_meta, target_err = [], {}, None
+        snap_rows, snap_meta, snap_err = [], {}, None
+        stat_rows, stat_meta, stat_err = [], {}, None
     team_stats = _team_stats(stats_rows, weekly_rows)
     targets = _targets(target_rows)
     snaps = _snaps(snap_rows)
@@ -143,6 +157,25 @@ def load_gangstash_sim_inputs(
     if skipped:
         note += "  skipped " + ",".join(skipped)
     return inputs, note
+
+
+def _rows_in_weeks(rows: list[dict], weeks: list[int] | None) -> list[dict]:
+    """Drop rows whose ``week`` is outside the requested prior window."""
+    if not weeks:
+        return rows
+    want = {int(week) for week in weeks}
+    kept: list[dict] = []
+    for row in rows:
+        raw = row.get("week")
+        if raw is None or raw == "":
+            continue
+        try:
+            week = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if week in want:
+            kept.append(row)
+    return kept
 
 
 def _pull(fn) -> tuple[list[dict], dict, str | None]:

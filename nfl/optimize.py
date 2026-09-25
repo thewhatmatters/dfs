@@ -249,6 +249,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="replay Odds / simple-games JSON instead of a live API",
     )
     ap.add_argument(
+        "--lines-file",
+        default=None,
+        help="CSV or JSON historical lines (spread/total or implied totals). "
+        "Wins over --lines-json and the live source.",
+    )
+    ap.add_argument(
+        "--week",
+        type=int,
+        default=None,
+        help="NFL week. With gangstash lines, past weeks prefer "
+        "dataset=closing_lines and fall back to game_lines.",
+    )
+    ap.add_argument(
+        "--season",
+        type=int,
+        default=None,
+        help="Season for --week (default: the slate CSV year).",
+    )
+    ap.add_argument(
         "--lines-source",
         choices=("oddsapi", "gangstash"),
         default="gangstash",
@@ -570,12 +589,16 @@ def main(argv: list[str] | None = None) -> int:
 
     slate_day = infer_slate_date(csv_path)
     json_path = Path(args.lines_json).expanduser() if args.lines_json else None
+    file_path = Path(args.lines_file).expanduser() if args.lines_file else None
     try:
         by_team = ingest_slate_lines(
             pool,
             lines_json=json_path,
+            lines_file=file_path,
             slate_day=slate_day,
             source=args.lines_source,
+            season=args.season or slate_day.year,
+            week=args.week,
         )
     except (LinesKeyMissing, LinesAuthError, LinesError, UnmappedTeam) as e:
         msg = (

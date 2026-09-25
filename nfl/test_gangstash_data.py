@@ -730,6 +730,60 @@ class GameLinesTest(unittest.TestCase):
         self.assertAlmostEqual(row.spread, -2.5)
         self.assertAlmostEqual(row.home_moneyline or 0, -130)
 
+    def test_implied_totals_derive_spread_and_total(self) -> None:
+        row = parse_game_line(
+            {
+                "home_team_fd": "MIA",
+                "away_team_fd": "NE",
+                "season": 2026,
+                "week": 2,
+                "home_implied_total": 17.5,
+                "away_implied_total": 24.0,
+            }
+        )
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertAlmostEqual(row.total, 41.5, places=4)
+        self.assertAlmostEqual(row.spread, 6.5, places=4)
+
+    def test_nflverse_spread_line_favorite_gets_the_higher_total(self) -> None:
+        row = parse_game_line(
+            {
+                "home_team": "SF",
+                "away_team": "MIA",
+                "spread_line": 12.5,
+                "total_line": 44.5,
+                "total": 41,
+                "home_moneyline": -900,
+                "away_moneyline": 650,
+            }
+        )
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(row.home_fd, "SF")
+        self.assertEqual(row.away_fd, "MIA")
+        self.assertAlmostEqual(row.spread, -12.5, places=4)
+        self.assertAlmostEqual(row.total, 44.5, places=4)
+        implied_home = (row.total - row.spread) / 2
+        implied_away = (row.total + row.spread) / 2
+        self.assertAlmostEqual(implied_home, 28.5, places=4)
+        self.assertAlmostEqual(implied_away, 16.0, places=4)
+        self.assertGreater(implied_home, implied_away)
+
+        implied = parse_game_line(
+            {
+                "home_team": "SF",
+                "away_team": "MIA",
+                "spread_line": 12.5,
+                "total_line": 44.5,
+                "home_implied_tt": 20.0,
+                "away_implied_tt": 24.5,
+            }
+        )
+        assert implied is not None
+        self.assertAlmostEqual(implied.total, 44.5, places=4)
+        self.assertAlmostEqual(implied.spread, 4.5, places=4)
+
     def test_gangstash_source_builds_implied_totals_and_skips_odds(self) -> None:
         raw = [
             {
@@ -799,6 +853,76 @@ class GameLinesTest(unittest.TestCase):
         odds.assert_not_called()
         self.assertEqual(by_team["PHI"].source, "lines-json")
         self.assertAlmostEqual(by_team["PHI"].total, 44)
+
+    def test_past_week_prefers_closing_lines(self) -> None:
+        closing = [
+            {
+                "home_team_fd": "PHI",
+                "away_team_fd": "DAL",
+                "season": 2026,
+                "week": 2,
+                "home_implied_total": 27.0,
+                "away_implied_total": 20.0,
+            }
+        ]
+        game = [
+            {
+                "home_team_fd": "PHI",
+                "away_team_fd": "DAL",
+                "season": 2026,
+                "week": 2,
+                "spread": -1.0,
+                "total": 40.0,
+            }
+        ]
+        players = [_pl()]
+        with patch(
+            "nfl.lines.fetch_closing_lines",
+            return_value=(closing, {"live": False}),
+        ) as closing_fetch, patch(
+            "nfl.lines.fetch_game_lines",
+            return_value=(game, {"live": False}),
+        ) as game_fetch:
+            by_team = ingest_slate_lines(
+                players,
+                slate_day=date(2026, 9, 13),
+                source="gangstash",
+                season=2026,
+                week=2,
+            )
+        closing_fetch.assert_called_once()
+        game_fetch.assert_not_called()
+        self.assertAlmostEqual(by_team["PHI"].implied_home, 27.0, places=4)
+        self.assertAlmostEqual(by_team["PHI"].total, 47.0, places=4)
+
+    def test_empty_closing_lines_fall_back_to_game_lines(self) -> None:
+        game = [
+            {
+                "home_team_fd": "PHI",
+                "away_team_fd": "DAL",
+                "season": 2026,
+                "week": 1,
+                "spread": -3.5,
+                "total": 45.5,
+            }
+        ]
+        players = [_pl()]
+        with patch(
+            "nfl.lines.fetch_closing_lines",
+            return_value=([], {"live": False}),
+        ), patch(
+            "nfl.lines.fetch_game_lines",
+            return_value=(game, {"live": False}),
+        ) as game_fetch:
+            by_team = ingest_slate_lines(
+                players,
+                slate_day=date(2026, 9, 13),
+                source="gangstash",
+                week=1,
+                season=2026,
+            )
+        game_fetch.assert_called_once()
+        self.assertAlmostEqual(by_team["PHI"].total, 45.5, places=4)
 
 
 class DepthSourceTest(unittest.TestCase):
