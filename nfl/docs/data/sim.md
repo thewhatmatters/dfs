@@ -44,6 +44,8 @@ spread_sigma = 10 × scale_game
 
 `1.15` is the per-play EPA standard deviation that leaves the sigmas at the old constants (`0.12` and `10`). Missing variance uses scale `1`.
 
+`--sim-mode team` (default `off`) replaces that draw with a bivariate normal on the total and the FanDuel home spread. The SDs and correlation are the 2024 regular-season closing-line residuals (272 games, sample SD, FanDuel spread sign): total SD `12.4874`, spread SD `12.6228`, correlation `-0.0832`. They are not scaled by EPA variance. Pass yards, pass TDs, pass attempts, and rush attempts are then multiplied by `1 + 0.6901 × (team points / implied − 1)`. `0.6901` is the 2024 week-1 bisection that matches the sim's mean QB–opp DEF correlation to the 2024 actual Pearson, `-0.4663`. A constant per team puts the mean of pass volume and of rush volume back on the unscaled anchor, because the margin script already moves the other way. After the draws, one additive constant per player puts that player's mean back on the default-mode mean. Correlations are unchanged by that constant. The default mode does not take this branch. If those constants are missing, or a game has no finite closing total and spread, that game keeps the default draw and the sim logs a warning. It does not raise.
+
 **Scoring variance for a team** is the mean of:
 
 - that team's **offense** EPA variance
@@ -242,12 +244,13 @@ The reader is `fetch_player_stats_weekly` (`dataset=player_stats_weekly&season=&
 
 ## Holdout
 
-`python3 -m nfl.holdout` repeats that backtest across weeks and seasons and only measures. It does not change the ILP or the sim. There is no CSV: the pool is the depth chart. Inputs are still weeks before the target. Week 1 stays empty unless `--seed-prior-season` loads the prior season's week 18 (default off).
+`python3 -m nfl.holdout` repeats that backtest across weeks and seasons and only measures. It does not change the ILP. `--sim-mode` defaults to `off` (the current draws). `team` is the opt-in joint total and spread. There is no CSV: the pool is the depth chart. Inputs are still weeks before the target. Week 1 stays empty unless `--seed-prior-season` loads the prior season's week 18 (default off).
 
 ```bash
 python3 -m nfl.holdout --season 2024 --weeks 1-18 --n 3000 --json-out results/holdout-2024.json
 python3 -m nfl.holdout --season 2025 --weeks 1-18 --n 3000 --json-out results/holdout-2025.json
 python3 -m nfl.holdout --season 2026 --weeks 2 --n 3000 --json-out results/holdout-2026-w2.json
+python3 -m nfl.holdout --season 2024 --weeks 1-18 --n 3000 --sim-mode team --json-out results/holdout-2024-team.json
 ```
 
 `--seasons 2024,2025` scores both. Each week runs the placeholder sim and the data sim. The text and the JSON report pooled starters and the full pool (mean error and MAE by position for board, sim-placeholder, and sim-data), calibration (share of actuals at or below the 10th through 90th percentile of that player's draws, and p10–p90 coverage), the SD of simulated game margin and total against the actual games and against closing-line residuals, Pearson correlations for QB–WR1, QB–TE1, QB–RB1, QB vs opposing DEF, QB vs opposing QB, and WR1–WR2, and the average weekly Spearman of projection vs actual. One week (the last requested week other than week 1) is rerun with opponent pass and rush multipliers, pace, red-zone TD rate, and depth-1 target/carry shares moved ±10%. `props_closing` is the prop baseline when that season has rows; 2024, 2025, and 2026 weeks 1–2 skip it.

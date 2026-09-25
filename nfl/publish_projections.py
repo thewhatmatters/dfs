@@ -15,6 +15,7 @@ Read key: GANGSTASH_API_KEY (existing /data and /props clients).
 `simulate_games` with the same gangstash `SimInputs` the optimizer
 builds for `--projection-source sim`. `mean` is that simulated mean.
 `--sim-efficiency` matches the optimizer (default `data`).
+`--sim-mode team` is opt-in. The default `off` keeps the current draws.
 The run log prints the effective mode after any fallback, and each sim
 row stores that mode on `inputs.sim_efficiency`. Missing sim inputs
 fall back to placeholder and the board, and the log says so. The
@@ -258,6 +259,7 @@ def maybe_sim(
     refresh: bool,
     week: int | None = None,
     sim_efficiency: str = "data",
+    sim_mode: str = "off",
 ) -> SimResult:
     """``(pid → SimStats, effective efficiency mode)``, plus game draws.
 
@@ -270,6 +272,9 @@ def maybe_sim(
     placeholder fallback when sim inputs are missing.
     """
     requested = (sim_efficiency or "data").strip().lower()
+    from nfl.sim_team import parse_sim_mode
+
+    mode = parse_sim_mode(sim_mode)
     if n <= 0:
         return SimResult(None, requested)
     fn = load_simulate_games()
@@ -317,12 +322,17 @@ def maybe_sim(
         )
         return SimResult(None, used)
     try:
-        result = fn(
-            sim_pool([e.player for e in entries]),
+        call = dict(
             n=int(n),
             seed=int(seed),
             inputs=sim_inputs,
             efficiency=efficiency,
+        )
+        if mode == "team":
+            call["sim_mode"] = "team"
+        result = fn(
+            sim_pool([e.player for e in entries]),
+            **call,
         )
     except Exception as e:
         print(
@@ -1238,6 +1248,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "the board, and the log says so. Same flag as nfl.optimize.",
     )
     ap.add_argument(
+        "--sim-mode",
+        default="off",
+        help="off (default) keeps the current draws. team draws a joint "
+        "total and spread and scales production with the team score.",
+    )
+    ap.add_argument(
         "--dry-run",
         action="store_true",
         help=f"Write JSON and CSV under {OUT_DIR} and do not POST",
@@ -1314,6 +1330,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.sim < 0:
         print("publish projections: --sim must be >= 0", file=sys.stderr)
         return 1
+    from nfl.sim_team import parse_sim_mode
+
+    try:
+        args.sim_mode = parse_sim_mode(args.sim_mode)
+    except ValueError as exc:
+        print("publish projections: %s" % exc, file=sys.stderr)
+        return 1
     key = None
     if not args.dry_run:
         try:
@@ -1332,6 +1355,7 @@ def main(argv: list[str] | None = None) -> int:
             refresh=bool(args.refresh),
             week=week,
             sim_efficiency=args.sim_efficiency,
+            sim_mode=args.sim_mode,
         )
         sim_by_pid, used_efficiency, game_draws = sim_parts(sim)
     except StaleInputs as e:
@@ -1364,7 +1388,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(
         f"projections {season} week {week} {args.season_type} "
-        f"run_at={run_at} model_version={version} sim_efficiency={used_efficiency}",
+        f"run_at={run_at} model_version={version} sim_efficiency={used_efficiency}"
+        + ("" if args.sim_mode == "off" else f" sim_mode={args.sim_mode}"),
         file=sys.stderr,
     )
     print(summarize(rows), file=sys.stderr)

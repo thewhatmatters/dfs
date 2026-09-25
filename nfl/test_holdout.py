@@ -512,7 +512,15 @@ class ReportTest(unittest.TestCase):
                 prop_fetch=lambda season: ([], "props_closing: no rows"),
             )
         self.assertNotIn("scores", report)
+        self.assertNotIn("sim_mode", report)
         self.assertGreater(report["errors"]["full"]["board"]["QB"]["n"], 0)
+
+    def test_unknown_sim_mode_is_a_choke(self) -> None:
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = main(["--season", "2025", "--weeks", "2", "--sim-mode", "rates"])
+        self.assertEqual(code, 1)
+        self.assertIn("choke HOLDOUT", err.getvalue())
 
     def test_props_mae_sits_next_to_the_sim(self) -> None:
         def props(_season):
@@ -1176,6 +1184,75 @@ class MeasurementHarnessTest(unittest.TestCase):
         self.assertIn("game_total_sd.sim_data", report["mc_se"]["metrics"])
         self.assertEqual(report["seed"], 1)
         self.assertEqual(report["seeds"], [1, 2])
+
+    @unittest.skipUnless(_has_scoring(), "numpy and scipy are required")
+    def test_team_mode_with_pregame_seeds_and_metrics(self) -> None:
+        common = dict(
+            n=6,
+            seeds=[1, 2, 3],
+            population="pregame",
+            metrics=True,
+            run_sensitivity=False,
+            load=self._load,
+            prop_fetch=lambda season: ([], "props_closing: no rows"),
+        )
+        default = run_holdout([2025], [2], **common)
+        team = run_holdout([2025], [2], sim_mode="team", **common)
+        self.assertNotIn("sim_mode", default)
+        self.assertNotIn("sim-mode:", format_report(default))
+        self.assertEqual(team["sim_mode"], "team")
+        self.assertEqual(team["population"], "pregame")
+        self.assertEqual(team["seeds"], [1, 2, 3])
+        self.assertEqual(team["mc_se"]["n_seeds"], 3)
+        self.assertIn("scores", team)
+        self.assertIn("paired", team)
+        self.assertGreater(
+            team["game_variance"]["sim_total_sd"]["sim_data"],
+            default["game_variance"]["sim_total_sd"]["sim_data"],
+        )
+        self.assertIn("sim-mode: team", format_report(team))
+
+    @unittest.skipUnless(_has_scoring(), "numpy and scipy are required")
+    def test_cli_team_mode_pregame_seeds_and_metrics(self) -> None:
+        def boom(*_args, **_kwargs):
+            raise AssertionError("network")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "holdout.json"
+            argv = [
+                "--season",
+                "2025",
+                "--weeks",
+                "2",
+                "--n",
+                "6",
+                "--population",
+                "pregame",
+                "--seeds",
+                "1,2,3",
+                "--metrics",
+                "--sim-mode",
+                "team",
+                "--json-out",
+                str(path),
+            ]
+            with patch("nfl.holdout._load_live", side_effect=boom), patch(
+                "nfl.holdout.fetch_props_closing", side_effect=boom
+            ), patch("nfl.holdout.load_week", side_effect=self._load), patch(
+                "nfl.holdout.fetch_prop_rows",
+                return_value=([], "props_closing: no rows"),
+            ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                code = main(argv)
+            self.assertEqual(code, 0)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["sim_mode"], "team")
+            self.assertEqual(payload["population"], "pregame")
+            self.assertEqual(payload["seeds"], [1, 2, 3])
+            self.assertEqual(payload["mc_se"]["n_seeds"], 3)
+            self.assertTrue(path.with_suffix(".draws.npz").is_file())
+            self.assertTrue(path.with_suffix(".manifest.json").is_file())
+            text_out = format_report(payload)
+            self.assertIn("sim-mode: team", text_out)
 
     @unittest.skipUnless(_has_scoring(), "numpy and scipy are required")
     def test_main_writes_manifest_and_draws(self) -> None:

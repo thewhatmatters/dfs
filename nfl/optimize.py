@@ -96,6 +96,7 @@ from nfl.sim import (  # noqa: E402
     sim_header,
     simulate_games,
 )
+from nfl.sim_team import parse_sim_mode
 from nfl.sim_efficiency import (  # noqa: E402
     projection_source_for_run,
     resolve_run_efficiency,
@@ -434,6 +435,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "Does not change the board formula.",
     )
     ap.add_argument(
+        "--sim-mode",
+        default="off",
+        help="off (default) keeps the current draws. team draws a joint "
+        "total and spread and scales production with the team score. "
+        "Does not change the ILP rules.",
+    )
+    ap.add_argument(
         "--sim-inputs",
         default=None,
         metavar="PATH",
@@ -595,6 +603,11 @@ def _write_payload(payload: dict, args) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
+    try:
+        args.sim_mode = parse_sim_mode(args.sim_mode)
+    except ValueError as e:
+        emit("SIM_MODE", str(e))
+        return 1
     try:
         rules = replace(
             FANDUEL_NFL,
@@ -1027,12 +1040,14 @@ def main(argv: list[str] | None = None) -> int:
             args.projection_source = source
             payload["flags"]["projection_source"] = source
         payload["flags"]["sim_efficiency"] = used_mode
+        payload["flags"]["sim_mode"] = args.sim_mode
         game_sim = simulate_games(
             pool,
             n=sim_n,
             seed=args.sim_seed,
             inputs=sim_inputs,
             efficiency=efficiency,
+            sim_mode=args.sim_mode,
         )
         sim_by_pid = game_sim.by_pid
         payload["sim_diagnostic"] = format_sim_diagnostic(
