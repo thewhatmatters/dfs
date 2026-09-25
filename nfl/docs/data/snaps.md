@@ -3,7 +3,10 @@
 Grant: [`lineups-authorization.md`](lineups-authorization.md). Public Lineups
 SSR pages, cached. Do not scrape FanDuel.
 
-Wednesday-style weekly refresh (after the prior week’s games land):
+The optimizer default is gangstash (`--snaps-source=gangstash`). This CSV is
+the legacy Lineups path (`--snaps-source=lineups`).
+
+Legacy optional refresh (only when you want this CSV):
 
 ```
 python3 -m nfl.targets --refresh
@@ -27,7 +30,7 @@ with `metric:"snaps"`. Row fields: `name`, `team` (full name), `position`,
 
 ## Optimizer join
 
-Default source is this CSV (`--snaps-source=lineups`). `python3 -m nfl.optimize`
+Default source is gangstash. `python3 -m nfl.optimize --snaps-source=lineups`
 loads the **latest week** in that CSV (or `--snaps-week=N`) and joins RB/WR/TE
 pool players via `nfl.names.match_key`. No invented aliases. `--snaps-csv PATH`
 overrides the default file. `--skip-snaps` leaves snap fields empty (RB usage

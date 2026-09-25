@@ -15,8 +15,8 @@ Solve the highest-projection legal FanDuel NFL classic lineup for a slate CSV.
 
 ## What it does
 
-Loads contest rules from this repo, filters the FanDuel export, joins Vegas
-lines + OurLads depth + Lineups RB/WR/TE targets + Lineups snaps + ESPN injuries + Gangstash props (cached), and runs the PuLP ILP
+Loads contest rules from this repo, filters the FanDuel export, joins gangstash
+lines, depth, targets, and snaps (fallbacks: oddsapi, ourlads/espn, lineups) + ESPN injuries + Gangstash props (cached), and runs the PuLP ILP
 (greedy if PuLP is missing). Default objective is **week1_score** (implied×depth×share×usage, volume props a
 ±20% tilt — not an override). No FPPG. No stdin interview. No question card.
 
@@ -51,24 +51,24 @@ Repo-root `scripts/optimize.py` is the **NCAAF** shim — do not use it here.
 | `--csv=PATH` | FanDuel players-list CSV (required) |
 | `--out=PATH` | write JSON artifact |
 | `--lines-json=PATH` | replay Odds / simple-games JSON (wins over `--lines-source`) |
-| `--lines-source=oddsapi\|gangstash` | default **oddsapi** (`ODDS_API_KEY`). `gangstash` is `dataset=game_lines` |
-| `--skip-depth` | skip OurLads depth join (unlisted prior) |
-| `--refresh-depth` | refetch OurLads HTML (slate teams only) |
-| `--depth-source=ourlads\|espn\|gangstash` | default **ourlads**; `espn` often 403; `gangstash` is `dataset=depth_charts` |
+| `--lines-source=gangstash\|oddsapi` | default **gangstash**. `oddsapi` uses `ODDS_API_KEY` |
+| `--skip-depth` | skip depth join (unlisted prior) |
+| `--refresh-depth` | refetch depth (OurLads HTML when that source is selected) |
+| `--depth-source=gangstash\|ourlads\|espn` | default **gangstash**. `ourlads` or `espn` (often 403) are fallbacks |
 | `--skip-injuries` | skip ESPN injury join |
 | `--refresh-injuries` | refetch ESPN injuries |
 | `--skip-targets` | skip RB/WR/TE target join (usage uses snaps or 1.0) |
-| `--targets-source=lineups\|gangstash` | default **lineups** CSV. `gangstash` share is sum(targets)/sum(team_targets) |
+| `--targets-source=gangstash\|lineups` | default **gangstash**. `lineups` is the legacy CSV. Share is sum(targets)/sum(team_targets) |
 | `--targets-csv=PATH` | Lineups `targets.csv` (default `nfl/data/targets.csv`) |
 | `--targets-week=N` | join that week (lineups default: latest week in the CSV) |
-| `--targets-weeks=1,2` | gangstash window only |
-| `--refresh-targets` | refetch gangstash targets (not the Lineups scrape) |
+| `--targets-weeks=1,2` | gangstash window. Unset = every completed week the API returns |
+| `--refresh-targets` | refetch gangstash targets (legacy Lineups scrape is `python3 -m nfl.targets --refresh`) |
 | `--skip-snaps` | skip snap join (RB usage uses targets or 1.0) |
-| `--snaps-source=lineups\|gangstash` | default **lineups** CSV. `gangstash` `offense_pct` is the 0–1 `snap_share` |
+| `--snaps-source=gangstash\|lineups` | default **gangstash**. `offense_pct` is the 0–1 `snap_share`. `lineups` is the legacy CSV |
 | `--snaps-csv=PATH` | Lineups `snaps.csv` (default `nfl/data/snaps.csv`) |
 | `--snaps-week=N` | Lineups join week (default: latest week in the CSV) |
-| `--snaps-weeks=1,2` | gangstash window; if omitted, uses `--targets-weeks` or every week returned |
-| `--refresh-snaps` | refetch gangstash snaps (not the Lineups scrape) |
+| `--snaps-weeks=1,2` | gangstash window. Unset = every completed week the API returns |
+| `--refresh-snaps` | refetch gangstash snaps (legacy Lineups scrape is `python3 -m nfl.snaps --refresh`) |
 | `--skip-props` | skip Gangstash player props |
 | `--refresh-props` | refetch Gangstash props — do not unless asked |
 | `--exclude-questionable` | drop CSV Q; IR/NA already dropped |
@@ -102,7 +102,7 @@ is not ILP).
 1. **Rules** — read `nfl/docs/sites/fanduel-nfl.md` if anything looks off vs the CSV (`Roster Position`, salaries, DST).
 2. **Preflight** — `python3 .cursor/skills/optimize-nfl-classic/scripts/preflight.py --csv=<path>`. `down` stops. `gated` `SOLVER_PULP`: `--agent` Skip → greedy, say so. If overall is not `ready`, name the **`choke` id** and open [`references/sources.md`](references/sources.md) (catalog: `nfl/docs/data/sources.md`). Do not dump the catalog on a green run.
 3. **Solve** — Interactive TTY: `python3 -m nfl.optimize --csv=<path> --sim --out results/nfl-lineup.json` (**no** `--agent`). Same flags via `python3 .cursor/skills/optimize-nfl-classic/scripts/optimize.py`. Newest CSV: `nfl/data/FanDuel-NFL-*-players-list.csv`. GPP/ceiling → `--objective=ceiling`. `n-lineups` only if named. Cached props. JSON stdout only with `--agent` / `--json` / non-TTY. Gate `LINES_KEY` is a **hard stop**. Ingest failures print `choke <ID>:` on stderr and set JSON `"choke"`.
-4. **Report** — paste the stderr picker table **verbatim** inside a markdown ` ``` ` fence (preserves box-drawing in the TUI). Do **not** rewrite as a bullet/list, do **not** put a second `props:` line under each player, do **not** dump JSON in the chat on a TTY. Stack / bring-back / cash-line notes stay **under** the table (already in `format_picker_table`). Last column is **Sources** (compact join tags, e.g. `ourlads/lineups-tgt`). Method (`pulp-cbc` vs `greedy`) and objective (`mean` / `floor` / `ceiling`) are the stderr header line above the table. Picker `projection` is **week1_score** (not the ILP objective with stack premium); `fl` / `cl` when sim ran. Confirm **no team has 4**. If the run stopped, quote the choke id first. n>1: upload path under `nfl/export/`. “What’s the slate status?” → `python3 -m nfl.optimize --csv … --slate-status` (or `python3 -m nfl.status --csv …`) and paste the `slate status` block.
+4. **Report** — paste the stderr picker table **verbatim** inside a markdown ` ``` ` fence (preserves box-drawing in the TUI). Do **not** rewrite as a bullet/list, do **not** put a second `props:` line under each player, do **not** dump JSON in the chat on a TTY. Stack / bring-back / cash-line notes stay **under** the table (already in `format_picker_table`). Last column is **Sources** (compact join tags, e.g. `gs-depth/gs-tgt/gs-snap/gs-props` or `ourlads/lineups-tgt`). Method (`pulp-cbc` vs `greedy`) and objective (`mean` / `floor` / `ceiling`) are the stderr header line above the table. Picker `projection` is **week1_score** (not the ILP objective with stack premium); `fl` / `cl` when sim ran. Confirm **no team has 4**. If the run stopped, quote the choke id first. n>1: upload path under `nfl/export/`. “What’s the slate status?” → `python3 -m nfl.optimize --csv … --slate-status` (or `python3 -m nfl.status --csv …`) and paste the `slate status` block.
 
 ## Conventions this skill follows
 

@@ -36,16 +36,23 @@ from nfl.choke import (  # noqa: E402
     props_id,
     stamp,
 )
-from nfl.depth import DepthError, attach_depth_ranks, ingest_slate_depth  # noqa: E402
+from nfl.depth import (  # noqa: E402
+    DepthError,
+    GangstashDepthKeyMissing,
+    attach_depth_ranks,
+    ingest_slate_depth,
+)
 from nfl.gangstash import (  # noqa: E402
     GangstashDataError,
     GangstashDataKeyMissing,
     GangstashTruncated,
+    missing_key_message,
 )
 from nfl.injuries import InjuryError, ingest_slate_injuries  # noqa: E402
 from nfl.lines import (  # noqa: E402
     LinesAuthError,
     LinesError,
+    LinesGangstashKeyMissing,
     LinesKeyMissing,
     infer_slate_date,
     ingest_slate_lines,
@@ -174,12 +181,15 @@ def _gangstash_snaps_weeks(
     snaps_weeks: list[int] | None,
     targets_weeks: list[int] | None,
 ) -> list[int] | None:
-    """Explicit snaps window, else the targets window, else every returned week."""
-    if snaps_weeks is not None:
-        return snaps_weeks
-    if (source or "lineups").strip().lower() == "gangstash":
-        return targets_weeks
-    return None
+    """Gangstash snap window. None omits `week` and keeps every week returned.
+
+    Does not copy `--targets-weeks`. Lineups ignores the list (`targets_weeks`
+    is unused; kept so callers stay stable).
+    """
+    del targets_weeks
+    if (source or "lineups").strip().lower() != "gangstash":
+        return None
+    return snaps_weeks
 
 
 def _week_list(value: str) -> list[int]:
@@ -234,9 +244,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument(
         "--lines-source",
         choices=("oddsapi", "gangstash"),
-        default="oddsapi",
-        help="game lines provider (default oddsapi). gangstash uses "
-        "GANGSTASH_API_KEY. --lines-json still wins.",
+        default="gangstash",
+        help="game lines provider (default gangstash, GANGSTASH_API_KEY). "
+        "oddsapi is the Odds API fallback. --lines-json still wins.",
     )
     ap.add_argument(
         "--skip-depth",
@@ -251,8 +261,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument(
         "--depth-source",
         choices=("ourlads", "espn", "gangstash"),
-        default="ourlads",
-        help="depth provider (default ourlads; espn or gangstash are optional)",
+        default="gangstash",
+        help="depth provider (default gangstash). ourlads and espn are fallbacks",
     )
     ap.add_argument(
         "--skip-injuries",
@@ -278,9 +288,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument(
         "--targets-source",
         choices=("lineups", "gangstash"),
-        default="lineups",
-        help="RB/WR/TE target share source (default lineups CSV). "
-        "gangstash uses sum(targets)/sum(team_targets) over the week window.",
+        default="gangstash",
+        help="RB/WR/TE target share source (default gangstash). "
+        "lineups is the legacy CSV fallback.",
     )
     ap.add_argument(
         "--targets-week",
@@ -296,13 +306,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         metavar="LIST",
         help="gangstash target window, comma-separated (e.g. 1,2). "
-        "Share is sum(targets)/sum(team_targets). Ignored for lineups.",
+        "If omitted, keep every completed week the API returns for the season "
+        "(week is not sent). Share is sum(targets)/sum(team_targets). "
+        "Ignored for lineups.",
     )
     ap.add_argument(
         "--refresh-targets",
         action="store_true",
         help="bypass the gangstash targets day cache "
-        "(lineups refresh stays: python3 -m nfl.targets --refresh)",
+        "(legacy optional Lineups refresh: python3 -m nfl.targets --refresh)",
     )
     ap.add_argument(
         "--skip-snaps",
@@ -312,9 +324,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument(
         "--snaps-source",
         choices=("lineups", "gangstash"),
-        default="lineups",
-        help="snap counts provider (default lineups CSV). gangstash uses "
-        "dataset=snaps and offense_pct as the 0-1 snap_share.",
+        default="gangstash",
+        help="snap counts provider (default gangstash; offense_pct is the "
+        "0-1 snap_share). lineups is the legacy CSV fallback.",
     )
     ap.add_argument(
         "--snaps-csv",
@@ -335,14 +347,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         metavar="LIST",
         help="gangstash snap window, comma-separated (e.g. 1,2). "
-        "If omitted, uses --targets-weeks, else every week returned. "
-        "Ignored for lineups.",
+        "If omitted, keep every completed week the API returns for the season "
+        "(week is not sent). Ignored for lineups.",
     )
     ap.add_argument(
         "--refresh-snaps",
         action="store_true",
         help="bypass the gangstash snaps day cache "
-        "(lineups refresh stays: python3 -m nfl.snaps --refresh)",
+        "(legacy optional Lineups refresh: python3 -m nfl.snaps --refresh)",
     )
     ap.add_argument(
         "--skip-props",
@@ -539,11 +551,13 @@ def main(argv: list[str] | None = None) -> int:
             slate_day=slate_day,
             source=args.lines_source,
         )
-    except LinesKeyMissing as e:
-        emit("LINES_KEY", str(e))
-        return 1
-    except (LinesAuthError, LinesError, UnmappedTeam) as e:
-        emit(lines_id(e), str(e))
+    except (LinesKeyMissing, LinesAuthError, LinesError, UnmappedTeam) as e:
+        msg = (
+            missing_key_message(str(e))
+            if isinstance(e, LinesGangstashKeyMissing)
+            else str(e)
+        )
+        emit(lines_id(e), msg)
         return 1
     pool = attach_team_lines(pool, by_team)
     games = unique_games(by_team)
@@ -579,21 +593,32 @@ def main(argv: list[str] | None = None) -> int:
                 refresh=args.refresh_depth,
                 source=args.depth_source,
             )
+        except GangstashDepthKeyMissing as e:
+            emit("DEPTH_GANGSTASH_KEY", missing_key_message(str(e)))
+            dstats = {
+                "skipped": True,
+                "matched": 0,
+                "players": len(pool),
+                "choke": "DEPTH_GANGSTASH_KEY",
+                "error": str(e),
+                "source": "gangstash",
+            }
         except (DepthError, UnmappedTeam) as e:
             emit(depth_id(e), str(e))
             return 1
-        pool, dstats = attach_depth_ranks(
-            pool,
-            depth_rows,
-            score_fn=lambda pl, rank: score_player(pl, rank),
-            source=args.depth_source,
-        )
-        dstats = {**dstats, "skipped": False, "source": args.depth_source}
-        print(
-            f"depth matched {dstats['matched']} / {dstats['players']}  "
-            f"rows {dstats['depth_rows']}",
-            file=sys.stderr,
-        )
+        else:
+            pool, dstats = attach_depth_ranks(
+                pool,
+                depth_rows,
+                score_fn=lambda pl, rank: score_player(pl, rank),
+                source=args.depth_source,
+            )
+            dstats = {**dstats, "skipped": False, "source": args.depth_source}
+            print(
+                f"depth matched {dstats['matched']} / {dstats['players']}  "
+                f"rows {dstats['depth_rows']}",
+                file=sys.stderr,
+            )
 
     tstats: dict = {"skipped": True}
     if args.skip_targets:
@@ -627,7 +652,7 @@ def main(argv: list[str] | None = None) -> int:
                 "source": args.targets_source,
             }
         except GangstashDataKeyMissing as e:
-            emit("TARGETS_GANGSTASH_KEY", str(e))
+            emit("TARGETS_GANGSTASH_KEY", missing_key_message(str(e)))
             tstats = {
                 "skipped": True,
                 "choke": "TARGETS_GANGSTASH_KEY",
@@ -700,7 +725,7 @@ def main(argv: list[str] | None = None) -> int:
                 "source": args.snaps_source,
             }
         except GangstashDataKeyMissing as e:
-            emit("SNAPS_GANGSTASH_KEY", str(e))
+            emit("SNAPS_GANGSTASH_KEY", missing_key_message(str(e)))
             sstats = {
                 "skipped": True,
                 "choke": "SNAPS_GANGSTASH_KEY",

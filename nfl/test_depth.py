@@ -258,6 +258,9 @@ class ChokeIdTest(unittest.TestCase):
         self.assertEqual(depth_id(UnmappedTeam("ZZZ")), "DEPTH_JOIN")
         self.assertEqual(depth_id(DepthError("index")), "DEPTH_OURLADS")
         self.assertEqual(depth_id(EspnDepthError("403")), "DEPTH_ESPN")
+        from nfl.depth import GangstashDepthKeyMissing
+
+        self.assertEqual(depth_id(GangstashDepthKeyMissing("no key")), "DEPTH_GANGSTASH_KEY")
 
 
 if __name__ == "__main__":

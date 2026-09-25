@@ -78,8 +78,9 @@ NFL path is flags-only.
   Wednesday refresh: targets then snaps. Props pages inventoried only
   (`https://www.lineups.com/nfl/player-prop-bets/`).
 - 2026-09-17: **Picker Sources + slate status.** Last picker column is
-  compact join tags (`ourlads`/`espn`, `lineups-tgt`, `lineups-snap`,
-  `odds-props`, `vegas-dst`) from fields already on the player — not a
+  compact join tags (`gs-depth`/`ourlads`/`espn`, `gs-tgt`/`lineups-tgt`,
+  `gs-snap`/`lineups-snap`, `gs-props`/`odds-props`, `vegas-dst`) from
+  fields already on the player — not a
   new scrape and not ILP. `--slate-status` (default only) prints pool +
   per-source coverage and exits 0; `=with-solve` prints then solves.
   `python3 -m nfl.status` is the status-only entry. JSON `slate_status`
@@ -99,7 +100,7 @@ NFL path is flags-only.
   `nfl/data/gangstash-props/`. Game lines default to `ODDS_API_KEY`
   (`--lines-source=gangstash` optional; see `nfl/docs/data/gangstash.md`).
   Unmapped `prop` strings print and are not scored. Picker tag is
-  `gangstash` when `prop_book` is gangstash. See
+  `gs-props` when `prop_book` is gangstash. See
   `nfl/docs/data/player-props.md`.
 
 ## 4. Known limitations / environment caveats
@@ -117,4 +118,4 @@ See `skill-architecture.md` §B; this skill targets every PASS that applies.
 ## 6. Notes
 
 Hard dep: repo `nfl` package (same git tree). Soft: `pulp` (gated, greedy degrade).
-Vegas game lines: `ODDS_API_KEY` by default (hard gate `LINES_KEY`). `--lines-source=gangstash` uses `GANGSTASH_API_KEY` (`LINES_GANGSTASH_KEY`). Player props: `GANGSTASH_API_KEY` (degrade `PROPS_GANGSTASH_KEY` when no cache). Targets default to Lineups. Choke ids: `nfl/docs/data/sources.md`.
+Vegas game lines, targets, snaps, and depth default to gangstash (`GANGSTASH_API_KEY`). `--lines-source=oddsapi` is the Odds key (`LINES_KEY`). Missing gangstash key and no cache stops lines and degrades the other three; stderr names the old flags. `python3 -m nfl.targets --refresh` and `python3 -m nfl.snaps --refresh` are the legacy optional Lineups CSVs. Choke ids: `nfl/docs/data/sources.md`.

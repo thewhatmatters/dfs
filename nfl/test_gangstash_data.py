@@ -12,13 +12,16 @@ from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
-from nfl.depth import GangstashDepthError, ingest_slate_depth
+from nfl.choke import depth_id, lines_id
+from nfl.depth import GangstashDepthError, GangstashDepthKeyMissing, ingest_slate_depth
 from nfl.gangstash import (
+    FALLBACK_FLAGS,
     GangstashDataError,
     GangstashDataKeyMissing,
     GangstashTruncated,
     dataset_cache_file,
     fetch_dataset,
+    missing_key_message,
 )
 from nfl.http import HttpAuthError, HttpError
 from nfl.gangstash_data import (
@@ -32,7 +35,7 @@ from nfl.gangstash_data import (
     parse_game_line,
 )
 from nfl.http import HttpError
-from nfl.lines import ingest_slate_lines
+from nfl.lines import LinesGangstashKeyMissing, ingest_slate_lines
 from nfl.optimize import _gangstash_snaps_weeks, parse_args
 from nfl.snaps import _pct, attach_snaps, load_optimizer_snaps
 from nfl.players import Player
@@ -383,12 +386,14 @@ class TargetWindowTest(unittest.TestCase):
         walker = by_name["Devontez Walker"]
         self.assertAlmostEqual(brown.target_share or 0, 12 / 50)
         self.assertEqual(brown.targets_status, "joined")
+        self.assertEqual(brown.targets_source, "gangstash")
         self.assertAlmostEqual(
             brown.objective,
             week1_score(30.0, 1, "WR", target_share=12 / 50),
         )
         self.assertIsNone(walker.target_share)
         self.assertEqual(walker.targets_status, "unmatched")
+        self.assertIsNone(walker.targets_source)
         self.assertAlmostEqual(
             walker.objective,
             week1_score(30.0, 1, "WR", target_share=None),
@@ -413,6 +418,46 @@ class TargetWindowTest(unittest.TestCase):
         self.assertIn("season=2026", calls[0])
         self.assertIn("week=1,2", calls[0])
         self.assertNotIn("secret-key", calls[0])
+
+    def test_unset_weeks_omit_the_week_param(self) -> None:
+        calls: list[str] = []
+
+        def fake_http(url, headers=None, timeout=30):
+            calls.append(url)
+            return {
+                "data": [
+                    {
+                        "player_name": "A.J. Brown",
+                        "team_fd": "PHI",
+                        "position": "WR",
+                        "week": 1,
+                        "targets": 8,
+                        "team_targets": 30,
+                    },
+                    {
+                        "player_name": "A.J. Brown",
+                        "team_fd": "PHI",
+                        "position": "WR",
+                        "week": 2,
+                        "targets": 4,
+                        "team_targets": 20,
+                    },
+                ],
+                "truncated": False,
+            }, {}
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "nfl.gangstash.DATA_CACHE_DIR", Path(tmp)
+        ), patch("nfl.gangstash.envmod.get", side_effect=_env_get), patch(
+            "nfl.gangstash.http_json", side_effect=fake_http
+        ):
+            raw, _meta = fetch_targets(
+                season=2026, refresh=True, cache_day=date(2026, 9, 24)
+            )
+        self.assertIn("season=2026", calls[0])
+        self.assertNotIn("week=", calls[0])
+        rows = aggregate_target_window(raw)
+        self.assertEqual(rows[0]["weeks"], [1, 2])
 
 
 class SnapWindowTest(unittest.TestCase):
@@ -632,6 +677,7 @@ class SnapWindowTest(unittest.TestCase):
         self.assertAlmostEqual(by_name["Jonathan Taylor"].snap_share or 0, 0.94)
         self.assertEqual(by_name["Jonathan Taylor"].snaps, 61)
         self.assertEqual(by_name["Jonathan Taylor"].snaps_status, "joined")
+        self.assertEqual(by_name["Jonathan Taylor"].snaps_source, "gangstash")
         self.assertAlmostEqual(
             by_name["Jonathan Taylor"].objective or 0,
             week1_score(30.0, 1, "RB", snap_share=0.94),
@@ -957,21 +1003,32 @@ class TeamStatsTest(unittest.TestCase):
 class FlagDefaultTest(unittest.TestCase):
     def test_existing_sources_stay_the_default(self) -> None:
         args = parse_args(["--csv", "players.csv"])
-        self.assertEqual(args.lines_source, "oddsapi")
-        self.assertEqual(args.targets_source, "lineups")
-        self.assertEqual(args.depth_source, "ourlads")
-        self.assertEqual(args.snaps_source, "lineups")
+        self.assertEqual(args.lines_source, "gangstash")
+        self.assertEqual(args.targets_source, "gangstash")
+        self.assertEqual(args.depth_source, "gangstash")
+        self.assertEqual(args.snaps_source, "gangstash")
         self.assertIsNone(args.targets_weeks)
         self.assertIsNone(args.targets_week)
         self.assertIsNone(args.snaps_weeks)
         self.assertFalse(args.refresh_targets)
         self.assertFalse(args.refresh_snaps)
 
-    def test_snaps_window_follows_targets_when_unset(self) -> None:
-        self.assertEqual(_gangstash_snaps_weeks("gangstash", None, [1, 2]), [1, 2])
+    def test_unset_snaps_weeks_do_not_copy_targets(self) -> None:
+        self.assertIsNone(_gangstash_snaps_weeks("gangstash", None, [1, 2]))
         self.assertIsNone(_gangstash_snaps_weeks("gangstash", None, None))
         self.assertEqual(_gangstash_snaps_weeks("gangstash", [2], [1, 2]), [2])
-        self.assertIsNone(_gangstash_snaps_weeks("lineups", None, [1, 2]))
+        self.assertIsNone(_gangstash_snaps_weeks("lineups", [1, 2], [1, 2]))
+
+    def test_missing_key_message_names_old_flags(self) -> None:
+        text = missing_key_message("GANGSTASH_API_KEY is not set")
+        self.assertIn(FALLBACK_FLAGS, text)
+        self.assertIn("--lines-source=oddsapi", text)
+        self.assertIn("--targets-source=lineups", text)
+        self.assertIn("--snaps-source=lineups", text)
+        self.assertIn("--depth-source=ourlads", text)
+        self.assertNotIn("\n", text)
+        self.assertEqual(lines_id(LinesGangstashKeyMissing("no key")), "LINES_GANGSTASH_KEY")
+        self.assertEqual(depth_id(GangstashDepthKeyMissing("no key")), "DEPTH_GANGSTASH_KEY")
 
     def test_week_list_parses(self) -> None:
         args = parse_args(

@@ -208,11 +208,18 @@ def format_picker_sources(
     is_dst = pos in _DST_POS or slot in _DST_POS
     src = str(p.get("depth_source") or depth_source or "").strip().lower()
     if p.get("depth_rank") is not None:
-        tags.append("espn" if src == "espn" else "ourlads")
+        if src == "espn":
+            tags.append("espn")
+        elif src == "gangstash":
+            tags.append("gs-depth")
+        else:
+            tags.append("ourlads")
     if p.get("target_share") is not None:
-        tags.append("lineups-tgt")
+        tgt = str(p.get("targets_source") or "").strip().lower()
+        tags.append("gs-tgt" if tgt == "gangstash" else "lineups-tgt")
     if p.get("snap_share") is not None:
-        tags.append("lineups-snap")
+        snap = str(p.get("snaps_source") or "").strip().lower()
+        tags.append("gs-snap" if snap == "gangstash" else "lineups-snap")
     prop_status = str(p.get("prop_status") or "").strip().lower()
     if (
         prop_status == "props"
@@ -229,7 +236,7 @@ def format_picker_sources(
         )
     ):
         book = str(p.get("prop_book") or "").strip().lower()
-        tags.append("gangstash" if book == "gangstash" else "odds-props")
+        tags.append("gs-props" if book == "gangstash" else "odds-props")
     inj = str(p.get("injury") or "").strip().upper()
     if inj == "Q":
         tags.append("espn-inj")

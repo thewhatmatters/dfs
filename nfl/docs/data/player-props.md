@@ -2,8 +2,8 @@
 
 NFL player props come from Randy’s gangstash HTTP API. The board is
 BettingPros consensus via Data Aggregator (one line per player and prop).
-Game lines (spreads, totals, moneylines) still default to `ODDS_API_KEY` in
-`nfl/lines.py`. `--lines-source=gangstash` is the optional switch
+Game lines default to gangstash (`--lines-source=gangstash`).
+`--lines-source=oddsapi` is the Odds API fallback
 ([`gangstash.md`](gangstash.md)).
 
 ## Endpoint
