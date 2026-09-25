@@ -5,10 +5,16 @@ from __future__ import annotations
 import sys
 from typing import Any
 
-from nfl.depth import DepthError, EspnDepthError
+from nfl.depth import DepthError, EspnDepthError, GangstashDepthError
 from nfl.http import HttpAuthError
 from nfl.injuries import InjuryError
-from nfl.lines import LinesAuthError, LinesError, LinesKeyMissing
+from nfl.lines import (
+    LinesAuthError,
+    LinesError,
+    LinesGangstashError,
+    LinesGangstashKeyMissing,
+    LinesKeyMissing,
+)
 from nfl.props import PropsError, PropsKeyMissing
 from nfl.teams import UnmappedTeam
 
@@ -28,10 +34,14 @@ def stamp(payload: dict[str, Any], choke_id: str, message: str) -> dict[str, Any
 
 
 def lines_id(exc: BaseException) -> str:
+    if isinstance(exc, LinesGangstashKeyMissing):
+        return "LINES_GANGSTASH_KEY"
     if isinstance(exc, LinesKeyMissing):
         return "LINES_KEY"
     if isinstance(exc, UnmappedTeam):
         return "LINES_JOIN"
+    if isinstance(exc, LinesGangstashError):
+        return "LINES_GANGSTASH"
     if isinstance(exc, (LinesAuthError, HttpAuthError)):
         return "LINES_AUTH"
     text = str(exc).casefold()
@@ -43,6 +53,8 @@ def lines_id(exc: BaseException) -> str:
 def depth_id(exc: BaseException) -> str:
     if isinstance(exc, UnmappedTeam):
         return "DEPTH_JOIN"
+    if isinstance(exc, GangstashDepthError):
+        return "DEPTH_GANGSTASH"
     if isinstance(exc, EspnDepthError):
         return "DEPTH_ESPN"
     if isinstance(exc, DepthError):

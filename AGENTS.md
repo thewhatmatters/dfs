@@ -2,9 +2,9 @@
 
 Salary-cap daily fantasy. First sport/site: **NCAA football, FanDuel classic**. NFL FanDuel classic is a second adapter (`nfl/`, `python3 -m nfl.optimize`). Keep sport code in its package — do **not** import `ncaaf` from `nfl`.
 
-## Runtime — Grok CLI
+## Runtime
 
-**Grok CLI** (`~/.grok/bin/grok`, or `$GROK_BIN`) is the implementation agent. It already loads this `AGENTS.md` as project rules. From **Cursor**, do not implement in-session: pack the task and run `bash scripts/dispatch-grok.sh <prompt-file>` (see `.cursor/rules/grok-cli-dispatch.mdc`). Interactive Grok in this directory is also fine — skip Cursor entirely when you want zero Cursor tokens.
+Cursor cloud agents implement in this repo directly. **Grok CLI** (`~/.grok/bin/grok`, or `$GROK_BIN`) is an allowed optional worker, not a requirement: `bash scripts/dispatch-grok.sh <prompt-file>` (see `.cursor/rules/grok-cli-dispatch.mdc`). If the CLI is missing or unauthenticated, implement in-session. Do not pass `-m` / `GROK_MODEL` to the dispatcher.
 
 ## Product lock
 
@@ -30,7 +30,8 @@ python3 -m nfl.optimize --csv "nfl/data/<players-list>.csv"          # FanDuel N
 python3 -m nfl.depth --csv "nfl/data/<players-list>.csv"             # OurLads NFL depth → nfl/data/depth.csv
 # NFL uploads: nfl/export/ when --n-lineups>1. Cached props; do not --refresh-props unless asked.
 # NCAAF player props: ODDS_API_KEY, cached, ~70 credits/slate (see ncaaf/docs/data/player-props.md)
-# NFL player props: GANGSTASH_API_KEY (see nfl/docs/data/player-props.md). Game lines still use ODDS_API_KEY.
+# NFL player props: GANGSTASH_API_KEY (see nfl/docs/data/player-props.md).
+# NFL game lines default to ODDS_API_KEY. --lines-source=gangstash is optional (nfl/docs/data/gangstash.md).
 # After week 1: CFBD pass/rush mix — ncaaf/docs/data/play-distribution.md (not live until 2026 boxes)
 ```
 

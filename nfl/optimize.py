@@ -37,6 +37,11 @@ from nfl.choke import (  # noqa: E402
     stamp,
 )
 from nfl.depth import DepthError, attach_depth_ranks, ingest_slate_depth  # noqa: E402
+from nfl.gangstash import (  # noqa: E402
+    GangstashDataError,
+    GangstashDataKeyMissing,
+    GangstashTruncated,
+)
 from nfl.injuries import InjuryError, ingest_slate_injuries  # noqa: E402
 from nfl.lines import (  # noqa: E402
     LinesAuthError,
@@ -85,14 +90,14 @@ from nfl.snaps import (  # noqa: E402
     DEFAULT_OUT as DEFAULT_SNAPS_CSV,
     SnapsError,
     attach_snaps,
-    load_snaps_csv,
+    load_optimizer_snaps,
     print_snaps_gaps,
 )
 from nfl.targets import (  # noqa: E402
     DEFAULT_OUT as DEFAULT_TARGETS_CSV,
     TargetsError,
     attach_targets,
-    load_targets_csv,
+    load_optimizer_targets,
     print_targets_gaps,
 )
 from nfl.teams import UnmappedTeam  # noqa: E402
@@ -100,7 +105,7 @@ from nfl.upload import export_lineups  # noqa: E402
 
 VEGAS_LABEL = (
     "Gangstash player-prop FD points when volume lines join; else implied "
-    "team total × depth × position share × Lineups usage tilt "
+    "team total × depth × position share × target/snap usage tilt "
     "(DEF: opp implied PA bucket + 3.0)"
 )
 
@@ -164,6 +169,32 @@ def _positive_week(value: str) -> int:
     return n
 
 
+def _gangstash_snaps_weeks(
+    source: str,
+    snaps_weeks: list[int] | None,
+    targets_weeks: list[int] | None,
+) -> list[int] | None:
+    """Explicit snaps window, else the targets window, else every returned week."""
+    if snaps_weeks is not None:
+        return snaps_weeks
+    if (source or "lineups").strip().lower() == "gangstash":
+        return targets_weeks
+    return None
+
+
+def _week_list(value: str) -> list[int]:
+    parts = [p.strip() for p in (value or "").split(",") if p.strip()]
+    if not parts:
+        raise argparse.ArgumentTypeError("comma-separated weeks, e.g. 1,2")
+    out: list[int] = []
+    for part in parts:
+        n = int(part)
+        if n < 1:
+            raise argparse.ArgumentTypeError("weeks must be >= 1")
+        out.append(n)
+    return out
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--csv", required=True, help="FanDuel players-list CSV")
@@ -201,6 +232,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="replay Odds / simple-games JSON instead of a live API",
     )
     ap.add_argument(
+        "--lines-source",
+        choices=("oddsapi", "gangstash"),
+        default="oddsapi",
+        help="game lines provider (default oddsapi). gangstash uses "
+        "GANGSTASH_API_KEY. --lines-json still wins.",
+    )
+    ap.add_argument(
         "--skip-depth",
         action="store_true",
         help="do not fetch/join OurLads depth (role prior stays unlisted)",
@@ -212,9 +250,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     ap.add_argument(
         "--depth-source",
-        choices=("ourlads", "espn"),
+        choices=("ourlads", "espn", "gangstash"),
         default="ourlads",
-        help="depth provider (default ourlads; espn is optional fallback)",
+        help="depth provider (default ourlads; espn or gangstash are optional)",
     )
     ap.add_argument(
         "--skip-injuries",
@@ -238,16 +276,45 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"Lineups targets CSV (default: {DEFAULT_TARGETS_CSV})",
     )
     ap.add_argument(
+        "--targets-source",
+        choices=("lineups", "gangstash"),
+        default="lineups",
+        help="RB/WR/TE target share source (default lineups CSV). "
+        "gangstash uses sum(targets)/sum(team_targets) over the week window.",
+    )
+    ap.add_argument(
         "--targets-week",
         type=_positive_week,
         default=None,
         metavar="N",
-        help="targets.csv week to join (default: latest week in the CSV)",
+        help="targets week to join (lineups CSV default: latest week; "
+        "gangstash: that single week)",
+    )
+    ap.add_argument(
+        "--targets-weeks",
+        type=_week_list,
+        default=None,
+        metavar="LIST",
+        help="gangstash target window, comma-separated (e.g. 1,2). "
+        "Share is sum(targets)/sum(team_targets). Ignored for lineups.",
+    )
+    ap.add_argument(
+        "--refresh-targets",
+        action="store_true",
+        help="bypass the gangstash targets day cache "
+        "(lineups refresh stays: python3 -m nfl.targets --refresh)",
     )
     ap.add_argument(
         "--skip-snaps",
         action="store_true",
-        help="do not join Lineups snap counts (RB usage uses targets or 1.0)",
+        help="do not join snap counts (RB usage uses targets or 1.0)",
+    )
+    ap.add_argument(
+        "--snaps-source",
+        choices=("lineups", "gangstash"),
+        default="lineups",
+        help="snap counts provider (default lineups CSV). gangstash uses "
+        "dataset=snaps and offense_pct as the 0-1 snap_share.",
     )
     ap.add_argument(
         "--snaps-csv",
@@ -261,6 +328,21 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         metavar="N",
         help="snaps.csv week to join (default: latest week in the CSV)",
+    )
+    ap.add_argument(
+        "--snaps-weeks",
+        type=_week_list,
+        default=None,
+        metavar="LIST",
+        help="gangstash snap window, comma-separated (e.g. 1,2). "
+        "If omitted, uses --targets-weeks, else every week returned. "
+        "Ignored for lineups.",
+    )
+    ap.add_argument(
+        "--refresh-snaps",
+        action="store_true",
+        help="bypass the gangstash snaps day cache "
+        "(lineups refresh stays: python3 -m nfl.snaps --refresh)",
     )
     ap.add_argument(
         "--skip-props",
@@ -452,7 +534,10 @@ def main(argv: list[str] | None = None) -> int:
     json_path = Path(args.lines_json).expanduser() if args.lines_json else None
     try:
         by_team = ingest_slate_lines(
-            pool, lines_json=json_path, slate_day=slate_day
+            pool,
+            lines_json=json_path,
+            slate_day=slate_day,
+            source=args.lines_source,
         )
     except LinesKeyMissing as e:
         emit("LINES_KEY", str(e))
@@ -514,40 +599,143 @@ def main(argv: list[str] | None = None) -> int:
     if args.skip_targets:
         print("targets skipped", file=sys.stderr)
     else:
+        if args.targets_source == "lineups" and args.targets_weeks:
+            print(
+                "targets-weeks applies to --targets-source=gangstash; "
+                "lineups join uses --targets-week",
+                file=sys.stderr,
+            )
         tpath = Path(args.targets_csv).expanduser()
         try:
-            trows = load_targets_csv(tpath)
+            trows, tmeta = load_optimizer_targets(
+                source=args.targets_source,
+                csv_path=tpath,
+                week=args.targets_week,
+                weeks=args.targets_weeks,
+                season=slate_day.year,
+                refresh=args.refresh_targets,
+            )
         except TargetsError as e:
             emit(e.choke, str(e))
+            if e.choke != "TARGETS_CSV":
+                return 1
             tstats = {
                 "skipped": True,
                 "csv": str(tpath),
                 "choke": e.choke,
                 "error": str(e),
+                "source": args.targets_source,
             }
+        except GangstashDataKeyMissing as e:
+            emit("TARGETS_GANGSTASH_KEY", str(e))
+            tstats = {
+                "skipped": True,
+                "choke": "TARGETS_GANGSTASH_KEY",
+                "error": str(e),
+                "source": "gangstash",
+            }
+        except GangstashTruncated as e:
+            emit("TARGETS_GANGSTASH", str(e))
+            return 1
+        except UnmappedTeam as e:
+            emit("TARGETS_JOIN", str(e))
+            return 1
+        except GangstashDataError as e:
+            emit("TARGETS_GANGSTASH", str(e))
+            return 1
         else:
-            pool, tstats = attach_targets(pool, trows, week=args.targets_week)
-            tstats["csv"] = str(tpath)
+            if args.targets_source == "gangstash":
+                pool, tstats = attach_targets(
+                    pool, trows, week=tmeta.get("join_week")
+                )
+            else:
+                pool, tstats = attach_targets(pool, trows, week=args.targets_week)
+                tstats["csv"] = str(tpath)
+            tstats["source"] = tmeta.get("source", args.targets_source)
+            if tmeta.get("cache"):
+                tstats["cache"] = tmeta.get("cache")
+            if tmeta.get("cache_stale"):
+                tstats["cache_stale"] = True
+                print(
+                    f"targets using cache {tmeta.get('cache')} "
+                    "(live gangstash unreachable or key unset)",
+                    file=sys.stderr,
+                )
+            if tmeta.get("weeks") is not None:
+                tstats["weeks"] = tmeta.get("weeks")
             print_targets_gaps(tstats)
 
     sstats: dict = {"skipped": True}
     if args.skip_snaps:
         print("snaps skipped", file=sys.stderr)
     else:
+        if args.snaps_source == "lineups" and args.snaps_weeks:
+            print(
+                "snaps-weeks applies to --snaps-source=gangstash; "
+                "lineups join uses --snaps-week",
+                file=sys.stderr,
+            )
+        snaps_weeks = _gangstash_snaps_weeks(
+            args.snaps_source, args.snaps_weeks, args.targets_weeks
+        )
         spath = Path(args.snaps_csv).expanduser()
         try:
-            srows = load_snaps_csv(spath)
+            srows, smeta = load_optimizer_snaps(
+                source=args.snaps_source,
+                csv_path=spath,
+                week=args.snaps_week,
+                weeks=snaps_weeks,
+                season=slate_day.year,
+                refresh=args.refresh_snaps,
+            )
         except SnapsError as e:
             emit(e.choke, str(e))
+            if e.choke != "SNAPS_CSV":
+                return 1
             sstats = {
                 "skipped": True,
                 "csv": str(spath),
                 "choke": e.choke,
                 "error": str(e),
+                "source": args.snaps_source,
             }
+        except GangstashDataKeyMissing as e:
+            emit("SNAPS_GANGSTASH_KEY", str(e))
+            sstats = {
+                "skipped": True,
+                "choke": "SNAPS_GANGSTASH_KEY",
+                "error": str(e),
+                "source": "gangstash",
+            }
+        except GangstashTruncated as e:
+            emit("SNAPS_GANGSTASH", str(e))
+            return 1
+        except UnmappedTeam as e:
+            emit("SNAPS_JOIN", str(e))
+            return 1
+        except GangstashDataError as e:
+            emit("SNAPS_GANGSTASH", str(e))
+            return 1
         else:
-            pool, sstats = attach_snaps(pool, srows, week=args.snaps_week)
-            sstats["csv"] = str(spath)
+            if args.snaps_source == "gangstash":
+                pool, sstats = attach_snaps(
+                    pool, srows, week=smeta.get("join_week")
+                )
+            else:
+                pool, sstats = attach_snaps(pool, srows, week=args.snaps_week)
+                sstats["csv"] = str(spath)
+            sstats["source"] = smeta.get("source", args.snaps_source)
+            if smeta.get("cache"):
+                sstats["cache"] = smeta.get("cache")
+            if smeta.get("cache_stale"):
+                sstats["cache_stale"] = True
+                print(
+                    f"snaps using cache {smeta.get('cache')} "
+                    "(live gangstash unreachable or key unset)",
+                    file=sys.stderr,
+                )
+            if smeta.get("weeks") is not None:
+                sstats["weeks"] = smeta.get("weeks")
             print_snaps_gaps(sstats)
 
     pstats: dict = {"skipped": True, "reason": "skip-props"}
@@ -610,6 +798,8 @@ def main(argv: list[str] | None = None) -> int:
             "skip_props": args.skip_props,
             "skip_injuries": args.skip_injuries,
             "depth_source": args.depth_source,
+            "lines_source": args.lines_source,
+            "targets_source": args.targets_source,
         },
     )
     if args.slate_status:
@@ -647,12 +837,19 @@ def main(argv: list[str] | None = None) -> int:
             "greedy": args.greedy,
             "skip_depth": args.skip_depth,
             "depth_source": args.depth_source,
+            "lines_source": args.lines_source,
             "skip_targets": args.skip_targets,
+            "targets_source": args.targets_source,
             "targets_csv": str(args.targets_csv),
             "targets_week": args.targets_week,
+            "targets_weeks": args.targets_weeks,
+            "refresh_targets": args.refresh_targets,
             "skip_snaps": args.skip_snaps,
+            "snaps_source": args.snaps_source,
             "snaps_csv": str(args.snaps_csv),
             "snaps_week": args.snaps_week,
+            "snaps_weeks": args.snaps_weeks,
+            "refresh_snaps": args.refresh_snaps,
             "skip_props": args.skip_props,
             "skip_injuries": args.skip_injuries,
             "min_salary": args.min_salary,

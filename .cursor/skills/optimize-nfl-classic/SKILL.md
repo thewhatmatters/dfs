@@ -50,18 +50,25 @@ Repo-root `scripts/optimize.py` is the **NCAAF** shim — do not use it here.
 | `--agent` | JSON on stdout; no prompts |
 | `--csv=PATH` | FanDuel players-list CSV (required) |
 | `--out=PATH` | write JSON artifact |
-| `--lines-json=PATH` | replay Odds / simple-games JSON |
+| `--lines-json=PATH` | replay Odds / simple-games JSON (wins over `--lines-source`) |
+| `--lines-source=oddsapi\|gangstash` | default **oddsapi** (`ODDS_API_KEY`). `gangstash` is `dataset=game_lines` |
 | `--skip-depth` | skip OurLads depth join (unlisted prior) |
 | `--refresh-depth` | refetch OurLads HTML (slate teams only) |
-| `--depth-source=ourlads\|espn` | default **ourlads**; `espn` is optional fallback (often 403) |
+| `--depth-source=ourlads\|espn\|gangstash` | default **ourlads**; `espn` often 403; `gangstash` is `dataset=depth_charts` |
 | `--skip-injuries` | skip ESPN injury join |
 | `--refresh-injuries` | refetch ESPN injuries |
-| `--skip-targets` | skip Lineups RB/WR/TE target join (usage uses snaps or 1.0) |
+| `--skip-targets` | skip RB/WR/TE target join (usage uses snaps or 1.0) |
+| `--targets-source=lineups\|gangstash` | default **lineups** CSV. `gangstash` share is sum(targets)/sum(team_targets) |
 | `--targets-csv=PATH` | Lineups `targets.csv` (default `nfl/data/targets.csv`) |
-| `--targets-week=N` | join that week (default: latest week in the CSV) |
-| `--skip-snaps` | skip Lineups snap join (RB usage uses targets or 1.0) |
+| `--targets-week=N` | join that week (lineups default: latest week in the CSV) |
+| `--targets-weeks=1,2` | gangstash window only |
+| `--refresh-targets` | refetch gangstash targets (not the Lineups scrape) |
+| `--skip-snaps` | skip snap join (RB usage uses targets or 1.0) |
+| `--snaps-source=lineups\|gangstash` | default **lineups** CSV. `gangstash` `offense_pct` is the 0–1 `snap_share` |
 | `--snaps-csv=PATH` | Lineups `snaps.csv` (default `nfl/data/snaps.csv`) |
-| `--snaps-week=N` | join that week (default: latest week in the CSV) |
+| `--snaps-week=N` | Lineups join week (default: latest week in the CSV) |
+| `--snaps-weeks=1,2` | gangstash window; if omitted, uses `--targets-weeks` or every week returned |
+| `--refresh-snaps` | refetch gangstash snaps (not the Lineups scrape) |
 | `--skip-props` | skip Gangstash player props |
 | `--refresh-props` | refetch Gangstash props — do not unless asked |
 | `--exclude-questionable` | drop CSV Q; IR/NA already dropped |

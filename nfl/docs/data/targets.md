@@ -1,7 +1,12 @@
-# Lineups RB/WR/TE targets (usage tilt)
+# RB/WR/TE targets (usage tilt)
 
-Grant: [`lineups-authorization.md`](lineups-authorization.md). Public Lineups
+Default source is Lineups (`--targets-source=lineups`). Grant:
+[`lineups-authorization.md`](lineups-authorization.md). Public Lineups
 SSR pages, cached. Do not scrape FanDuel.
+
+`--targets-source=gangstash` reads `dataset=targets` instead of this CSV.
+Window share is `sum(targets)/sum(team_targets)`. The tilt math does not
+change. See [`gangstash.md`](gangstash.md). RB snap share is still Lineups.
 
 Wednesday-style weekly refresh (after the prior week’s games land):
 
@@ -22,6 +27,11 @@ https://www.lineups.com/nfl/targets/running-back/ (same SSR metrics family).
 (Jr/Sr/II stripped). No invented aliases. `--targets-csv PATH` overrides
 the default file. `--skip-targets` leaves `target_share` empty (RB usage
 then uses snaps or 1.0).
+
+Gangstash (`--targets-source=gangstash`) uses the same join. Pass
+`--targets-weeks=1,2` for a multi-week share, or `--targets-week=N` for one
+week. With neither, every week the endpoint returns is collapsed. Unmatched
+names stay usage 1.0. `--refresh-targets` refetches that cache only.
 
 Name mismatches are **not fatal**. Stderr + JSON `targets` report:
 

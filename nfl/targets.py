@@ -1,5 +1,6 @@
-"""Lineups.com RB/WR/TE target refresh → nfl/data/targets.csv.
+"""RB/WR/TE target share for the usage tilt.
 
+Default source is Lineups.com → nfl/data/targets.csv (`--targets-source=lineups`).
 Public pages only (no login). Identified User-Agent; cache under
 nfl/data/lineups-targets/. Grant: nfl/docs/data/lineups-authorization.md.
 
@@ -10,6 +11,10 @@ Wednesday-style weekly refresh (after the prior week’s games land):
 
   python3 -m nfl.targets --refresh
   python3 -m nfl.snaps --refresh
+
+`--targets-source=gangstash` reads `dataset=targets` and collapses a week
+window with sum(targets)/sum(team_targets). The join still uses
+`attach_targets` (unmatched target_share stays empty → usage 1.0).
 
 Usage:
   python3 -m nfl.targets --refresh
@@ -26,6 +31,7 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
+from nfl.gangstash_data import aggregate_target_window, fetch_targets
 from nfl.lineups import (
     LineupsError,
     extract_ssr_payload as extract_lineups_ssr,
@@ -398,8 +404,9 @@ def print_targets_gaps(stats: dict[str, Any]) -> None:
         f"unmatched_slate_rb_wr_te {len(unmatched_sl)}",
         file=sys.stderr,
     )
+    feed = "gangstash" if stats.get("source") == "gangstash" else "Lineups"
     if unmatched_lu:
-        print(f"unmatched Lineups ({len(unmatched_lu)}):", file=sys.stderr)
+        print(f"unmatched {feed} ({len(unmatched_lu)}):", file=sys.stderr)
         for row in unmatched_lu:
             print(
                 f"  {row.get('player')} ({row.get('team')} {row.get('position')})",
@@ -440,6 +447,60 @@ def write_targets_csv(rows: list[TargetWeekRow], path: Path) -> None:
                     "asof": r.asof,
                 }
             )
+
+
+def load_optimizer_targets(
+    *,
+    source: str,
+    csv_path: Path,
+    week: int | None,
+    weeks: list[int] | None,
+    season: int,
+    refresh: bool = False,
+    cache_day: date | None = None,
+) -> tuple[list[TargetWeekRow], dict[str, Any]]:
+    """Lineups CSV, or a gangstash window collapsed to one target_share per player."""
+    src = (source or "lineups").strip().lower()
+    if src == "lineups":
+        return load_targets_csv(csv_path), {"source": "lineups", "join_week": week}
+    if src != "gangstash":
+        raise TargetsError(
+            "TARGETS_SOURCE",
+            f"unknown --targets-source {source!r} (lineups|gangstash)",
+        )
+    window = list(weeks) if weeks else ([week] if week else None)
+    raw, meta = fetch_targets(
+        season=season,
+        weeks=window,
+        refresh=refresh,
+        cache_day=cache_day,
+    )
+    normalized = aggregate_target_window(raw, weeks=window)
+    asof = (cache_day or date.today()).isoformat()
+    rows: list[TargetWeekRow] = []
+    for item in normalized:
+        rows.append(
+            TargetWeekRow(
+                player=item["player_name"],
+                team=item["team_fd"],
+                position=item["position"],
+                week=int(item["week"]),
+                targets=int(item["targets"]),
+                target_share=float(item["target_share"]),
+                targets_avg=float(item["targets_avg"]),
+                targets_total=int(item["targets_total"]),
+                source="gangstash",
+                asof=asof,
+            )
+        )
+    join_week = rows[0].week if rows else None
+    return rows, {
+        **meta,
+        "source": "gangstash",
+        "join_week": join_week,
+        "weeks": window,
+        "season": season,
+    }
 
 
 def refresh_targets(
