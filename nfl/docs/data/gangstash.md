@@ -174,3 +174,11 @@ read by `week1_score`. Season rows include `team`, `team_fd`, `side`,
 | `TEAM_STATS_GANGSTASH` | team-stats CLI HTTP or truncated board | **stop** (CLI only) |
 
 Catalog: [`sources.md`](sources.md).
+
+Nightly board (and optional sim) rows are written with a separate key.
+See [`projections.md`](projections.md).
+
+```
+POST .../functions/v1/projections
+x-api-key: $GANGSTASH_PROJECTIONS_WRITER_KEY
+```

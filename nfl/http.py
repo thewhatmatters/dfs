@@ -60,6 +60,45 @@ def http_json(
         raise HttpError(f"non-JSON: {e}") from e
 
 
+def http_json_post(
+    url: str,
+    body: object,
+    headers: dict[str, str] | None = None,
+    *,
+    timeout: int = 60,
+) -> tuple[Any, dict[str, str]]:
+    """POST a JSON body. Do not put secrets in `url` or `body`."""
+    data = json.dumps(body).encode("utf-8")
+    hdrs = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+    }
+    if headers:
+        hdrs.update(headers)
+    req = urllib.request.Request(url, data=data, headers=hdrs, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
+            raw = resp.read().decode("utf-8")
+            resp_hdrs = {k.lower(): v for k, v in resp.headers.items()}
+    except ssl.SSLError as e:
+        raise HttpError(
+            f"TLS verify failed ({e}). Install certifi (`python3 -m pip install certifi`) "
+            "or run Python's Install Certificates.command"
+        ) from e
+    except urllib.error.HTTPError as e:
+        payload = e.read().decode("utf-8", errors="replace")[:300]
+        if e.code in {401, 403}:
+            raise HttpAuthError(f"HTTP {e.code} (key rejected). {payload}") from e
+        raise HttpError(f"HTTP {e.code}: {payload}") from e
+    except urllib.error.URLError as e:
+        raise HttpError(f"unreachable: {e.reason}") from e
+    try:
+        return json.loads(raw), resp_hdrs
+    except json.JSONDecodeError as e:
+        raise HttpError(f"non-JSON: {e}") from e
+
+
 def http_text(
     url: str,
     headers: dict[str, str] | None = None,
