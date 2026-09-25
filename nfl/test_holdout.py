@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import random
@@ -10,11 +11,17 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
 from nfl.backtest import _depth_table
-from nfl.gangstash import GangstashDataError
+from nfl.gangstash import (
+    GangstashDataError,
+    capture_pulls,
+    dataset_cache_file,
+    fetch_dataset,
+)
 from nfl.gangstash_data import (
     GangstashDepthSlot,
     fetch_props_closing,
@@ -33,11 +40,15 @@ from nfl.holdout import (
     fetch_prop_rows,
     format_report,
     index_prop_lines,
+    is_pregame_starter,
+    _pack_draws,
     load_week,
     main,
     parse_seasons,
+    parse_seeds,
     parse_weeks,
     pearson,
+    write_draw_archive,
     perturb,
     pick_sensitivity_week,
     run_holdout,
@@ -599,6 +610,247 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(len(sim.draws["a"]), 5)
         self.assertEqual(sim.game_draws[0][1], "NO")
         self.assertEqual(sim.game_draws[0][2], "DET")
+
+
+class MeasurementHarnessTest(unittest.TestCase):
+    def _load(self, season, week, *, seed_prior=False):
+        players = [
+            _pl(pid="qb", name="Home QB", position="QB", team="DET", opponent="NO", salary=8000),
+            _pl(pid="wr", name="Home WR", position="WR", team="DET", opponent="NO", salary=7000),
+            _pl(
+                pid="oqb",
+                name="Away QB",
+                position="QB",
+                team="NO",
+                opponent="DET",
+                spread=3.0,
+            ),
+            _pl(
+                pid="owr",
+                name="Away WR",
+                position="WR",
+                team="NO",
+                opponent="DET",
+                spread=3.0,
+            ),
+            _pl(pid="def", name="Lions", position="D", team="DET", opponent="NO"),
+        ]
+        actuals = [
+            _actual("Home QB", "DET", 18.0),
+            {**_actual("Home WR", "DET", 0.0), "targets": 0, "snaps": 0},
+            _actual("Away QB", "NO", 14.0),
+            _actual("Away WR", "NO", 9.0),
+            _dst("DET", 8.0, 17.0),
+            _dst("NO", 6.0, 24.0),
+        ]
+        return WeekLoad(players, actuals, SimInputs(), [], ["pool: depth charts"])
+
+    def test_long_ensembles_store_quantiles(self) -> None:
+        import numpy as np
+
+        kind, values = _pack_draws(np.linspace(0.0, 10.0, 300))
+        self.assertEqual(kind, "quantiles")
+        self.assertEqual(values.shape, (99,))
+        self.assertAlmostEqual(float(values[0]), 0.1, places=6)
+        self.assertAlmostEqual(float(values[-1]), 9.9, places=6)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "draws.npz"
+            info = write_draw_archive(
+                path,
+                [
+                    {
+                        "kind": kind,
+                        "values": values,
+                        "actual": 4.0,
+                        "mean": 5.0,
+                        "salary": 6000,
+                        "season": 2024,
+                        "week": 2,
+                        "seed": 1,
+                        "starter": True,
+                        "mode": "sim_data",
+                        "pid": "qb",
+                        "position": "QB",
+                        "block": "2024-2",
+                    }
+                ],
+            )
+            self.assertEqual(info["kind"], "quantiles")
+            self.assertEqual(info["quantiles"], "q01..q99")
+            loaded = np.load(path, allow_pickle=False)
+            self.assertEqual(loaded["values"].shape, (1, 99))
+            self.assertAlmostEqual(float(loaded["quantile"][0]), 0.01)
+
+    def test_parse_seeds(self) -> None:
+        self.assertEqual(parse_seeds(None, 4), [4])
+        self.assertEqual(parse_seeds("1,2,3", 9), [1, 2, 3])
+        with self.assertRaises(ValueError):
+            parse_seeds("1,2,3,4,5,6", 1)
+
+    def test_pregame_keeps_a_zero_point_starter(self) -> None:
+        self.assertTrue(
+            is_pregame_starter(_pl(name="Home WR", position="WR", depth_rank=1))
+        )
+        pre = run_holdout(
+            [2025],
+            [2],
+            n=4,
+            seed=1,
+            population="pregame",
+            run_sensitivity=False,
+            load=self._load,
+            prop_fetch=lambda season: ([], "props_closing: no rows"),
+        )
+        played = run_holdout(
+            [2025],
+            [2],
+            n=4,
+            seed=1,
+            population="played",
+            run_sensitivity=False,
+            load=self._load,
+            prop_fetch=lambda season: ([], "props_closing: no rows"),
+        )
+        self.assertGreater(
+            pre["errors"]["starters"]["board"]["WR"]["n"],
+            played["errors"]["starters"]["board"]["WR"]["n"],
+        )
+        self.assertEqual(
+            pre["errors"]["full"]["board"]["WR"]["n"],
+            played["errors"]["full"]["board"]["WR"]["n"],
+        )
+        self.assertEqual(pre["correlations"], played["correlations"])
+        self.assertEqual(
+            pre["correlations"]["QB-WR1"]["sim_data"],
+            pre["residual_correlations"]["QB-WR1"]["sim_data"]["sim"],
+        )
+        self.assertIn("scores", pre)
+        self.assertIn("paired", pre)
+        self.assertEqual(pre["paired"]["starters"]["board_minus_sim_data"]["abs_error"]["n_boot"], 2000)
+        self.assertIn("few blocks", pre["scores"]["pools"]["starters"]["sim_data"]["crps"]["note"])
+        self.assertGreater(pre["scores"]["salary_thresholds"]["n"], 0)
+        self.assertEqual(pre["scores"]["lineup"]["thresholds"], [125.0, 165.0])
+        self.assertEqual(pre["mc_se"]["n_seeds"], 1)
+        self.assertIsNone(pre["mc_se"]["metrics"]["starter_mae.sim_data.ALL"]["se"])
+        self.assertEqual(
+            pre["errors"]["starters"]["board"]["QB"]["mae"],
+            pre["mc_se"]["metrics"]["starter_mae.board.QB"]["mean"],
+        )
+        text = format_report(pre)
+        self.assertIn("population: pregame", text)
+        self.assertIn("residual correlations", text)
+        self.assertIn("correlations (actual Pearson", text)
+
+    def test_seeds_report_monte_carlo_se(self) -> None:
+        report = run_holdout(
+            [2025],
+            [2],
+            n=5,
+            seeds=[1, 2],
+            population="played",
+            run_sensitivity=False,
+            load=self._load,
+            prop_fetch=lambda season: ([], "props_closing: no rows"),
+        )
+        metric = report["mc_se"]["metrics"]["starter_mae.sim_data.ALL"]
+        self.assertEqual(metric["n"], 2)
+        self.assertEqual(len(metric["values"]), 2)
+        self.assertAlmostEqual(metric["mean"], sum(metric["values"]) / 2, places=4)
+        self.assertIsNotNone(metric["se"])
+        self.assertIsNotNone(metric["half_width_95"])
+        self.assertIn("coverage.sim_data.p10_p90", report["mc_se"]["metrics"])
+        self.assertIn("game_total_sd.sim_data", report["mc_se"]["metrics"])
+        self.assertEqual(report["seed"], 1)
+        self.assertEqual(report["seeds"], [1, 2])
+
+    def test_main_writes_manifest_and_draws(self) -> None:
+        def boom(*_args, **_kwargs):
+            raise AssertionError("network")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "holdout.json"
+            with patch("nfl.holdout._load_live", side_effect=boom), patch(
+                "nfl.holdout.fetch_props_closing", side_effect=boom
+            ), patch("nfl.holdout.load_week", side_effect=self._load), patch(
+                "nfl.holdout.fetch_prop_rows",
+                return_value=([], "props_closing: no rows"),
+            ), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                code = main(
+                    [
+                        "--season",
+                        "2025",
+                        "--weeks",
+                        "2",
+                        "--n",
+                        "4",
+                        "--seeds",
+                        "1,2",
+                        "--population",
+                        "pregame",
+                        "--json-out",
+                        str(path),
+                    ]
+                )
+            self.assertEqual(code, 0)
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            draws = path.with_suffix(".draws.npz")
+            manifest_path = path.with_suffix(".manifest.json")
+            self.assertTrue(draws.is_file())
+            self.assertTrue(manifest_path.is_file())
+            archive = np_load(draws)
+            self.assertEqual(str(archive["kind"][0]), "draws")
+            self.assertEqual(archive["values"].shape[0], payload["draws"]["n_rows"])
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+        self.assertEqual(manifest["git_sha"], sha)
+        self.assertIn(manifest["git_dirty"], (True, False))
+        self.assertEqual(manifest["seeds"], [1, 2])
+        self.assertEqual(manifest["draws"]["n"], 4)
+        self.assertEqual(manifest["draws"]["sha256"], payload["draws"]["sha256"])
+        self.assertEqual(manifest["population"], "pregame")
+        self.assertIn("--seeds", manifest["argv"])
+        self.assertTrue(manifest["python"])
+        self.assertTrue(manifest["numpy"])
+        self.assertTrue(manifest["scipy"])
+        self.assertEqual(manifest["datasets"], [])
+        self.assertEqual(payload["population"], "pregame")
+        self.assertIn("errors", payload)
+        self.assertIn("calibration", payload)
+
+
+def np_load(path: Path):
+    import numpy as np
+
+    return np.load(path, allow_pickle=False)
+
+
+class PullManifestTest(unittest.TestCase):
+    def test_cache_hit_records_sha_rows_and_timestamp(self) -> None:
+        day = date(2026, 9, 24)
+        params = {"season": "2024", "week": "2"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = dataset_cache_file(root, day, "player_stats_weekly", params)
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                json.dumps({"data": [{"player_name": "A"}, {"player_name": "B"}], "truncated": False}),
+                encoding="utf-8",
+            )
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            with capture_pulls() as pulls, patch("nfl.gangstash.http_json") as http:
+                rows, _meta = fetch_dataset(
+                    "player_stats_weekly", params, cache_day=day, cache_root=root
+                )
+            http.assert_not_called()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(len(pulls), 1)
+        recorded = pulls[0]
+        self.assertEqual(recorded["dataset"], "player_stats_weekly")
+        self.assertEqual(recorded["n_rows"], 2)
+        self.assertEqual(recorded["sha256"], digest)
+        self.assertTrue(recorded["pulled_at"])
+        self.assertEqual(recorded["params"]["season"], "2024")
+        self.assertFalse(recorded["live"])
 
 
 if __name__ == "__main__":

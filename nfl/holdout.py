@@ -12,6 +12,12 @@ before that week, the same rule as ``nfl.backtest``. Week 1 therefore has
 no season-to-date board. ``--seed-prior-season`` (default off) replaces
 week 1 sim inputs with the prior season's week 18.
 
+``--population pregame`` (default) keeps depth-chart starters even when the
+box score is a zero. ``--population played`` restores the legacy starter
+filter. ``--seeds 1,2,3`` adds a Monte Carlo SE across seeds. With
+``--json-out results/holdout-2024.json`` the run also writes
+``results/holdout-2024.draws.npz`` and ``results/holdout-2024.manifest.json``.
+
 The report pools starters and the full pool: mean error and MAE by position
 for the board, the placeholder sim, and the data sim. It also reports sim
 calibration, game margin and total variance, role correlations, Spearman
@@ -23,20 +29,39 @@ seasons skip that section.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import platform
+import subprocess
 import sys
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+import numpy as np
+
 from nfl.backtest import (
     DepthPoolError,
+    _STARTER_RANKS,
     _load_live,
     _position,
     index_actual_rows,
     index_dst_rows,
     is_starter,
+)
+from nfl.calibration import (
+    N_BOOT,
+    QUANTILES,
+    block_bootstrap,
+    crps_ensemble,
+    fisher_z,
+    interval_hit,
+    monte_carlo_summary,
+    paired_difference,
+    pit,
+    pit_histogram,
+    salary_multiple_scores,
 )
 from nfl.gangstash import (
     GangstashDataError,
@@ -44,6 +69,7 @@ from nfl.gangstash import (
     GangstashError,
     GangstashKeyMissing,
     GangstashTruncated,
+    capture_pulls,
 )
 from nfl.gangstash_data import fetch_props_closing
 from nfl.lines import LinesError
@@ -68,6 +94,14 @@ _SENSITIVITY = (
     "red_zone_td_rate",
     "target_carry_shares",
 )
+# Full per-player draws stay on disk at or below this length. Longer
+# ensembles are stored as q01..q99. Scoring still uses the raw draws.
+_FULL_DRAW_MAX = 250
+_LINEUP_THRESHOLDS = (125.0, 165.0)
+_SALARY_MULTIPLES = (2.0, 3.0, 4.0)
+_LOSS_MODES = ("board", "sim_placeholder", "sim_data")
+_SIM_MODES = ("sim_placeholder", "sim_data")
+
 _TD_FIELDS = {
     "rushing touchdowns": "rush_tds",
     "rushing tds": "rush_tds",
@@ -134,6 +168,46 @@ def parse_seasons(raw: str | None, season: int | None) -> list[int]:
     if any(item < 1 for item in seasons):
         raise ValueError("season must be >= 1")
     return seasons
+
+
+def parse_seeds(raw: str | None, seed: int | None) -> list[int]:
+    """``1,2,3`` or the single ``--seed`` when ``raw`` is empty. At most 5."""
+    if raw is None or not str(raw).strip():
+        if seed is None:
+            raise ValueError("pass --seed or --seeds")
+        return [int(seed)]
+    out: list[int] = []
+    for part in str(raw).split(","):
+        piece = part.strip()
+        if not piece:
+            continue
+        out.append(int(piece))
+    if not out:
+        raise ValueError("seeds is empty")
+    if len(out) > 5:
+        raise ValueError("seeds supports at most 5")
+    return out
+
+
+def is_pregame_starter(player: Player) -> bool:
+    """Depth-chart starter at decision time, including a zero-point bust.
+
+    Same ranks as ``is_starter`` (QB/RB/TE 1, WR 1-3, every DEF) without
+    the post-game ``played`` filter.
+    """
+    pos = (player.position or "").upper()
+    if pos in {"D", "DEF"}:
+        return True
+    ranks = _STARTER_RANKS.get(pos)
+    return ranks is not None and player.depth_rank in ranks
+
+
+def _in_population(player: Player, row: dict, population: str) -> bool:
+    if population == "played":
+        return is_starter(player, row)
+    if population == "pregame":
+        return is_pregame_starter(player)
+    raise ValueError("population must be pregame or played")
 
 
 def pick_sensitivity_week(weeks: list[int], override: int | None) -> int | None:
@@ -725,22 +799,558 @@ def _actual_fd(
     return float(info["fd_points"]), info["row"]
 
 
+def _new_seed_bag() -> dict:
+    positions = (*_POS_ORDER, "ALL")
+    return {
+        "starter_abs": {mode: {pos: [] for pos in positions} for mode in _LOSS_MODES},
+        "rank": {mode: {pos: [] for pos in _POS_ORDER} for mode in _LOSS_MODES},
+        "cover10": {mode: [] for mode in _SIM_MODES},
+        "cover25": {mode: [] for mode in _SIM_MODES},
+        "crps": {mode: [] for mode in _SIM_MODES},
+        "pit": {mode: [] for mode in _SIM_MODES},
+        "total_sd": {mode: [] for mode in _SIM_MODES},
+        "margin_sd": {mode: [] for mode in _SIM_MODES},
+        "sim_corr": {mode: {name: [] for name in _PAIRS} for mode in _SIM_MODES},
+        "resid_actual": {mode: {name: [] for name in _PAIRS} for mode in _SIM_MODES},
+        "resid_sim": {mode: {name: [] for name in _PAIRS} for mode in _SIM_MODES},
+    }
+
+
+def _new_row_sink() -> dict:
+    return {
+        "block": [],
+        "starter": [],
+        "salary": [],
+        "actual": [],
+        "abs": {mode: [] for mode in _LOSS_MODES},
+        "crps": {mode: [] for mode in _SIM_MODES},
+        "cover10": {mode: [] for mode in _SIM_MODES},
+        "cover25": {mode: [] for mode in _SIM_MODES},
+        "pit": {mode: [] for mode in _SIM_MODES},
+        "price_block": [],
+        "brier": {mode: {mult: [] for mult in _SALARY_MULTIPLES} for mode in _SIM_MODES},
+        "log_score": {mode: {mult: [] for mult in _SALARY_MULTIPLES} for mode in _SIM_MODES},
+    }
+
+
+def _pack_draws(series: np.ndarray) -> tuple[str, np.ndarray]:
+    if int(series.size) > _FULL_DRAW_MAX:
+        return "quantiles", np.quantile(series, QUANTILES)
+    return "draws", np.asarray(series, dtype=np.float64)
+
+
+def _record_pairs(bag: dict, players: list[Player], joined_rows: list[dict], sims: dict) -> None:
+    actual_by_pid = {item["player"].pid: item["actual"] for item in joined_rows}
+    mean_by_pid: dict[str, dict[str, float]] = {}
+    for item in joined_rows:
+        pl = item["player"]
+        mean_by_pid[pl.pid] = {}
+        for mode, sim in sims.items():
+            series = sim.draws.get(pl.pid)
+            if series:
+                mean_by_pid[pl.pid][mode] = float(np.mean(np.asarray(series, dtype=float)))
+    teams = sorted({(pl.team or "").upper() for pl in players if pl.team})
+    for team in teams:
+        roles = _pair_roles(players, team)
+        qb = _role(players, team, "QB", 1)
+        opp = (qb.opponent or "").upper() if qb is not None else ""
+        for name, pair in roles.items():
+            if pair is None:
+                continue
+            if name == "QB-oppQB" and (not opp or team >= opp):
+                continue
+            left, right = pair
+            left_actual = actual_by_pid.get(left.pid)
+            right_actual = actual_by_pid.get(right.pid)
+            for mode, sim in sims.items():
+                rho = _pair_correlation(sim.draws, left, right)
+                if rho is not None:
+                    bag["sim_corr"][mode][name].append(rho)
+                    bag["resid_sim"][mode][name].append(rho)
+                left_mean = mean_by_pid.get(left.pid, {}).get(mode)
+                right_mean = mean_by_pid.get(right.pid, {}).get(mode)
+                if (
+                    left_actual is None
+                    or right_actual is None
+                    or left_mean is None
+                    or right_mean is None
+                ):
+                    continue
+                bag["resid_actual"][mode][name].append(
+                    (left_actual - left_mean, right_actual - right_mean)
+                )
+
+
+def _absorb_seed(
+    bag: dict,
+    joined_rows: list[dict],
+    players: list[Player],
+    sims: dict,
+    week_games: list[dict],
+    *,
+    rng,
+    row_sink: dict | None,
+    draw_sink: list | None,
+    season: int,
+    week: int,
+    seed_i: int,
+) -> None:
+    """One seed's headline pieces. ``row_sink`` is the primary seed only."""
+    block = f"{int(season)}-{int(week)}"
+    by_pos = {
+        mode: {pos: ([], []) for pos in _POS_ORDER} for mode in ("board", *_SIM_MODES)
+    }
+    shared: list[dict] = []
+    for item in joined_rows:
+        pl = item["player"]
+        actual = float(item["actual"])
+        pos = item["position"]
+        board = float(item["board"])
+        by_pos["board"][pos][0].append(board)
+        by_pos["board"][pos][1].append(actual)
+        if item["starter"]:
+            err = abs(board - actual)
+            bag["starter_abs"]["board"][pos].append(err)
+            bag["starter_abs"]["board"]["ALL"].append(err)
+        series = {}
+        preds = {}
+        ready = True
+        for mode in _SIM_MODES:
+            sim = sims[mode]
+            stats = sim.by_pid.get(pl.pid)
+            arr = np.asarray(sim.draws.get(pl.pid) or (), dtype=float)
+            if stats is None or arr.size == 0:
+                ready = False
+                break
+            series[mode] = arr
+            preds[mode] = float(stats.mean)
+            by_pos[mode][pos][0].append(preds[mode])
+            by_pos[mode][pos][1].append(actual)
+            if item["starter"]:
+                err = abs(preds[mode] - actual)
+                bag["starter_abs"][mode][pos].append(err)
+                bag["starter_abs"][mode]["ALL"].append(err)
+        if ready:
+            shared.append(
+                {
+                    "player": pl,
+                    "actual": actual,
+                    "board": board,
+                    "position": pos,
+                    "starter": bool(item["starter"]),
+                    "salary": int(pl.salary or 0),
+                    "series": series,
+                    "preds": preds,
+                }
+            )
+    for mode in ("board", *_SIM_MODES):
+        for pos in _POS_ORDER:
+            rho = spearman(by_pos[mode][pos][0], by_pos[mode][pos][1])
+            if rho is not None:
+                bag["rank"][mode][pos].append(rho)
+    actual_game_keys = {game["game"] for game in week_games}
+    for mode in _SIM_MODES:
+        sds = _sim_game_sds(sims[mode])
+        for game, (margin_sd, total_sd) in sds.items():
+            if game not in actual_game_keys:
+                continue
+            if margin_sd is not None:
+                bag["margin_sd"][mode].append(margin_sd)
+            if total_sd is not None:
+                bag["total_sd"][mode].append(total_sd)
+    if shared:
+        y = np.asarray([row["actual"] for row in shared], dtype=float)
+        starter = np.asarray([row["starter"] for row in shared], dtype=bool)
+        salary = np.asarray([row["salary"] for row in shared], dtype=float)
+        if row_sink is not None:
+            row_sink["block"].extend([block] * len(shared))
+            row_sink["starter"].extend(bool(flag) for flag in starter)
+            row_sink["salary"].extend(salary.tolist())
+            row_sink["actual"].extend(y.tolist())
+            row_sink["abs"]["board"].extend(
+                np.abs(np.asarray([row["board"] for row in shared], dtype=float) - y).tolist()
+            )
+        for mode in _SIM_MODES:
+            draws = np.stack([row["series"][mode] for row in shared])
+            pred = np.asarray([row["preds"][mode] for row in shared], dtype=float)
+            crps = crps_ensemble(draws, y)
+            hit10 = interval_hit(draws, y, 0.10, 0.90)
+            hit25 = interval_hit(draws, y, 0.25, 0.75)
+            pits = pit(draws, y, rng)
+            if np.any(starter):
+                bag["cover10"][mode].extend(hit10[starter].astype(float).tolist())
+                bag["cover25"][mode].extend(hit25[starter].astype(float).tolist())
+                bag["crps"][mode].extend(crps[starter].astype(float).tolist())
+                bag["pit"][mode].extend(pits[starter].astype(float).tolist())
+            if row_sink is not None:
+                row_sink["abs"][mode].extend(np.abs(pred - y).tolist())
+                row_sink["crps"][mode].extend(crps.tolist())
+                row_sink["cover10"][mode].extend(hit10.astype(float).tolist())
+                row_sink["cover25"][mode].extend(hit25.astype(float).tolist())
+                row_sink["pit"][mode].extend(pits.tolist())
+                priced = salary_multiple_scores(draws, y, salary, _SALARY_MULTIPLES)
+                if priced["n"]:
+                    if mode == _SIM_MODES[0]:
+                        row_sink["price_block"].extend([block] * priced["n"])
+                    for offset, mult in enumerate(priced["multiples"]):
+                        row_sink["brier"][mode][mult].extend(priced["brier"][:, offset].tolist())
+                        row_sink["log_score"][mode][mult].extend(
+                            priced["log_score"][:, offset].tolist()
+                        )
+            if draw_sink is not None:
+                for i, row in enumerate(shared):
+                    series = row["series"][mode]
+                    kind, values = _pack_draws(series)
+                    draw_sink.append(
+                        {
+                            "kind": kind,
+                            "values": values,
+                            "actual": float(y[i]),
+                            "mean": float(np.mean(series)),
+                            "salary": int(row["salary"]),
+                            "season": int(season),
+                            "week": int(week),
+                            "seed": int(seed_i),
+                            "starter": bool(row["starter"]),
+                            "mode": mode,
+                            "pid": row["player"].pid,
+                            "position": row["position"],
+                            "block": block,
+                        }
+                    )
+    _record_pairs(bag, players, joined_rows, sims)
+
+
+def _finalize_seed(bag: dict) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for mode in _LOSS_MODES:
+        for pos in (*_POS_ORDER, "ALL"):
+            xs = bag["starter_abs"][mode][pos]
+            if xs:
+                out[f"starter_mae.{mode}.{pos}"] = sum(xs) / len(xs)
+        for pos in _POS_ORDER:
+            xs = bag["rank"][mode][pos]
+            if xs:
+                out[f"rank.{mode}.{pos}"] = sum(xs) / len(xs)
+    for mode in _SIM_MODES:
+        if bag["cover10"][mode]:
+            out[f"coverage.{mode}.p10_p90"] = sum(bag["cover10"][mode]) / len(bag["cover10"][mode])
+        if bag["cover25"][mode]:
+            out[f"coverage.{mode}.p25_p75"] = sum(bag["cover25"][mode]) / len(bag["cover25"][mode])
+        if bag["crps"][mode]:
+            out[f"crps.{mode}"] = sum(bag["crps"][mode]) / len(bag["crps"][mode])
+        if bag["pit"][mode]:
+            out[f"pit_chi2_p.{mode}"] = float(pit_histogram(bag["pit"][mode])["p"])
+        if bag["total_sd"][mode]:
+            out[f"game_total_sd.{mode}"] = sum(bag["total_sd"][mode]) / len(bag["total_sd"][mode])
+        if bag["margin_sd"][mode]:
+            out[f"game_margin_sd.{mode}"] = sum(bag["margin_sd"][mode]) / len(bag["margin_sd"][mode])
+        for name in _PAIRS:
+            sim_list = bag["resid_sim"][mode][name]
+            act_pairs = bag["resid_actual"][mode][name]
+            c_sim = _mean(sim_list)
+            c_act = pearson(
+                [pair[0] for pair in act_pairs],
+                [pair[1] for pair in act_pairs],
+            )
+            if c_sim is not None:
+                out[f"resid_sim.{mode}.{name}"] = c_sim
+                out[f"corr_sim.{mode}.{name}"] = _mean(bag["sim_corr"][mode][name])
+            if c_act is not None:
+                out[f"resid_actual.{mode}.{name}"] = c_act
+            checked = fisher_z(c_sim, c_act, len(act_pairs))
+            if checked["z"] is not None:
+                out[f"fisher_z.{mode}.{name}"] = checked["z"]
+    return out
+
+
+def _residual_report(bag: dict) -> dict:
+    out = {}
+    for name in _PAIRS:
+        out[name] = {}
+        for mode in _SIM_MODES:
+            act_pairs = bag["resid_actual"][mode][name]
+            c_act = pearson(
+                [pair[0] for pair in act_pairs],
+                [pair[1] for pair in act_pairs],
+            )
+            c_sim = _mean(bag["resid_sim"][mode][name])
+            checked = fisher_z(c_sim, c_act, len(act_pairs))
+            out[name][mode] = {
+                "actual": c_act,
+                "n_actual": len(act_pairs),
+                "sim": c_sim,
+                "n_sim": len(bag["resid_sim"][mode][name]),
+                "se": checked["se"],
+                "z": checked["z"],
+                "flag": checked["flag"],
+            }
+    return out
+
+
+def _mask_boot(values, starter, blocks, *, starters_only: bool) -> dict:
+    vals = np.asarray(values, dtype=float)
+    flags = np.asarray(starter, dtype=bool)
+    labels = np.asarray(blocks)
+    if starters_only:
+        vals = vals[flags]
+        labels = labels[flags]
+    return block_bootstrap(vals, labels, n_boot=N_BOOT, seed=0)
+
+
+def _scores_report(row_sink: dict) -> dict:
+    """Block-bootstrap the primary seed. Lineup totals are omitted here."""
+    if not row_sink["block"]:
+        return {
+            "note": "no joined rows",
+            "lineup": _lineup_note(),
+            "salary_thresholds": {"n": 0, "note": "no priced rows"},
+        }
+    out = {
+        "orientation": (
+            "crps and brier are losses (lower is better). "
+            "log_score is o*log(p)+(1-o)*log(1-p) after clipping p to "
+            "[1e-6, 1-1e-6] (higher is better)."
+        ),
+        "pools": {},
+        "salary_thresholds": _salary_block(row_sink),
+        "lineup": _lineup_note(),
+    }
+    for pool, starters_only in (("starters", True), ("full", False)):
+        pool_out = {}
+        for mode in _SIM_MODES:
+            hist_values = row_sink["pit"][mode]
+            flags = row_sink["starter"]
+            if starters_only:
+                hist_values = [
+                    value
+                    for value, flag in zip(row_sink["pit"][mode], flags)
+                    if flag
+                ]
+            pool_out[mode] = {
+                "crps": _mask_boot(row_sink["crps"][mode], flags, row_sink["block"], starters_only=starters_only),
+                "p10_p90": _mask_boot(row_sink["cover10"][mode], flags, row_sink["block"], starters_only=starters_only),
+                "p25_p75": _mask_boot(row_sink["cover25"][mode], flags, row_sink["block"], starters_only=starters_only),
+                "pit_mean": _mask_boot(row_sink["pit"][mode], flags, row_sink["block"], starters_only=starters_only),
+                "pit_histogram": pit_histogram(hist_values),
+            }
+        out["pools"][pool] = pool_out
+    return out
+
+
+def _salary_block(row_sink: dict) -> dict:
+    n = len(row_sink["price_block"])
+    if n == 0:
+        return {
+            "n": 0,
+            "multiples": [float(m) for m in _SALARY_MULTIPLES],
+            "note": "no salary on the depth-chart pool; thresholds need salary > 0",
+            "levels": {},
+        }
+    levels = {}
+    for mode in _SIM_MODES:
+        levels[mode] = {}
+        for mult in _SALARY_MULTIPLES:
+            label = f"{int(mult)}x"
+            levels[mode][label] = {
+                "brier": block_bootstrap(
+                    row_sink["brier"][mode][mult],
+                    row_sink["price_block"],
+                    n_boot=N_BOOT,
+                    seed=0,
+                ),
+                "log_score": block_bootstrap(
+                    row_sink["log_score"][mode][mult],
+                    row_sink["price_block"],
+                    n_boot=N_BOOT,
+                    seed=0,
+                ),
+            }
+    return {
+        "n": n,
+        "multiples": [float(m) for m in _SALARY_MULTIPLES],
+        "note": "threshold = multiple * salary / 1000",
+        "levels": levels,
+    }
+
+
+def _lineup_note() -> dict:
+    return {
+        "thresholds": [float(t) for t in _LINEUP_THRESHOLDS],
+        "note": (
+            "no lineup draws on the depth-chart holdout; "
+            "salary is omitted and the lineup solver is not run"
+        ),
+        "levels": {},
+    }
+
+
+def _paired_report(row_sink: dict) -> dict:
+    if not row_sink["block"]:
+        return {}
+    out = {}
+    comparisons = (
+        ("board", "sim_placeholder"),
+        ("board", "sim_data"),
+        ("sim_placeholder", "sim_data"),
+    )
+    for pool, starters_only in (("starters", True), ("full", False)):
+        flags = np.asarray(row_sink["starter"], dtype=bool)
+        blocks = np.asarray(row_sink["block"])
+        if starters_only:
+            keep = flags
+        else:
+            keep = np.ones(flags.shape[0], dtype=bool)
+        pool_out = {}
+        kept_blocks = blocks[keep]
+        for left, right in comparisons:
+            key = f"{left}_minus_{right}"
+            entry = {
+                "abs_error": paired_difference(
+                    np.asarray(row_sink["abs"][left], dtype=float)[keep],
+                    np.asarray(row_sink["abs"][right], dtype=float)[keep],
+                    kept_blocks,
+                    n_boot=N_BOOT,
+                    seed=0,
+                )
+            }
+            if left in _SIM_MODES and right in _SIM_MODES:
+                entry["crps"] = paired_difference(
+                    np.asarray(row_sink["crps"][left], dtype=float)[keep],
+                    np.asarray(row_sink["crps"][right], dtype=float)[keep],
+                    kept_blocks,
+                    n_boot=N_BOOT,
+                    seed=0,
+                )
+            pool_out[key] = entry
+        out[pool] = pool_out
+    return out
+
+
+def write_draw_archive(path: Path, rows: list[dict]) -> dict:
+    """Persist draws, or q01..q99 when each row is longer than ``_FULL_DRAW_MAX``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        np.savez_compressed(path, kind=np.array(["empty"]))
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        return {"path": str(path), "kind": "empty", "n_rows": 0, "sha256": digest}
+    kind = rows[0]["kind"]
+    values = np.stack([np.asarray(row["values"], dtype=np.float64) for row in rows])
+    payload = {
+        "kind": np.array([kind]),
+        "values": values,
+        "actual": np.asarray([row["actual"] for row in rows], dtype=np.float64),
+        "mean": np.asarray([row["mean"] for row in rows], dtype=np.float64),
+        "salary": np.asarray([row["salary"] for row in rows], dtype=np.int64),
+        "season": np.asarray([row["season"] for row in rows], dtype=np.int32),
+        "week": np.asarray([row["week"] for row in rows], dtype=np.int32),
+        "seed": np.asarray([row["seed"] for row in rows], dtype=np.int32),
+        "starter": np.asarray([row["starter"] for row in rows], dtype=np.bool_),
+        "mode": np.asarray([row["mode"] for row in rows]),
+        "pid": np.asarray([row["pid"] for row in rows]),
+        "position": np.asarray([row["position"] for row in rows]),
+        "block": np.asarray([row["block"] for row in rows]),
+    }
+    if kind == "quantiles":
+        payload["quantile"] = np.asarray(QUANTILES, dtype=np.float64)
+    np.savez_compressed(path, **payload)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    info = {
+        "path": str(path),
+        "kind": kind,
+        "n_rows": len(rows),
+        "sha256": digest,
+    }
+    if kind == "draws":
+        info["n_draws"] = int(values.shape[1])
+    else:
+        info["quantiles"] = "q01..q99"
+    return info
+
+
+def git_state(root: Path | None = None) -> dict:
+    repo = root or Path(__file__).resolve().parents[1]
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo,
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        dirty = bool(
+            subprocess.check_output(
+                ["git", "status", "--porcelain"],
+                cwd=repo,
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+        return {"git_sha": None, "git_dirty": None}
+    return {"git_sha": sha, "git_dirty": dirty}
+
+
+def build_manifest(*, argv: list[str], report: dict, pulls: list[dict], draws: dict | None) -> dict:
+    git = git_state()
+    return {
+        "git_sha": git["git_sha"],
+        "git_dirty": git["git_dirty"],
+        "seeds": list(report.get("seeds") or []),
+        "seed": report.get("seed"),
+        "draws": {
+            "n": report.get("n"),
+            **(draws or {}),
+        },
+        "population": report.get("population"),
+        "argv": list(argv),
+        "python": platform.python_version(),
+        "numpy": np.__version__,
+        "scipy": __import__("scipy").__version__,
+        "datasets": list(pulls),
+    }
+
+
+def _mc_block(per_seed: list[dict]) -> dict:
+    keys = sorted({key for item in per_seed for key in item})
+    out = {}
+    for key in keys:
+        vals = [item[key] for item in per_seed if key in item and item[key] is not None]
+        if vals:
+            out[key] = monte_carlo_summary(vals)
+    return out
+
+
 def run_holdout(
     seasons: list[int],
     weeks: list[int],
     *,
     n: int = 3000,
     seed: int = 1,
+    seeds: list[int] | None = None,
+    population: str = "pregame",
     seed_prior_season: bool = False,
     sensitivity_week: int | None = None,
     run_sensitivity: bool = True,
     load=None,
     prop_fetch=None,
+    draws_out: str | Path | None = None,
 ) -> dict:
     """Score every requested week. Network stays inside ``load`` and props."""
+    if population not in ("pregame", "played"):
+        raise ValueError("population must be pregame or played")
+    seed_list = [int(item) for item in (seeds if seeds is not None else [seed])]
+    if not seed_list:
+        raise ValueError("seeds is empty")
+    if len(seed_list) > 5:
+        raise ValueError("seeds supports at most 5")
+    primary = seed_list[0]
     loader = load or load_week
     props_of = prop_fetch or fetch_prop_rows
     draws_n = max(1, int(n))
+    seed_bags = [_new_seed_bag() for _ in seed_list]
+    row_sink = _new_row_sink()
+    draw_sink: list[dict] = []
+    pit_rng = [np.random.default_rng(10_000 + int(item)) for item in seed_list]
     sens_week = pick_sensitivity_week(weeks, sensitivity_week) if run_sensitivity else None
     errors = {
         pool: {mode: defaultdict(list) for mode in ("board", "sim_placeholder", "sim_data")}
@@ -804,31 +1414,56 @@ def run_holdout(
             dst_by_team = index_dst_rows(
                 loaded.actual_rows, season=season, week=week
             )
-            placeholder = simulate_games(
+            placeholder_model = build_efficiency("placeholder", loaded.sim_inputs)
+            # Primary seed is simulated first, in the same order as a one-seed run.
+            primary_placeholder = simulate_games(
                 players,
                 n=draws_n,
-                seed=int(seed),
+                seed=int(primary),
                 inputs=loaded.sim_inputs,
-                efficiency=build_efficiency("placeholder", loaded.sim_inputs),
+                efficiency=placeholder_model,
             )
             data_model, data_mode, data_note = resolve_run_efficiency(
                 "data",
                 loaded.sim_inputs,
                 before_week=week,
             )
-            data_sim = simulate_games(
+            primary_data = simulate_games(
                 players,
                 n=draws_n,
-                seed=int(seed),
+                seed=int(primary),
                 inputs=loaded.sim_inputs,
                 efficiency=data_model,
             )
             if data_note:
                 print(data_note, file=sys.stderr)
-            sims = {
-                "sim_placeholder": placeholder,
-                "sim_data": data_sim,
-            }
+            sims_by_seed = [
+                {
+                    "sim_placeholder": primary_placeholder,
+                    "sim_data": primary_data,
+                }
+            ]
+            for seed_i in seed_list[1:]:
+                sims_by_seed.append(
+                    {
+                        "sim_placeholder": simulate_games(
+                            players,
+                            n=draws_n,
+                            seed=int(seed_i),
+                            inputs=loaded.sim_inputs,
+                            efficiency=placeholder_model,
+                        ),
+                        "sim_data": simulate_games(
+                            players,
+                            n=draws_n,
+                            seed=int(seed_i),
+                            inputs=loaded.sim_inputs,
+                            efficiency=data_model,
+                        ),
+                    }
+                )
+            sims = sims_by_seed[0]
+            data_sim = sims["sim_data"]
             joined_rows = []
             for pl in players:
                 found = _actual_fd(pl, indexed, dst_by_team)
@@ -850,7 +1485,7 @@ def run_holdout(
                 if "sim_data" not in means or "sim_placeholder" not in means:
                     continue
                 pos = _position(pl.position)
-                starter = is_starter(pl, row)
+                starter = _in_population(pl, row, population)
                 item = {
                     "position": pos,
                     "board": board,
@@ -984,7 +1619,21 @@ def run_holdout(
                     baseline,
                     week=int(week),
                     n=draws_n,
-                    seed=int(seed),
+                    seed=int(primary),
+                )
+            for offset, seed_i in enumerate(seed_list):
+                _absorb_seed(
+                    seed_bags[offset],
+                    joined_rows,
+                    players,
+                    sims_by_seed[offset],
+                    week_games,
+                    rng=pit_rng[offset],
+                    row_sink=row_sink if offset == 0 else None,
+                    draw_sink=draw_sink,
+                    season=int(season),
+                    week=int(week),
+                    seed_i=int(seed_i),
                 )
 
     prop_by_pos: dict[str, list[tuple[float, float]]] = defaultdict(list)
@@ -1008,7 +1657,9 @@ def run_holdout(
         "seasons": [int(season) for season in seasons],
         "weeks": [int(week) for week in weeks],
         "n": draws_n,
-        "seed": int(seed),
+        "seed": int(primary),
+        "seeds": [int(item) for item in seed_list],
+        "population": population,
         "seed_prior_season": bool(seed_prior_season),
         "prior_weeks_rule": "weeks 1..W-1 only; week 1 is empty unless --seed-prior-season",
         "scored": scored,
@@ -1090,6 +1741,37 @@ def run_holdout(
             },
         },
     }
+    per_seed = [_finalize_seed(bag) for bag in seed_bags]
+    draws_info = {
+        "kind": draw_sink[0]["kind"] if draw_sink else "empty",
+        "n_rows": len(draw_sink),
+    }
+    if draws_out is not None:
+        archive = write_draw_archive(Path(draws_out), draw_sink)
+        draws_info = {
+            "kind": archive["kind"],
+            "n_rows": archive["n_rows"],
+            "sha256": archive["sha256"],
+        }
+        if "n_draws" in archive:
+            draws_info["n_draws"] = archive["n_draws"]
+        if "quantiles" in archive:
+            draws_info["quantiles"] = archive["quantiles"]
+    report["scores"] = _scores_report(row_sink)
+    report["paired"] = _paired_report(row_sink)
+    report["residual_correlations"] = (
+        _residual_report(seed_bags[0]) if seed_bags else {}
+    )
+    report["mc_se"] = {
+        "n_seeds": len(seed_list),
+        "seeds": [int(item) for item in seed_list],
+        "metrics": _mc_block(per_seed),
+    }
+    report["draws"] = draws_info
+    report["population_note"] = (
+        "pregame keeps depth-chart starters (QB/RB/TE rank 1, WR ranks 1-3, DEF) "
+        "including zero-point busts. played is the legacy is_starter filter."
+    )
     return _round_report(report)
 
 
@@ -1217,6 +1899,95 @@ def format_report(report: dict) -> str:
     else:
         note = "; ".join(props["notes"]) if props["notes"] else "no rows"
         lines.append(f"props_closing: skipped ({note})")
+    lines.append(f"population: {report.get('population', 'pregame')}")
+    seeds = report.get("seeds") or [report.get("seed")]
+    lines.append("seeds: " + ",".join(str(item) for item in seeds))
+    scores = report.get("scores") or {}
+    pools = scores.get("pools") or {}
+    if pools:
+        lines.append(
+            "scores (CRPS and coverage use a week-block bootstrap; "
+            "log score is higher-better)"
+        )
+        for pool in ("starters", "full"):
+            for mode in _SIM_MODES:
+                row = (pools.get(pool) or {}).get(mode) or {}
+                if not row:
+                    continue
+                crps = row.get("crps") or {}
+                cover = row.get("p10_p90") or {}
+                cover25 = row.get("p25_p75") or {}
+                hist = row.get("pit_histogram") or {}
+                note = crps.get("note") or ""
+                lines.append(
+                    f"  {mode} {pool} crps {_fmt(crps.get('estimate'), 7)} "
+                    f"p10-p90 {_fmt(cover.get('estimate'), 7)} "
+                    f"p25-p75 {_fmt(cover25.get('estimate'), 7)} "
+                    f"pit p {_fmt(hist.get('p'), 7)} "
+                    f"blocks {crps.get('n_blocks', 0)} {note}".rstrip()
+                )
+    salary = scores.get("salary_thresholds") or {}
+    if salary:
+        lines.append(
+            f"salary thresholds n {salary.get('n', 0)}  {salary.get('note', '')}".rstrip()
+        )
+    lineup = scores.get("lineup") or {}
+    if lineup.get("note"):
+        lines.append(f"lineup: {lineup['note']}")
+    paired = (report.get("paired") or {}).get("starters") or {}
+    if paired:
+        lines.append("paired starters (loss a minus b, week-block 95% CI)")
+        for key, entry in paired.items():
+            for loss_name in ("abs_error", "crps"):
+                row = entry.get(loss_name)
+                if not row:
+                    continue
+                ci = row.get("ci95") or [None, None]
+                flag = "excludes 0" if row.get("excludes_zero") else "includes 0"
+                lines.append(
+                    f"  {key} {loss_name} {_fmt(row.get('estimate'), 7)} "
+                    f"CI {_fmt(ci[0], 7)} {_fmt(ci[1], 7)} {flag}"
+                )
+    residual = report.get("residual_correlations") or {}
+    if residual:
+        lines.append(
+            "residual correlations (value minus draw mean; "
+            "sim is the mean within-game Pearson; flag when Fisher z > 4)"
+        )
+        for name in _PAIRS:
+            data = (residual.get(name) or {}).get("sim_data") or {}
+            if not data:
+                continue
+            flag = " FLAG" if data.get("flag") else ""
+            lines.append(
+                f"  {name:<10} actual {_fmt(data.get('actual'), 7)} "
+                f"sim {_fmt(data.get('sim'), 7)} "
+                f"z {_fmt(data.get('z'), 7)} n {data.get('n_actual', 0)}{flag}"
+            )
+    mc = report.get("mc_se") or {}
+    if int(mc.get("n_seeds") or 0) > 1:
+        lines.append(
+            f"monte carlo SE across {mc['n_seeds']} seeds "
+            "(mean, se, Student-t 95% half-width)"
+        )
+        metrics = mc.get("metrics") or {}
+        for key in (
+            "starter_mae.board.ALL",
+            "starter_mae.sim_placeholder.ALL",
+            "starter_mae.sim_data.ALL",
+            "coverage.sim_data.p10_p90",
+            "coverage.sim_data.p25_p75",
+            "game_total_sd.sim_data",
+            "crps.sim_data",
+        ):
+            row = metrics.get(key)
+            if not row:
+                continue
+            lines.append(
+                f"  {key} mean {_fmt(row.get('mean'), 7)} "
+                f"se {_fmt(row.get('se'), 7)} "
+                f"half {_fmt(row.get('half_width_95'), 7)}"
+            )
     return "\n".join(lines)
 
 
@@ -1258,7 +2029,31 @@ def main(argv: list[str] | None = None) -> int:
         help="sim draws per week (default 3000)",
     )
     ap.add_argument("--seed", type=int, default=1)
+    ap.add_argument(
+        "--seeds",
+        default=None,
+        help="comma-separated sim seeds, e.g. 1,2,3 (at most 5). "
+        "Default is --seed. Headline metrics include a Monte Carlo SE.",
+    )
+    ap.add_argument(
+        "--population",
+        choices=("pregame", "played"),
+        default="pregame",
+        help="starter pool: pregame depth chart (default) or played "
+        "(legacy positive counting stats)",
+    )
     ap.add_argument("--json-out", default=None, help="write the report JSON here")
+    ap.add_argument(
+        "--draws-out",
+        default=None,
+        help="npz of per-player draws, or q01..q99 when n is large "
+        "(default: next to --json-out)",
+    )
+    ap.add_argument(
+        "--manifest-out",
+        default=None,
+        help="run manifest JSON (default: next to --json-out)",
+    )
     ap.add_argument(
         "--seed-prior-season",
         action="store_true",
@@ -1274,27 +2069,63 @@ def main(argv: list[str] | None = None) -> int:
     try:
         seasons = parse_seasons(args.seasons, args.season)
         weeks = parse_weeks(args.weeks)
+        seeds = parse_seeds(args.seeds, args.seed)
     except ValueError as exc:
         print(f"choke HOLDOUT: {exc}", file=sys.stderr)
         return 1
     if args.n < 1:
         print("choke HOLDOUT: n must be >= 1", file=sys.stderr)
         return 1
-    report = run_holdout(
-        seasons,
-        weeks,
-        n=args.n,
-        seed=args.seed,
-        seed_prior_season=args.seed_prior_season,
-        sensitivity_week=args.sensitivity_week,
-    )
+    json_path = Path(args.json_out) if args.json_out else None
+    if args.draws_out:
+        draws_path = Path(args.draws_out)
+    elif json_path is not None:
+        draws_path = json_path.with_suffix(".draws.npz")
+    else:
+        draws_path = None
+    if args.manifest_out:
+        manifest_path = Path(args.manifest_out)
+    elif json_path is not None:
+        manifest_path = json_path.with_suffix(".manifest.json")
+    else:
+        manifest_path = None
+    cli = list(sys.argv[1:] if argv is None else argv)
+    with capture_pulls() as pulls:
+        report = run_holdout(
+            seasons,
+            weeks,
+            n=args.n,
+            seed=seeds[0],
+            seeds=seeds,
+            population=args.population,
+            seed_prior_season=args.seed_prior_season,
+            sensitivity_week=args.sensitivity_week,
+            draws_out=draws_path,
+        )
     text = format_report(report)
     print(text)
-    if args.json_out:
-        path = Path(args.json_out)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
-        print(f"json: {path}", file=sys.stderr)
+    if json_path is not None:
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+        print(f"json: {json_path}", file=sys.stderr)
+    if manifest_path is not None:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        manifest = build_manifest(
+            argv=cli,
+            report=report,
+            pulls=pulls,
+            draws={
+                "path": None if draws_path is None else str(draws_path),
+                "sha256": (report.get("draws") or {}).get("sha256"),
+                "kind": (report.get("draws") or {}).get("kind"),
+                "n_rows": (report.get("draws") or {}).get("n_rows"),
+                "quantiles": (report.get("draws") or {}).get("quantiles"),
+            },
+        )
+        manifest_path.write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+        print(f"manifest: {manifest_path}", file=sys.stderr)
     if not report["scored"]:
         return 1
     return 0
