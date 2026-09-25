@@ -415,6 +415,8 @@ class SimGuardTest(unittest.TestCase):
             )
         self.assertIsInstance(seen["efficiency"], DataEfficiency)
         self.assertEqual(parse_args([]).sim_efficiency, "data")
+        self.assertEqual(parse_args([]).sim_mode, "off")
+        self.assertEqual(parse_args(["--sim-mode", "team"]).sim_mode, "team")
         self.assertEqual(
             parse_args(["--sim-efficiency", "placeholder"]).sim_efficiency,
             "placeholder",
@@ -1105,6 +1107,47 @@ class DuplicateDepthPidTest(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual({entry.player.position for entry in rows}, {"QB", "TE"})
         self.assertNotIn("depth collapse", err.getvalue())
+
+
+class SimModePublishTest(unittest.TestCase):
+    def test_team_mode_missing_constants_do_not_raise(self) -> None:
+        import nfl.sim_team as sim_team
+        from nfl.sim import simulate_games
+
+        player = Player(
+            pid="warn-qb",
+            name="Warn QB",
+            position="QB",
+            salary=8000,
+            team="DET",
+            opponent="GB",
+            game="GB@DET",
+            fppg=None,
+            injury="",
+            roster_position="QB",
+            implied_total=22.0,
+            implied_opp=22.0,
+            total=44.0,
+            spread=0.0,
+            depth_rank=1,
+        )
+        original = sim_team.TEAM_SPREAD_SD
+        err = io.StringIO()
+        try:
+            sim_team.TEAM_SPREAD_SD = None
+            with redirect_stderr(err):
+                played = simulate_games([player], n=4, seed=1, sim_mode="team")
+        finally:
+            sim_team.TEAM_SPREAD_SD = original
+        self.assertEqual(len(played.draws[player.pid]), 4)
+        self.assertIn("fitted constants missing", err.getvalue())
+
+    def test_unknown_sim_mode_exits_before_the_slate(self) -> None:
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = main(["--dry-run", "--sim-mode", "rates"])
+        self.assertEqual(code, 1)
+        self.assertIn("unknown sim mode", err.getvalue())
 
 
 if __name__ == "__main__":

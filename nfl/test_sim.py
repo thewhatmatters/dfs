@@ -5,6 +5,7 @@ from __future__ import annotations
 import builtins
 import gc
 import io
+import math
 import random
 import unittest
 from contextlib import redirect_stderr
@@ -130,6 +131,10 @@ class FlagsTest(unittest.TestCase):
         default_seed = parse_args(["--csv", "x.csv"])
         self.assertEqual(default_seed.sim_seed, 1)
         self.assertEqual(default_seed.sim_efficiency, "data")
+        self.assertEqual(default_seed.sim_mode, "off")
+        self.assertEqual(
+            parse_args(["--csv", "x.csv", "--sim-mode", "team"]).sim_mode, "team"
+        )
         placeholder = parse_args(
             ["--csv", "x.csv", "--sim-efficiency", "placeholder"]
         )
@@ -2220,6 +2225,374 @@ class LowTotalQbTest(unittest.TestCase):
         self.assertGreater(gs.by_pid["willis"].mean, 12.0)
         self.assertLess(gs.by_pid["willis"].mean, 20.0)
         self.assertGreater(gs.by_pid["willis"].p90, role_share + 2.0)
+
+
+def _team_mode_side(team, opponent, home):
+    game = "%s@%s" % (opponent, team) if home else "%s@%s" % (team, opponent)
+    common = dict(
+        team=team,
+        opponent=opponent,
+        game=game,
+        implied_total=22.0,
+        implied_opp=22.0,
+        total=44.0,
+        spread=0.0,
+        depth_rank=1,
+    )
+    qb = _pl(pid="%s-qb" % team, name="%s QB" % team, position="QB", salary=8000, **common)
+    wr = _pl(pid="%s-wr" % team, name="%s WR" % team, position="WR", salary=7000, **common)
+    rb = _pl(pid="%s-rb" % team, name="%s RB" % team, position="RB", salary=6500, **common)
+    dst = dict(common)
+    dst["depth_rank"] = None
+    defense = _pl(
+        pid="%s-def" % team,
+        name="%s DEF" % team,
+        position="DEF",
+        salary=4000,
+        **dst,
+    )
+    weeks = [
+        TargetWeek(
+            season=2024,
+            week=week,
+            position="WR",
+            player_name=wr.name,
+            team_fd=team,
+            targets=8.0,
+            target_share=0.25,
+            team_targets=32.0,
+            team_pass_attempts=34.0,
+        )
+        for week in (1, 2, 3)
+    ]
+    return [qb, wr, rb, defense], weeks
+
+
+class TeamModeTest(unittest.TestCase):
+    def test_constants_match_the_2024_fit(self) -> None:
+        from nfl.sim_team import (
+            QB_OPP_DEF_CORRELATION,
+            TEAM_SCORE_DAMP,
+            TEAM_SPREAD_SD,
+            TEAM_TOTAL_SD,
+            TEAM_TOTAL_SPREAD_RHO,
+            fit_qb_def_correlation,
+            fit_spread_total,
+            load_qb_def,
+            load_residuals,
+            production_scale,
+        )
+
+        total_sd, spread_sd, rho = fit_spread_total(*load_residuals())
+        self.assertEqual(total_sd, TEAM_TOTAL_SD)
+        self.assertEqual(spread_sd, TEAM_SPREAD_SD)
+        self.assertEqual(rho, TEAM_TOTAL_SPREAD_RHO)
+        self.assertEqual(
+            fit_qb_def_correlation(*load_qb_def()), QB_OPP_DEF_CORRELATION
+        )
+        self.assertEqual(TEAM_SCORE_DAMP, 0.6901)
+        self.assertEqual(production_scale(22.0, 22.0, TEAM_SCORE_DAMP), 1.0)
+        self.assertAlmostEqual(
+            production_scale(11.0, 22.0, TEAM_SCORE_DAMP),
+            1.0 + TEAM_SCORE_DAMP * (0.5 - 1.0),
+            places=6,
+        )
+
+    def test_default_mode_matches_the_main_seed(self) -> None:
+        players = [
+            _pl(
+                pid="DET-qb",
+                name="DET QB",
+                position="QB",
+                team="DET",
+                opponent="GB",
+                game="GB@DET",
+                salary=8000,
+                implied_total=22.0,
+                implied_opp=22.0,
+                total=44.0,
+                spread=0.0,
+            ),
+            _pl(
+                pid="DET-wr",
+                name="DET WR",
+                position="WR",
+                team="DET",
+                opponent="GB",
+                game="GB@DET",
+                salary=7000,
+                implied_total=22.0,
+                implied_opp=22.0,
+                total=44.0,
+                spread=0.0,
+            ),
+            _pl(
+                pid="GB-qb",
+                name="GB QB",
+                position="QB",
+                team="GB",
+                opponent="DET",
+                game="GB@DET",
+                salary=8100,
+                implied_total=22.0,
+                implied_opp=22.0,
+                total=44.0,
+                spread=0.0,
+            ),
+        ]
+        bare = simulate_games(players, n=6, seed=1)
+        named = simulate_games(players, n=6, seed=1, sim_mode="off")
+        self.assertEqual(bare.draws, named.draws)
+        self.assertEqual(bare.game_draws, named.game_draws)
+        self.assertEqual(
+            bare.draws["DET-qb"],
+            (
+                15.155751611325307,
+                21.704638119888767,
+                15.828993818566872,
+                22.112009565231013,
+                18.249529137151967,
+                23.386625074613544,
+            ),
+        )
+        self.assertEqual(
+            bare.game_draws[0],
+            ("GB@DET", "GB", "DET", 32.64803579182927, 18.153579704831568),
+        )
+        det, det_weeks = _team_mode_side("DET", "GB", True)
+        gb, gb_weeks = _team_mode_side("GB", "DET", False)
+        inputs = SimInputs(targets=tuple(det_weeks + gb_weeks))
+        opp = simulate_games(det + gb, n=4, seed=11, inputs=inputs)
+        off = simulate_games(det + gb, n=4, seed=11, inputs=inputs, sim_mode="off")
+        self.assertEqual(opp.draws, off.draws)
+        self.assertEqual(opp.draws["DET-qb"][0], 15.816124536486775)
+        self.assertEqual(
+            opp.game_draws[0],
+            ("GB@DET", "GB", "DET", 20.65638912762312, 16.880507144607144),
+        )
+
+    def test_team_mode_correlations_and_total_sd(self) -> None:
+        from nfl.sim_team import TEAM_TOTAL_SD, parse_sim_mode, sample_sd
+
+        det, det_weeks = _team_mode_side("DET", "GB", True)
+        gb, gb_weeks = _team_mode_side("GB", "DET", False)
+        players = det + gb
+        inputs = SimInputs(targets=tuple(det_weeks + gb_weeks))
+        played = simulate_games(
+            players, n=2000, seed=1, inputs=inputs, sim_mode="team"
+        )
+        qb_wr = pearson(list(played.draws["DET-qb"]), list(played.draws["DET-wr"]))
+        qb_def = pearson(list(played.draws["DET-qb"]), list(played.draws["GB-def"]))
+        self.assertGreater(qb_wr, 0.2)
+        self.assertLess(qb_def, -0.2)
+        totals = [away + home for _g, _a, _h, away, home in played.game_draws]
+        # The team-point floor trims the sample SD by a few tenths.
+        self.assertAlmostEqual(sample_sd(totals), TEAM_TOTAL_SD, delta=0.40)
+        with self.assertRaises(ValueError):
+            parse_sim_mode("rates")
+
+    def test_missing_constants_fall_back_without_raising(self) -> None:
+        import nfl.sim_team as sim_team
+
+        det, det_weeks = _team_mode_side("DET", "GB", True)
+        gb, gb_weeks = _team_mode_side("GB", "DET", False)
+        players = det + gb
+        inputs = SimInputs(targets=tuple(det_weeks + gb_weeks))
+        off = simulate_games(players, n=6, seed=1, inputs=inputs, sim_mode="off")
+        original = sim_team.TEAM_TOTAL_SD
+        err = io.StringIO()
+        try:
+            sim_team.TEAM_TOTAL_SD = None
+            with redirect_stderr(err):
+                played = simulate_games(
+                    players, n=6, seed=1, inputs=inputs, sim_mode="team"
+                )
+        finally:
+            sim_team.TEAM_TOTAL_SD = original
+        self.assertEqual(played.draws, off.draws)
+        self.assertIn("fitted constants missing", err.getvalue())
+        self.assertIn("warning:", err.getvalue())
+
+    def test_game_without_lines_falls_back_for_that_game(self) -> None:
+        det, det_weeks = _team_mode_side("DET", "GB", True)
+        gb, gb_weeks = _team_mode_side("GB", "DET", False)
+        bare = []
+        for team, opponent, home in (("KC", "BUF", True), ("BUF", "KC", False)):
+            side, _weeks = _team_mode_side(team, opponent, home)
+            for player in side:
+                bare.append(
+                    _pl(
+                        pid=player.pid,
+                        name=player.name,
+                        position=player.position,
+                        salary=player.salary,
+                        team=player.team,
+                        opponent=player.opponent,
+                        game=player.game,
+                        implied_total=player.implied_total,
+                        implied_opp=player.implied_opp,
+                        depth_rank=player.depth_rank,
+                        total=None,
+                        spread=None,
+                    )
+                )
+        players = det + gb + bare
+        inputs = SimInputs(targets=tuple(det_weeks + gb_weeks))
+        err = io.StringIO()
+        with redirect_stderr(err):
+            team = simulate_games(
+                players, n=8, seed=3, inputs=inputs, sim_mode="team"
+            )
+        off = simulate_games(players, n=8, seed=3, inputs=inputs, sim_mode="off")
+        self.assertIn("BUF@KC has no spread/total", err.getvalue())
+        for player in bare:
+            self.assertEqual(team.draws[player.pid], off.draws[player.pid])
+        self.assertNotEqual(team.draws["DET-qb"], off.draws["DET-qb"])
+
+    def test_edge_scores_stay_finite_and_non_negative(self) -> None:
+        cases = (
+            ("low-dog", 30.0, 17.0),
+            ("low-fav", 30.0, -17.0),
+            ("high-dog", 60.0, 17.0),
+            ("high-fav", 60.0, -17.0),
+        )
+        for label, total, spread in cases:
+            home_pts = (total - spread) / 2.0
+            away_pts = (total + spread) / 2.0
+            players = []
+            for team, opponent, implied, opp, home in (
+                ("DET", "GB", home_pts, away_pts, True),
+                ("GB", "DET", away_pts, home_pts, False),
+            ):
+                game = "%s@%s" % (opponent, team) if home else "%s@%s" % (team, opponent)
+                common = dict(
+                    team=team,
+                    opponent=opponent,
+                    game=game,
+                    implied_total=implied,
+                    implied_opp=opp,
+                    total=total,
+                    spread=spread if home else -spread,
+                )
+                players.append(
+                    _pl(
+                        pid="%s-%s-qb" % (label, team),
+                        name="%s QB" % team,
+                        position="QB",
+                        salary=8000,
+                        depth_rank=1,
+                        **common,
+                    )
+                )
+                players.append(
+                    _pl(
+                        pid="%s-%s-backup" % (label, team),
+                        name="%s Backup" % team,
+                        position="QB",
+                        salary=5000,
+                        depth_rank=2,
+                        **common,
+                    )
+                )
+                players.append(
+                    _pl(
+                        pid="%s-%s-wr" % (label, team),
+                        name="%s WR" % team,
+                        position="WR",
+                        salary=7000,
+                        depth_rank=1,
+                        **common,
+                    )
+                )
+            # No QB on KC. BUF is a DEF-only entry in the same game.
+            # FA is on the card but not one of the teams in the lines.
+            players.append(
+                _pl(
+                    pid="%s-kc-wr" % label,
+                    name="KC WR",
+                    position="WR",
+                    salary=6000,
+                    team="KC",
+                    opponent="BUF",
+                    game="BUF@KC",
+                    implied_total=21.0,
+                    implied_opp=24.0,
+                    total=45.0,
+                    spread=-3.0,
+                    depth_rank=1,
+                )
+            )
+            players.append(
+                _pl(
+                    pid="%s-buf-def" % label,
+                    name="BUF DEF",
+                    position="DEF",
+                    salary=4000,
+                    team="BUF",
+                    opponent="KC",
+                    game="BUF@KC",
+                    implied_total=24.0,
+                    implied_opp=21.0,
+                    total=45.0,
+                    spread=3.0,
+                    depth_rank=None,
+                )
+            )
+            players.append(
+                _pl(
+                    pid="%s-fa-wr" % label,
+                    name="FA WR",
+                    position="WR",
+                    salary=4500,
+                    team="FA",
+                    opponent="DET",
+                    game="GB@DET",
+                    implied_total=18.0,
+                    implied_opp=22.0,
+                    total=total,
+                    spread=spread,
+                    depth_rank=1,
+                )
+            )
+            played = simulate_games(players, n=200, seed=1, sim_mode="team")
+            for pid, draws in played.draws.items():
+                self.assertEqual(len(draws), 200, pid)
+                for value in draws:
+                    self.assertTrue(math.isfinite(value), "%s %s" % (label, pid))
+                    if not pid.endswith("-def"):
+                        self.assertGreaterEqual(value, 0.0, "%s %s" % (label, pid))
+            for _game, _away, _home, away_pts, home_pts in played.game_draws:
+                self.assertTrue(math.isfinite(away_pts) and math.isfinite(home_pts))
+                self.assertGreaterEqual(away_pts, 3.0)
+                self.assertGreaterEqual(home_pts, 3.0)
+            self.assertEqual(played.by_pid["%s-DET-backup" % label].mean, 0.0)
+
+    def test_team_mode_means_stay_near_the_default(self) -> None:
+        det, det_weeks = _team_mode_side("DET", "GB", True)
+        gb, gb_weeks = _team_mode_side("GB", "DET", False)
+        players = det + gb
+        inputs = SimInputs(targets=tuple(det_weeks + gb_weeks))
+        off = simulate_games(players, n=4000, seed=1, inputs=inputs, sim_mode="off")
+        team = simulate_games(
+            players, n=4000, seed=1, inputs=inputs, sim_mode="team"
+        )
+        for player in players:
+            base = off.by_pid[player.pid].mean
+            alt = team.by_pid[player.pid].mean
+            if abs(base) < 1e-9:
+                self.assertLess(abs(alt), 0.05, player.pid)
+                continue
+            gap = abs(alt - base) / abs(base)
+            self.assertLess(gap, 0.02, "%s base %s team %s" % (player.pid, base, alt))
+
+    def test_unknown_sim_mode_is_a_choke(self) -> None:
+        from nfl.optimize import main
+
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = main(["--csv", "missing.csv", "--sim-mode", "rates"])
+        self.assertEqual(code, 1)
+        self.assertIn("choke SIM_MODE", err.getvalue())
 
 
 if __name__ == "__main__":

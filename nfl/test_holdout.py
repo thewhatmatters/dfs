@@ -512,7 +512,15 @@ class ReportTest(unittest.TestCase):
                 prop_fetch=lambda season: ([], "props_closing: no rows"),
             )
         self.assertNotIn("scores", report)
+        self.assertNotIn("sim_mode", report)
         self.assertGreater(report["errors"]["full"]["board"]["QB"]["n"], 0)
+
+    def test_unknown_sim_mode_is_a_choke(self) -> None:
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = main(["--season", "2025", "--weeks", "2", "--sim-mode", "rates"])
+        self.assertEqual(code, 1)
+        self.assertIn("choke HOLDOUT", err.getvalue())
 
     def test_props_mae_sits_next_to_the_sim(self) -> None:
         def props(_season):

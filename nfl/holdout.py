@@ -33,7 +33,8 @@ for the board, the placeholder sim, and the data sim. It also reports sim
 calibration, game margin and total variance, role correlations, Spearman
 rank accuracy, a one-week ±10% sensitivity, and a props_closing baseline
 when that dataset has rows. ``props_closing`` starts at 2026 week 3; earlier
-seasons skip that section.
+seasons skip that section. ``--sim-mode team`` scores the opt-in team-score
+sim. The default ``off`` is the current draws.
 """
 
 from __future__ import annotations
@@ -87,6 +88,7 @@ from nfl.sim import GameSim, simulate_games
 from nfl.sim_efficiency import DataEfficiency, build_efficiency, resolve_run_efficiency
 from nfl.sim_feed import resolve_sim_inputs
 from nfl.sim_inputs import CarryWeek, SimInputError, SimInputs, TargetWeek, TeamStat
+from nfl.sim_team import parse_sim_mode
 from nfl.teams import UnmappedTeam, require_fd
 
 _POS_ORDER = ("QB", "RB", "WR", "TE", "DEF")
@@ -899,6 +901,7 @@ def _sensitivity(
     week: int,
     n: int,
     seed: int,
+    sim_mode: str = "off",
 ) -> dict:
     report = {}
     for kind in _SENSITIVITY:
@@ -913,6 +916,7 @@ def _sensitivity(
                 seed=seed,
                 inputs=bundle,
                 efficiency=model,
+                sim_mode=sim_mode,
             )
             buckets: dict[str, list[float]] = defaultdict(list)
             for pl in players:
@@ -1638,8 +1642,10 @@ def run_holdout(
     prop_fetch=None,
     draws_out: str | Path | None = None,
     metrics: bool = False,
+    sim_mode: str = "off",
 ) -> dict:
     """Score every requested week. Network stays inside ``load`` and props."""
+    score_mode = parse_sim_mode(sim_mode)
     if population not in ("pregame", "played"):
         raise ValueError("population must be pregame or played")
     seed_list = [int(item) for item in (seeds if seeds is not None else [seed])]
@@ -1740,6 +1746,7 @@ def run_holdout(
                 seed=int(primary),
                 inputs=loaded.sim_inputs,
                 efficiency=placeholder_model,
+                sim_mode=score_mode,
             )
             data_model, data_mode, data_note = resolve_run_efficiency(
                 "data",
@@ -1752,6 +1759,7 @@ def run_holdout(
                 seed=int(primary),
                 inputs=loaded.sim_inputs,
                 efficiency=data_model,
+                sim_mode=score_mode,
             )
             if data_note:
                 print(data_note, file=sys.stderr)
@@ -1770,6 +1778,7 @@ def run_holdout(
                             seed=int(seed_i),
                             inputs=loaded.sim_inputs,
                             efficiency=placeholder_model,
+                            sim_mode=score_mode,
                         ),
                         "sim_data": simulate_games(
                             players,
@@ -1777,6 +1786,7 @@ def run_holdout(
                             seed=int(seed_i),
                             inputs=loaded.sim_inputs,
                             efficiency=data_model,
+                            sim_mode=score_mode,
                         ),
                     }
                 )
@@ -2022,6 +2032,7 @@ def run_holdout(
                     week=int(week),
                     n=draws_n,
                     seed=int(primary),
+                    sim_mode=score_mode,
                 )
             if want_metrics:
                 for offset, seed_i in enumerate(seed_list):
@@ -2063,6 +2074,7 @@ def run_holdout(
         "n": draws_n,
         "seed": int(primary),
         "seeds": [int(item) for item in seed_list],
+        **({"sim_mode": score_mode} if score_mode != "off" else {}),
         "population": population,
         "join": join_counts,
         "kickoff": {
@@ -2217,6 +2229,8 @@ def format_report(report: dict) -> str:
             seed=report["seed"],
         )
     ]
+    if report.get("sim_mode") not in (None, "", "off"):
+        lines.append("sim-mode: %s" % report["sim_mode"])
     if report.get("seed_prior_season"):
         lines.append("seed-prior-season: on")
     else:
@@ -2558,6 +2572,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument(
+        "--sim-mode",
+        default="off",
+        help="off (default) keeps the current draws. team draws a joint "
+        "total and spread and scales production with the team score.",
+    )
+    ap.add_argument(
         "--seeds",
         default=None,
         help="comma-separated sim seeds, e.g. 1,2,3 (at most 5). "
@@ -2608,6 +2628,7 @@ def main(argv: list[str] | None = None) -> int:
         seasons = parse_seasons(args.seasons, args.season)
         weeks = parse_weeks(args.weeks)
         seeds = parse_seeds(args.seeds, args.seed)
+        parse_sim_mode(args.sim_mode)
     except ValueError as exc:
         print(f"choke HOLDOUT: {exc}", file=sys.stderr)
         return 1
@@ -2644,6 +2665,7 @@ def main(argv: list[str] | None = None) -> int:
                 sensitivity_week=args.sensitivity_week,
                 draws_out=draws_path,
                 metrics=want_metrics,
+                sim_mode=args.sim_mode,
             )
     except HoldoutMetricsError as exc:
         print(f"choke HOLDOUT_METRICS: {exc}", file=sys.stderr)
