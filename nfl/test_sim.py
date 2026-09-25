@@ -13,11 +13,14 @@ from nfl.players import Player
 from nfl.projections import POS_FD_SHARE, projection_board, prop_factor, week1_score
 from nfl.rules import DST_SACK_TO_PRIOR, FANDUEL_NFL, dst_projection
 from nfl.sim import (
+    GameSim,
+    SimStats,
     DEFAULT_DRAWS,
     SPREAD_SIGMA,
     TOTAL_SIGMA_FRAC,
     apply_ilp_objective,
     draw_simplex,
+    format_board_vs_sim,
     format_sim_diagnostic,
     game_sigmas,
     has_volume_props,
@@ -149,6 +152,32 @@ class FlagsTest(unittest.TestCase):
             _sim_n(parse_args(["--csv", "x.csv", "--sim", "0"])),
             0,
         )
+
+    def test_projection_source_defaults_to_board(self):
+        off = parse_args(["--csv", "x.csv"])
+        self.assertEqual(off.projection_source, "board")
+        self.assertEqual(_sim_n(off), 0)
+        chosen = parse_args(["--csv", "x.csv", "--projection-source", "sim"])
+        self.assertEqual(chosen.projection_source, "sim")
+        self.assertEqual(_sim_n(chosen), DEFAULT_DRAWS)
+        self.assertEqual(
+            _sim_n(
+                parse_args(
+                    ["--csv", "x.csv", "--projection-source", "sim", "--sim", "0"]
+                )
+            ),
+            DEFAULT_DRAWS,
+        )
+        self.assertEqual(
+            _sim_n(
+                parse_args(
+                    ["--csv", "x.csv", "--projection-source", "sim", "--sim", "400"]
+                )
+            ),
+            400,
+        )
+        with self.assertRaises(SystemExit):
+            parse_args(["--csv", "x.csv", "--projection-source", "fppg"])
 
     def test_cash_line_n_lineups_min_unique_defaults(self):
         off = parse_args(["--csv", "x.csv"])
@@ -1102,6 +1131,117 @@ class _RecordingYards:
         if opportunities.receiving is None:
             return 0.0
         return opportunities.receiving.rec_yd
+
+
+class ProjectionSourceTest(unittest.TestCase):
+    def test_sim_mean_replaces_ilp_objective_board_does_not(self):
+        pl = _pl(
+            pid="wr",
+            name="Alpha WR",
+            position="WR",
+            team="ARI",
+            implied_total=24.0,
+            depth_rank=1,
+        )
+        board = pl.objective
+        stats = {
+            pl.pid: SimStats(
+                mean=18.5,
+                p10=9.0,
+                p50=17.0,
+                p90=29.0,
+                n=100,
+                source="game",
+            )
+        }
+        kept = apply_ilp_objective(
+            [pl], "mean", sim_by_pid=stats, projection_source="board"
+        )
+        self.assertAlmostEqual(kept[0].objective, board, places=6)
+        swapped = apply_ilp_objective(
+            [pl], "mean", sim_by_pid=stats, projection_source="sim"
+        )
+        self.assertAlmostEqual(swapped[0].objective, 18.5, places=6)
+        self.assertAlmostEqual(pl.objective, board, places=6)
+        missing = apply_ilp_objective(
+            [pl], "mean", sim_by_pid={}, projection_source="sim"
+        )
+        self.assertAlmostEqual(missing[0].objective, board, places=6)
+        floor = apply_ilp_objective(
+            [pl], "floor", sim_by_pid=stats, projection_source="sim"
+        )
+        ceil = apply_ilp_objective(
+            [pl], "ceiling", sim_by_pid=stats, projection_source="board"
+        )
+        self.assertAlmostEqual(floor[0].objective, 9.0, places=6)
+        self.assertAlmostEqual(ceil[0].objective, 29.0, places=6)
+
+    def test_diagnostic_lists_largest_board_sim_gaps_first(self):
+        big = _pl(
+            pid="big",
+            name="Big Mover",
+            position="WR",
+            team="ARI",
+            implied_total=22.0,
+            depth_rank=1,
+        )
+        small = _pl(
+            pid="small",
+            name="Small Mover",
+            position="RB",
+            team="ARI",
+            implied_total=22.0,
+            depth_rank=1,
+        )
+        quiet = _pl(
+            pid="quiet",
+            name="Quiet",
+            position="TE",
+            team="ARI",
+            implied_total=22.0,
+            depth_rank=1,
+        )
+        small_board = float(small.objective or 0.0)
+        gs = GameSim(
+            by_pid={
+                "big": SimStats(
+                    mean=30.0, p10=12, p50=28, p90=40, n=50, source="game"
+                ),
+                "small": SimStats(
+                    mean=small_board + 0.4,
+                    p10=1,
+                    p50=small_board,
+                    p90=8,
+                    n=50,
+                    source="game",
+                ),
+                "quiet": SimStats(
+                    mean=float(quiet.objective or 0.0),
+                    p10=1,
+                    p50=2,
+                    p90=3,
+                    n=50,
+                    source="game",
+                ),
+            },
+            draws={},
+        )
+        text = format_board_vs_sim(
+            [quiet, small, big], gs, projection_source="board", limit=2
+        )
+        self.assertLess(text.find("Big Mover"), text.find("Small Mover"))
+        self.assertNotIn("Quiet", text)
+        self.assertIn("ILP mean uses board (week1_score)", text)
+        sim_text = format_board_vs_sim(
+            [big], gs, projection_source="sim", limit=1
+        )
+        self.assertIn(
+            "ILP mean uses sim mean; board stays week1_score for comparison",
+            sim_text,
+        )
+        full = format_sim_diagnostic([big, small], gs)
+        self.assertIn("board vs sim", full)
+        self.assertIn("Big Mover", full)
 
 
 class LiveShapeTest(unittest.TestCase):

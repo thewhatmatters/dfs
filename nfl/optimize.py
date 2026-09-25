@@ -88,6 +88,7 @@ from nfl.sim import (  # noqa: E402
     ILP_OBJECTIVES,
     SIM_OBJECTIVES,
     apply_ilp_objective,
+    format_board_vs_sim,
     format_correlation_summary,
     format_sim_diagnostic,
     sim_header,
@@ -410,8 +411,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--objective",
         choices=ILP_OBJECTIVES,
         default="mean",
-        help="ILP score: mean = week1_score (default; not sim p50); "
+        help="ILP score: mean = board or sim mean (--projection-source); "
         "floor = sim p10; ceiling = sim p90.",
+    )
+    ap.add_argument(
+        "--projection-source",
+        choices=("board", "sim"),
+        default="board",
+        help="What the ILP mean objective uses. board = week1_score "
+        "(default). sim = each player's simulated mean from the same "
+        "draws as floor/ceiling. Board proj stays for comparison. "
+        "Keep the default until layer 4 and a backtest.",
     )
     ap.add_argument(
         "--cash-line",
@@ -503,7 +513,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def _sim_n(args) -> int:
     n = int(args.sim or 0)
-    if args.objective in SIM_OBJECTIVES and n <= 0:
+    needs_sim = args.objective in SIM_OBJECTIVES or args.projection_source == "sim"
+    if needs_sim and n <= 0:
         return DEFAULT_DRAWS
     return n
 
@@ -895,6 +906,7 @@ def main(argv: list[str] | None = None) -> int:
             "sim": args.sim,
             "sim_seed": args.sim_seed,
             "objective": args.objective,
+            "projection_source": args.projection_source,
             "cash_line": args.cash_line,
             "n_lineups": args.n_lineups,
             "min_unique": args.min_unique,
@@ -943,24 +955,34 @@ def main(argv: list[str] | None = None) -> int:
             pool, n=sim_n, seed=args.sim_seed, inputs=sim_inputs
         )
         sim_by_pid = game_sim.by_pid
-        payload["sim_diagnostic"] = format_sim_diagnostic(pool, game_sim)
+        payload["sim_diagnostic"] = format_sim_diagnostic(
+            pool, game_sim, projection_source=args.projection_source
+        )
         print(
             format_correlation_summary(pool, game_sim, list_pairs=False),
+            file=sys.stderr,
+        )
+        print(
+            format_board_vs_sim(
+                pool, game_sim, projection_source=args.projection_source
+            ),
             file=sys.stderr,
         )
     board_mode = None
     board_rows: list[dict] = []
     if args.board:
         board_mode = "all" if args.board == "all" else "default"
+        # Proj column is week1_score. Build it before a sim-mean swap.
         board_rows = projection_board(
             pool, mode=board_mode, sim_by_pid=sim_by_pid or None
         )
         payload["board"] = board_rows
-    if args.objective in SIM_OBJECTIVES:
+    if args.projection_source == "sim" or args.objective in SIM_OBJECTIVES:
         pool = apply_ilp_objective(
             pool,
             args.objective,
             sim_by_pid=sim_by_pid,
+            projection_source=args.projection_source,
         )
     if args.n_lineups > 1:
         print(

@@ -25,8 +25,9 @@ fallback and do not add RNG draws.
 Not a play-by-play copula and not SaberSim.
 
 `--board` stays the point estimate (implied×depth×share×usage, ±20% prop tilt).
-Default ILP (`mean`) stays `week1_score` — not sim p50. `floor` /
-`ceiling` replace `Player.objective` with that player's sim p10 / p90.
+Default ILP (`mean`) stays `week1_score` (`--projection-source board`).
+`--projection-source sim` sets `mean` to each player's simulated mean.
+`floor` / `ceiling` replace `Player.objective` with that player's sim p10 / p90.
 Lineup Fl/Cl are the joint 9 (sum in the same world), not the sum of
 player p10s.
 """
@@ -45,6 +46,7 @@ from nfl.projections import (
     depth_prior,
     expected_snap_share,
     prop_factor,
+    score_player,
     usage_factor,
 )
 from nfl.rules import DST_SACK_TO_PRIOR, FANDUEL_NFL, dst_pa_points, dst_projection
@@ -336,21 +338,33 @@ def apply_ilp_objective(
     sim_by_pid: dict[str, SimStats] | None = None,
     lean_pids: frozenset[str] | None = None,
     lean_mult: float = 1.0,
+    projection_source: str = "board",
 ) -> list[Player]:
     """Set each player's ILP `objective`.
 
-    `mean`: leave `week1_score`.
-    `floor` / `ceiling`: sim p10 / p90. Optional `lean_mult` for `lean_pids`
-    (do not double-apply on mean). Ceiling stays p90 (not NCAAF p99).
+    `mean` + `board` (default): leave `week1_score`.
+    `mean` + `sim`: that player's simulated mean. Missing sim stats keep
+    the board score.
+    `floor` / `ceiling`: sim p10 / p90 from the same draws, either source.
+    Optional `lean_mult` for `lean_pids` applies only to floor/ceiling.
+    Ceiling stays p90 (not NCAAF p99).
     """
     kind = (kind or "mean").lower()
-    if kind == "mean":
-        return list(players)
-    if kind not in SIM_OBJECTIVES:
+    source = (projection_source or "board").lower()
+    if source not in ("board", "sim"):
+        raise ValueError(f"unknown projection source {projection_source!r}")
+    if kind not in ILP_OBJECTIVES:
         raise ValueError(f"unknown objective {kind!r}")
+    if kind == "mean" and source != "sim":
+        return list(players)
     by_pid = sim_by_pid or {}
     leaned = lean_pids or frozenset()
-    attr = "p10" if kind == "floor" else "p90"
+    if kind == "floor":
+        attr = "p10"
+    elif kind == "ceiling":
+        attr = "p90"
+    else:
+        attr = "mean"
     out: list[Player] = []
     for pl in players:
         st = by_pid.get(pl.pid)
@@ -358,7 +372,7 @@ def apply_ilp_objective(
             out.append(pl)
             continue
         val = float(getattr(st, attr))
-        if pl.pid in leaned:
+        if kind != "mean" and pl.pid in leaned:
             val *= lean_mult
         if val != pl.objective:
             out.append(replace(pl, objective=val))
@@ -746,8 +760,58 @@ def pearson(xs: list[float], ys: list[float]) -> float:
     return 0.0 if den == 0 else num / den
 
 
-def format_sim_diagnostic(players: list[Player], game_sim: GameSim) -> str:
-    """Per-player p10/p50/p90 plus same-team QB–WR and WR–WR correlations."""
+def format_board_vs_sim(
+    players: list[Player],
+    game_sim: GameSim,
+    *,
+    projection_source: str = "board",
+    limit: int = 8,
+) -> str:
+    """Largest |sim mean − week1 board| gaps.
+
+    Board is ``score_player`` (week1_score), not the ILP objective, so the
+    comparison still holds after ``--projection-source sim`` replaces it.
+    """
+    ranked: list[tuple[float, float, float, float, Player]] = []
+    for pl in players:
+        st = game_sim.by_pid.get(pl.pid)
+        if st is None:
+            continue
+        board = float(score_player(pl))
+        delta = float(st.mean) - board
+        ranked.append((abs(delta), delta, board, float(st.mean), pl))
+    ranked.sort(key=lambda row: (-row[0], row[4].pid))
+    shown = ranked[: max(0, int(limit))]
+    lines = [
+        f"board vs sim (top {len(shown)} movers by |sim mean − board|)",
+        "player  pos team     board     sim    delta",
+    ]
+    for _abs, delta, board, mean, pl in shown:
+        lines.append(
+            f"{pl.name}  {pl.position:<3} {(pl.team or ''):<5} "
+            f"{board:7.2f} {mean:7.2f} {delta:+7.2f}"
+        )
+    if not shown:
+        lines.append("(no sim rows)")
+    source = (projection_source or "board").lower()
+    if source == "sim":
+        lines.append(
+            "ILP mean uses sim mean; board stays week1_score for comparison"
+        )
+    else:
+        lines.append(
+            "ILP mean uses board (week1_score); sim mean is descriptive"
+        )
+    return "\n".join(lines)
+
+
+def format_sim_diagnostic(
+    players: list[Player],
+    game_sim: GameSim,
+    *,
+    projection_source: str = "board",
+) -> str:
+    """Per-player p10/p50/p90, correlations, and board-vs-sim movers."""
     lines = ["player  pos team     p10    p50    p90"]
     ordered = sorted(
         players,
@@ -768,6 +832,12 @@ def format_sim_diagnostic(players: list[Player], game_sim: GameSim) -> str:
         )
     lines.append("")
     lines.append(format_correlation_summary(players, game_sim))
+    lines.append("")
+    lines.append(
+        format_board_vs_sim(
+            players, game_sim, projection_source=projection_source
+        )
+    )
     return "\n".join(lines)
 
 

@@ -4,15 +4,23 @@
 
 This is not a play-by-play model and not a sportsbook scrape. The sim never calls the network. Weekly inputs are a local JSON file or in-memory rows. Gangstash `/data` readers are a separate client; this page is only the shape the sim consumes.
 
-## What the ILP still optimizes
+## What the ILP optimizes
 
-| Objective | Score |
-|-----------|--------|
-| `mean` (default) | `week1_score`: implied total × depth prior × position share × usage, ±20% prop tilt. Unchanged by the sim. |
-| `floor` | that player's sim p10 |
-| `ceiling` | that player's sim p90 |
+`--projection-source` chooses the `mean` score. Default is `board`.
 
-`--board` stays the point estimate. Sim columns (`mean`, `p10`, `p50`, `p90`) are descriptive. `Player.objective` is replaced only for `floor` and `ceiling`.
+| Objective | `board` (default) | `sim` |
+|-----------|-------------------|--------|
+| `mean` | `week1_score`: implied total × depth prior × position share × usage, ±20% prop tilt | that player's simulated mean FD points |
+| `floor` | that player's sim p10 | that player's sim p10 |
+| `ceiling` | that player's sim p90 | that player's sim p90 |
+
+`--projection-source sim` runs the Monte Carlo even when `--sim` is omitted (same as `floor` / `ceiling`). `--sim 0` does not turn that off. A player with no sim row keeps `week1_score`.
+
+The board point estimate stays `week1_score`. `--board` still prints it in the proj column (built before the objective swap). `lineup_proj` is still the sum of `week1_score`. The diagnostic lists the largest `|sim mean − board|` gaps and says which source the ILP mean is using.
+
+Leave the default at `board` until layer 4 (prop-calibrated efficiency and TDs) and a backtest against gangstash `player_stats_weekly` `fd_points` show the sim is at least as accurate as the board.
+
+JSON `flags.projection_source` is `board` or `sim`. The top-level `projection_source` string is still the Vegas / week-1 description, not this flag.
 
 ## Layers
 
@@ -159,7 +167,7 @@ No `--sim-inputs`, or inputs that do not match anyone's name:
 
 ## Diagnostic
 
-`format_sim_diagnostic` prints each player's p10 / p50 / p90 and a same-team correlation block.
+`format_sim_diagnostic` prints each player's p10 / p50 / p90, a same-team correlation block, and the largest board-vs-sim gaps (`score_player` vs sim mean).
 
 Two summaries:
 
