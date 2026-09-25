@@ -107,7 +107,7 @@ class PickerTableTest(unittest.TestCase):
         self.assertIn("18.2", text)
         self.assertIn("Props", text)
         self.assertIn("Sources", text)
-        self.assertIn("ourlads/odds-props", text)
+        self.assertIn("ourlads/gs-props", text)
         self.assertIn("ourlads/lineups-tgt/lineups-snap", text)
         self.assertIn("vegas-dst", text)
         self.assertIn("Joe Burrow (*)", text)
@@ -155,7 +155,7 @@ class PickerTableTest(unittest.TestCase):
         )
         self.assertEqual(
             format_picker_sources({"position": "QB", "prop_status": "props"}),
-            "odds-props",
+            "gs-props",
         )
         self.assertEqual(
             format_picker_sources(
