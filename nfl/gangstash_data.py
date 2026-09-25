@@ -669,7 +669,9 @@ def fetch_team_stats(
     refresh: bool = False,
     cache_day: date | None = None,
 ) -> tuple[list[dict], dict]:
-    """Season team stats. Cached only — not an optimizer input.
+    """Season team stats. Not an ILP input.
+
+    `--sim` reads these rows for EPA variance and pass rate. `week1_score` does not.
 
     Sends `season_type=REG` unless overridden. Rows stay raw.
     """

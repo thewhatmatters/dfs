@@ -55,7 +55,7 @@ Gangstash `offense_pct` is a 0–1 fraction, the same scale as Lineups
 30% target share ([`snaps.md`](snaps.md)). Projection math, ILP rules, and
 exposure logic are unchanged.
 
-Team stats are fetch/cache only (not an optimize input):
+Team stats are not an ILP input. `--sim` reads the season offense and defense rows (EPA sums, `neutral_pass_rate`, `proe`) and, when a week window is set, weekly rates. `week1_score` does not. Cache them on their own with:
 
 ```
 python3 -m nfl.gangstash_data team-stats --season 2026 --side offense

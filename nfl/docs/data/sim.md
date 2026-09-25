@@ -116,6 +116,26 @@ points(rng, player, OpportunityCount(pass_attempts, targets, rushes)) -> float
 
 Until then, a catcher's points are linear in his targets, which is why the share draw shows up cleanly in the correlations. A leading script also pushes rush points up and pass points down, so an RB can move against his QB even though they share the game.
 
+## Gangstash feed
+
+When `--sim` runs and `--sim-inputs` is omitted, `nfl/sim_feed.py` builds `SimInputs` from the readers in `nfl/gangstash_data.py` (same-day cache, then live, then a stale cache). `week1_score` does not read these rows.
+
+| Sim use | Dataset | What is kept |
+|---------|---------|----------------|
+| EPA variance | `team_stats`, season, offense and defense | raw `n`, `epa_sum`, `epa_sq_sum` (pass/rush sums only if the overall sums are missing) |
+| Neutral pass rate and PROE | same season rows | `neutral_pass_rate`, `proe`, `pass_rate` |
+| Recent script | `team_stats_weekly` for `--targets-weeks`, or `--targets-week` | averages those three rates onto the matching team/side. EPA sums stay seasonal. Skipped when no week is set (the weekly query requires `week`) |
+| Target shares | `targets`, that same week list, or every week the season query returns | one player-week each, not the single-share usage aggregate |
+| RB rush shares | `snaps`, same window, `position=RB` | `offense_pct` |
+
+No key and no cache for every dataset prints one line and keeps role shares:
+
+```
+sim inputs: gangstash unavailable — role shares deterministic
+```
+
+A partial board is used. `--sim-inputs PATH` does not call gangstash.
+
 ## Fallback
 
 No `--sim-inputs`, or inputs that do not match anyone's name:
