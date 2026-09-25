@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import io
 import json
 import unittest
+from contextlib import redirect_stderr
 from datetime import date
 from unittest.mock import patch
 
+from nfl.backtest import players_from_depth_chart
 from nfl.players import Player
 from nfl.projections import week1_score
 from nfl.publish_projections import (
@@ -21,11 +24,14 @@ from nfl.publish_projections import (
     maybe_sim,
     parse_args,
     post_projection_rows,
+    _team_lines,
     projection_rows,
     resolve_nfl_week,
     summarize,
     write_local,
 )
+from nfl.sim import simulate_games
+from nfl.snaps import SnapWeekRow
 from nfl.targets import TargetWeekRow
 
 
@@ -810,6 +816,295 @@ class ReportFlagTest(unittest.TestCase):
             rc = main(["--report", "--sim", "10"])
         self.assertEqual(rc, 1)
         write.assert_not_called()
+
+
+def _no_ari_line() -> dict:
+    return {
+        "game_id": "2025_05_ARI_NO",
+        "season": 2025,
+        "week": 5,
+        "commence_time": "2025-10-05T17:00:00Z",
+        "home_team_fd": "NO",
+        "away_team_fd": "ARI",
+        "spread": -3.0,
+        "total": 45.0,
+        "home_moneyline": -160,
+        "away_moneyline": 140,
+    }
+
+
+def _board_rows(depth: list[dict], **kwargs) -> list[dict]:
+    entries = build_entries([_no_ari_line()], depth, **kwargs)
+    return projection_rows(
+        entries,
+        season=2025,
+        week=5,
+        season_type="REG",
+        run_at="2025-10-05T16:00:00+00:00",
+        model_version="fixture",
+    )
+
+
+def _row_bytes(rows: list[dict]) -> dict[tuple, str]:
+    out = {}
+    for row in rows:
+        if row.get("model") != "board":
+            continue
+        key = (row.get("player_name"), row.get("team"), row.get("position"))
+        out[key] = json.dumps(row, sort_keys=True, separators=(",", ":"))
+    return out
+
+
+class DuplicateDepthPidTest(unittest.TestCase):
+    """One player id on two depth rows is one pool row.
+
+    Mocks the 2025 Taysom Hill chart (QB2 and TE2). No gangstash call.
+    """
+
+    def _depth(self) -> list[dict]:
+        return [
+            _depth("Derek Carr", "NO", "QB", 1, "pid-carr"),
+            _depth("Taysom Hill", "NO", "QB", 2, "pid-hill"),
+            _depth("Taysom Hill", "NO", "TE", 2, "pid-hill"),
+            _depth("Alvin Kamara", "NO", "RB", 1, "pid-kamara"),
+            _depth("Kyler Murray", "ARI", "QB", 1, "pid-kyler"),
+        ]
+
+    def _usage(self):
+        targets = [
+            TargetWeekRow(
+                player="Taysom Hill",
+                team="NO",
+                position="TE",
+                week=4,
+                targets=4,
+                target_share=0.11,
+                targets_avg=4.0,
+                targets_total=4,
+                source="gangstash",
+                asof="2025-10-01",
+            ),
+            TargetWeekRow(
+                player="Alvin Kamara",
+                team="NO",
+                position="RB",
+                week=4,
+                targets=5,
+                target_share=0.14,
+                targets_avg=5.0,
+                targets_total=5,
+                source="gangstash",
+                asof="2025-10-01",
+            ),
+        ]
+        snaps = [
+            SnapWeekRow(
+                player="Taysom Hill",
+                team="NO",
+                position="TE",
+                week=4,
+                snaps=28,
+                snap_share=0.42,
+                snaps_avg=28.0,
+                snaps_total=28,
+                team_snap_pct=None,
+                source="gangstash",
+                asof="2025-10-01",
+            ),
+            SnapWeekRow(
+                player="Alvin Kamara",
+                team="NO",
+                position="RB",
+                week=4,
+                snaps=45,
+                snap_share=0.68,
+                snaps_avg=45.0,
+                snaps_total=45,
+                team_snap_pct=None,
+                source="gangstash",
+                asof="2025-10-01",
+            ),
+        ]
+        return targets, snaps
+
+    def test_duplicate_pid_one_player_and_one_draw_array(self) -> None:
+        n_draws = 40
+        targets, snaps = self._usage()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            entries = build_entries(
+                [_no_ari_line()],
+                self._depth(),
+                target_rows=targets,
+                snap_rows=snaps,
+            )
+        hills = [entry for entry in entries if entry.player.pid == "pid-hill"]
+        self.assertEqual(len(hills), 1)
+        hill = hills[0].player
+        self.assertEqual(hill.position, "TE")
+        self.assertEqual(hill.depth_rank, 2)
+        self.assertEqual(hill.target_share, 0.11)
+        self.assertEqual(hill.snap_share, 0.42)
+        self.assertEqual(
+            [entry.player.pid for entry in entries].count("pid-hill"),
+            1,
+        )
+        kamara = next(entry.player for entry in entries if entry.player.pid == "pid-kamara")
+        self.assertEqual(kamara.target_share, 0.14)
+        self.assertEqual(kamara.snap_share, 0.68)
+        text = err.getvalue()
+        self.assertIn(
+            "depth collapse pid-hill positions=QB,TE chose=TE",
+            text,
+        )
+        sim = simulate_games([entry.player for entry in entries], n=n_draws, seed=1)
+        self.assertEqual(len(sim.draws["pid-hill"]), n_draws)
+        self.assertEqual(len(sim.draws["pid-kamara"]), n_draws)
+        self.assertEqual(len(sim.draws["pid-carr"]), n_draws)
+
+        parsed = _team_lines([_no_ari_line()])
+        by_team = {team: pair[0] for team, pair in parsed.items()}
+        with redirect_stderr(io.StringIO()):
+            pool = players_from_depth_chart(self._depth(), by_team)
+        hill_rows = [pl for pl in pool if pl.pid == "pid-hill"]
+        self.assertEqual(len(hill_rows), 1)
+        self.assertEqual(hill_rows[0].position, "TE")
+        pool_sim = simulate_games(pool, n=n_draws, seed=2)
+        self.assertEqual(len(pool_sim.draws["pid-hill"]), n_draws)
+        self.assertEqual(
+            sum(1 for pl in pool if pl.pid == "pid-hill"),
+            1,
+        )
+
+    def test_qb1_never_demoted(self) -> None:
+        depth = [
+            _depth("Taysom Hill", "NO", "TE", 1, "pid-hill"),
+            _depth("Taysom Hill", "NO", "QB", 1, "pid-hill"),
+            _depth("Kyler Murray", "ARI", "QB", 1, "pid-kyler"),
+        ]
+        csv = [
+            Player(
+                pid="fd-hill",
+                name="Taysom Hill",
+                position="TE",
+                salary=5400,
+                team="NO",
+                opponent="ARI",
+                game="ARI@NO",
+                fppg=None,
+                injury="",
+                roster_position="TE",
+            )
+        ]
+        err = io.StringIO()
+        with redirect_stderr(err):
+            bare = build_entries([_no_ari_line()], depth)
+            listed = build_entries([_no_ari_line()], depth, csv_players=csv)
+        for entries in (bare, listed):
+            hills = [entry for entry in entries if entry.player.pid == "pid-hill"]
+            self.assertEqual(len(hills), 1)
+            self.assertEqual(hills[0].player.position, "QB")
+            self.assertEqual(hills[0].player.depth_rank, 1)
+        hill_entry = next(entry for entry in listed if entry.player.pid == "pid-hill")
+        self.assertIsNone(hill_entry.salary)
+        self.assertIsNone(hill_entry.fanduel_id)
+        self.assertIn("depth collapse pid-hill positions=TE,QB chose=QB", err.getvalue())
+
+    def test_fanduel_position_wins(self) -> None:
+        depth = [
+            _depth("Taysom Hill", "NO", "QB", 2, "pid-hill"),
+            _depth("Taysom Hill", "NO", "TE", 4, "pid-hill"),
+            _depth("Derek Carr", "NO", "QB", 1, "pid-carr"),
+            _depth("Kyler Murray", "ARI", "QB", 1, "pid-kyler"),
+        ]
+        csv = [
+            Player(
+                pid="fd-hill",
+                name="Taysom Hill",
+                position="TE",
+                salary=5400,
+                team="NO",
+                opponent="ARI",
+                game="ARI@NO",
+                fppg=None,
+                injury="",
+                roster_position="TE",
+            )
+        ]
+        err = io.StringIO()
+        with redirect_stderr(err):
+            by_rank = build_entries([_no_ari_line()], depth)
+            by_csv = build_entries([_no_ari_line()], depth, csv_players=csv)
+        rank_hill = next(entry for entry in by_rank if entry.player.pid == "pid-hill")
+        csv_hill = next(entry for entry in by_csv if entry.player.pid == "pid-hill")
+        self.assertEqual(len([e for e in by_csv if e.player.pid == "pid-hill"]), 1)
+        self.assertEqual(rank_hill.player.position, "QB")
+        self.assertEqual(rank_hill.player.depth_rank, 2)
+        self.assertEqual(csv_hill.player.position, "TE")
+        self.assertEqual(csv_hill.player.depth_rank, 4)
+        self.assertEqual(csv_hill.salary, 5400)
+        self.assertEqual(csv_hill.fanduel_id, "fd-hill")
+        self.assertIn("depth collapse pid-hill positions=QB,TE chose=TE", err.getvalue())
+        self.assertIn("depth collapse pid-hill positions=QB,TE chose=QB", err.getvalue())
+
+    def test_same_rank_tie_break(self) -> None:
+        cases = (
+            (("RB", 2, "WR", 2), "RB"),
+            (("WR", 2, "TE", 2), "TE"),
+            (("QB", 2, "WR", 2), "WR"),
+            (("QB", 2, "RB", 2), "RB"),
+        )
+        for (left, left_rank, right, right_rank), chosen in cases:
+            depth = [
+                _depth("Dual Skill", "NO", left, left_rank, "pid-dual"),
+                _depth("Dual Skill", "NO", right, right_rank, "pid-dual"),
+                _depth("Kyler Murray", "ARI", "QB", 1, "pid-kyler"),
+            ]
+            with redirect_stderr(io.StringIO()):
+                entries = build_entries([_no_ari_line()], depth)
+            hit = [entry for entry in entries if entry.player.pid == "pid-dual"]
+            self.assertEqual(len(hit), 1, chosen)
+            self.assertEqual(hit[0].player.position, chosen)
+            self.assertEqual(hit[0].player.depth_rank, 2)
+
+    def test_other_players_board_rows_are_byte_identical(self) -> None:
+        targets, snaps = self._usage()
+        kept = [
+            _depth("Derek Carr", "NO", "QB", 1, "pid-carr"),
+            _depth("Taysom Hill", "NO", "TE", 2, "pid-hill"),
+            _depth("Alvin Kamara", "NO", "RB", 1, "pid-kamara"),
+            _depth("Kyler Murray", "ARI", "QB", 1, "pid-kyler"),
+        ]
+        both = [
+            _depth("Derek Carr", "NO", "QB", 1, "pid-carr"),
+            _depth("Taysom Hill", "NO", "QB", 2, "pid-hill"),
+            _depth("Taysom Hill", "NO", "TE", 2, "pid-hill"),
+            _depth("Alvin Kamara", "NO", "RB", 1, "pid-kamara"),
+            _depth("Kyler Murray", "ARI", "QB", 1, "pid-kyler"),
+        ]
+        kwargs = {"target_rows": targets, "snap_rows": snaps}
+        with redirect_stderr(io.StringIO()):
+            baseline = _row_bytes(_board_rows(kept, **kwargs))
+            collapsed = _row_bytes(_board_rows(both, **kwargs))
+        self.assertEqual(collapsed, baseline)
+        others = {key: value for key, value in collapsed.items() if key[0] != "Taysom Hill"}
+        self.assertGreaterEqual(len(others), 4)
+        for key, blob in others.items():
+            self.assertEqual(blob, baseline[key])
+
+    def test_missing_player_id_is_not_collapsed(self) -> None:
+        depth = [
+            _depth("Two Names", "NO", "QB", 2, None),
+            _depth("Two Names", "NO", "TE", 2, None),
+            _depth("Kyler Murray", "ARI", "QB", 1, "pid-kyler"),
+        ]
+        err = io.StringIO()
+        with redirect_stderr(err):
+            entries = build_entries([_no_ari_line()], depth)
+        rows = [entry for entry in entries if entry.player.name == "Two Names"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual({entry.player.position for entry in rows}, {"QB", "TE"})
+        self.assertNotIn("depth collapse", err.getvalue())
 
 
 if __name__ == "__main__":
