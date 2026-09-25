@@ -24,6 +24,8 @@ from nfl.gangstash_data import (
     parse_snap_row,
     parse_target_row,
 )
+from nfl.injuries import POOL_OUT_CODES, injury_code
+from nfl.players import Player
 from nfl.sim_inputs import (
     SimInputs,
     TeamStat,
@@ -40,6 +42,43 @@ UNAVAILABLE_NOTE = (
 _RATE_FIELDS = ("pass_rate", "neutral_pass_rate", "proe")
 # WOPR = 1.5 * target_share + 0.7 * air_yards_share. Divide to recover a share.
 WOPR_SHARE_DIVISOR = 2.2
+
+
+def load_week_injuries(
+    *,
+    season: int,
+    week: int,
+    refresh: bool = False,
+):
+    """Current-week ``dataset=injuries`` rows and cache meta.
+
+    Point-in-time ``injury_snapshots`` (an ``as_of`` read that skips
+    ``is_baseline``) is not on this revision. The nightly path uses the
+    week feed. Rows stay raw.
+    """
+    from nfl.gangstash_data import fetch_week_injuries
+
+    return fetch_week_injuries(season=season, week=week, refresh=refresh)
+
+
+def sim_pool(players: list[Player]) -> list[Player]:
+    """Players the nightly sim scores.
+
+    Out, IR, NA, and suspended players are omitted. Doubtful stays at
+    full value: the sim treats ``D`` as inactive, so the copy passed to
+    ``simulate_games`` has a blank injury. The published row still
+    carries ``D``. Questionable is unchanged.
+    """
+    kept: list[Player] = []
+    for pl in players:
+        code = injury_code(pl.injury)
+        if code in POOL_OUT_CODES:
+            continue
+        if code == "D":
+            kept.append(replace(pl, injury=""))
+            continue
+        kept.append(pl)
+    return kept
 
 
 def resolve_sim_inputs(

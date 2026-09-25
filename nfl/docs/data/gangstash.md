@@ -168,14 +168,22 @@ an error. A simple file (no nflverse schedule columns) still errors on a
 column the reader does not know.
 
 **`injuries`:** live. `season` is required. `week`, `team`, `gsis_id`, and
-`status` are optional. Rows carry `player_id`. The backtest stamps the
-week onto the pool (id match, then team and name). `O`, `D`, `IR`, and
-`NA` are out of the sim's target and rush shares and hand the chart slot
-to the next healthy player. `Q` keeps the pre-game projection. A FanDuel
-CSV still has its Injury Indicator. A failed injuries fetch on a CSV pool
-is not listed as missing. No-CSV mode has no indicator column, so a failed
-fetch is `missing: injuries` and does not stop the week. An Unknown dataset
-on a CSV pool is still a quiet skip.
+`status` are optional query filters. Live rows use `full_name`,
+`report_status`, `gsis_id`, and `player_key` (`practice_status` and
+`date_modified` are stored by the feed and ignored here). Older rows used
+`player_name` / `status` / `player_id`. The parser accepts both. Match
+is `gsis_id` or `player_key`, then team and name. The backtest stamps
+the week onto the pool. `O`, `D`, `IR`, and `NA` are out of the sim's
+target and rush shares and hand the chart slot to the next healthy
+player. `Q` keeps the pre-game projection. Nightly projections read this
+week feed (not `injury_snapshots`): `O` / `IR` / `NA` leave the sim at
+mean 0 and the next charted player inherits that role's usage; `D` stays
+at full value and is flagged; `Q` is unchanged. A FanDuel CSV `Injury
+Indicator` of `O` / `IR` / `NA` is the same drop when a CSV is supplied.
+A failed injuries fetch on a CSV pool is not listed as missing. No-CSV
+mode has no indicator column, so a failed fetch is `missing: injuries`
+and does not stop the week. An Unknown dataset on a CSV pool is still a
+quiet skip.
 
 **`depth_charts`** (latest ESPN via nflverse): `team`, `team_fd`, `pos_grp`,
 `pos_abb`, `pos_name`, `pos_slot`, `pos_rank`, `player_name`, `gsis_id`,

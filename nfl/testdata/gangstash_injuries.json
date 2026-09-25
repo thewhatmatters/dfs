@@ -1,0 +1,35 @@
+[
+  {
+    "season": 2026,
+    "week": 3,
+    "team": "KC",
+    "gsis_id": "00-0036322",
+    "player_key": "00-0036322",
+    "full_name": "Alpha Receiver",
+    "report_status": "Out",
+    "practice_status": "Did Not Participate In Practice",
+    "date_modified": "2026-09-24T15:04:00Z"
+  },
+  {
+    "season": 2026,
+    "week": 3,
+    "team": "BUF",
+    "gsis_id": "00-0034796",
+    "player_key": "buf-qb-key",
+    "full_name": "Questionable Quarterback",
+    "report_status": "Questionable",
+    "practice_status": "Limited Participation In Practice",
+    "date_modified": "2026-09-24T15:04:00Z"
+  },
+  {
+    "season": 2026,
+    "week": 3,
+    "team": "KC",
+    "gsis_id": "00-0035228",
+    "player_key": "kc-wr-doubtful",
+    "full_name": "Doubtful Receiver",
+    "report_status": "Doubtful",
+    "practice_status": "Did Not Participate In Practice",
+    "date_modified": "2026-09-24T15:04:00Z"
+  }
+]
