@@ -26,7 +26,7 @@ NFL path is flags-only.
 - 2026-09-06: **No interview / question card.** NCAAF TUI grill does not
   apply. Solve with `--sim` (mean default). GPP/ceiling → `--objective=ceiling`.
   `n-lineups` only if the user named a count. Cached props; no
-  `--refresh-props` unless asked. Uploads: `nfl/export/` when n>1.
+  `--refresh-props` unless asked. Uploads: `nfl/export/` only with `--export` or `--upload`.
 - 2026-09-06: **`--bring-back=N` default 0.** House term: opposing pass
   game vs our QB stack (WR/TE, optionally the other QB). Not kick-return,
   not opponent DST. Mean cash and existing 150 ceiling uploads stay

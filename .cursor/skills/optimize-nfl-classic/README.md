@@ -8,7 +8,7 @@
 - A stderr table you can paste into chat (QB, RB, RB, WR, WR, WR, TE, FLEX, DEF; last column Sources)
 - Slate coverage via `--slate-status` / `python3 -m nfl.status` (JSON `slate_status`)
 - An exact ILP when PuLP is installed; an approximate greedy fill otherwise (labeled)
-- FanDuel upload CSV in `nfl/export/` when `--n-lineups>1`
+- FanDuel upload CSV in `nfl/export/` when `--export` or `--upload` is set
 - Multi-lineup **coverage** (default when n>1): `--max-exposure=0.60` so no player is in every 9; `--diversity=coverage` keeps lineup #1 on mean and tilts later 9s toward underused players. `--diversity=chalk --max-exposure=1 --min-unique=2` is the old “swap two seats” path
 
 ## How to run

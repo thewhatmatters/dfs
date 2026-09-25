@@ -170,6 +170,63 @@ def stamped_export_path(
     return folder / stamped_export_name(contest, objective, when)
 
 
+def slate_contest(players) -> str:
+    """Majority FanDuel contest prefix on player ids (`134251-129458` → `134251`)."""
+    from collections import Counter
+
+    counts: Counter[str] = Counter()
+    for player in players:
+        pid = getattr(player, "pid", None)
+        if pid is None and isinstance(player, dict):
+            pid = player.get("id") or player.get("pid") or ""
+        text = str(pid or "")
+        if "-" not in text:
+            continue
+        prefix = text.split("-", 1)[0].strip()
+        if prefix:
+            counts[prefix] += 1
+    if not counts:
+        return ""
+    return counts.most_common(1)[0][0]
+
+
+def template_contest_ids(rows: list[list[str]]) -> set[str]:
+    """Non-empty `contest_id` cells. Empty when the template has no such column."""
+    if not rows:
+        return set()
+    labels = [_cell(c) for c in rows[0]]
+    if "contest_id" not in labels:
+        return set()
+    idx = labels.index("contest_id")
+    out: set[str] = set()
+    for row in rows[1:]:
+        if idx < len(row):
+            val = _cell(row[idx])
+            if val:
+                out.add(val)
+    return out
+
+
+def contest_mismatch_message(
+    template_ids: set[str],
+    slate_contest_id: str,
+) -> str | None:
+    """Loud warning when the entries file is from a different contest.
+
+    No ids, or no slate contest, is not a mismatch. A template whose
+    contest ids are exactly the slate contest is quiet.
+    """
+    slate = (slate_contest_id or "").strip()
+    ids = {item for item in template_ids if item}
+    if not ids or not slate or ids == {slate}:
+        return None
+    shown = ", ".join(sorted(ids))
+    return (
+        f"WARNING: entries template contest_id ({shown}) does not match "
+        f"players CSV contest {slate}. Do not upload this file."
+    )
+
+
 def export_lineups(
     lineups: list[Lineup] | list[dict],
     *,
@@ -177,18 +234,27 @@ def export_lineups(
     contest: str,
     objective: str,
     upload: str | Path | None = None,
+    export: bool = False,
     when: datetime | None = None,
     export_dir: str | Path | None = None,
     contest_ids: set[str] | None = None,
     template: str | Path | None = None,
 ) -> dict[str, Path]:
-    """Stamped `nfl/export/` CSV when more than one 9; `--upload` path if set.
+    """Write an upload CSV only when `export` or `upload` is set.
 
-    `n_lineups=1` and a single 9: no auto-export unless `upload` is set.
+    `n_lineups` is kept for callers. It does not write a file. `export`
+    writes the stamped `nfl/export/` CSV. `upload` writes that path only.
     """
+    del n_lineups
     written: dict[str, Path] = {}
+    if not export and not upload:
+        return written
     n = len(lineups)
-    if n_lineups > 1 or n > 1:
+    template_rows = load_template_rows(template)
+    note = contest_mismatch_message(template_contest_ids(template_rows), contest)
+    if note:
+        print(note, file=sys.stderr)
+    if export:
         dest = stamped_export_path(
             contest, objective, when=when, export_dir=export_dir
         )

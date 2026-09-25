@@ -28,7 +28,7 @@ python3 -m ncaaf.optimize --csv ncaaf/data/<export>.csv --use-fppg   # prior sea
 python3 -m ncaaf.depth --csv ncaaf/data/<export>.csv                 # OurLads slate depth → ncaaf/data/depth.csv
 python3 -m nfl.optimize --csv "nfl/data/<players-list>.csv"          # FanDuel NFL classic
 python3 -m nfl.depth --csv "nfl/data/<players-list>.csv"             # OurLads NFL depth → nfl/data/depth.csv
-# NFL uploads: nfl/export/ when --n-lineups>1. Cached props; do not --refresh-props unless asked.
+# NFL uploads: nfl/export/ only with --export (or --upload PATH). Cached props; do not --refresh-props unless asked.
 # NCAAF player props: ODDS_API_KEY, cached, ~70 credits/slate (see ncaaf/docs/data/player-props.md)
 # NFL player props: GANGSTASH_API_KEY (see nfl/docs/data/player-props.md).
 # NFL optimize defaults to gangstash lines, targets, snaps, and depth (GANGSTASH_API_KEY).
@@ -60,7 +60,7 @@ Solve immediately with `python3 -m ncaaf.optimize --csv … --agent --interview-
 
 Stdin interview in `ncaaf/interview.py` is for CLI `python3 -m ncaaf.optimize` without `--agent` (real TTY) — not a question card. No curses TUI. `--interview-defaults` applies recommends even on a TTY.
 
-NFL (`/optimize-nfl-classic`): no interview / question card. Newest `nfl/data/FanDuel-NFL-*-players-list.csv`. `python3 -m nfl.optimize --csv …` (mean default is the sim, 10000 draws, `--sim-efficiency data`; lines/targets/snaps/depth default to gangstash). `--projection-source board` opts out. GPP / ceiling → `--objective=ceiling`. `n-lineups` only if the user named a count. Cached props; do not `--refresh-props`. Uploads: `nfl/export/` when n>1. `--bring-back` default 0. House max **3** per team (`--max-per-team=4` restores FanDuel lobby 4). `--stack-qb` on (2+ WR/TE from a team ⇒ that team's QB; `--stack-qb=off` disables). n>1 defaults `--max-exposure=0.60`, `--min-unique=3` vs every locked 9, `--diversity=coverage` (lineup #1 stays mean). `--max-exposure=1 --diversity=chalk --min-unique=2` restores chalk lock-in.
+NFL (`/optimize-nfl-classic`): no interview / question card. Newest `nfl/data/FanDuel-NFL-*-players-list.csv`. `python3 -m nfl.optimize --csv …` (mean default is the sim, 10000 draws, `--sim-efficiency data`; lines/targets/snaps/depth default to gangstash). `--projection-source board` opts out. GPP / ceiling → `--objective=ceiling`. `n-lineups` only if the user named a count. Cached props; do not `--refresh-props`. Uploads: `nfl/export/` only with `--export` or `--upload` (n>1 does not write a file). `--bring-back` default 0. House max **3** per team (`--max-per-team=4` restores FanDuel lobby 4). `--stack-qb` on (2+ WR/TE from a team ⇒ that team's QB; `--stack-qb=off` disables). n>1 defaults `--max-exposure=0.60`, `--min-unique=3` vs every locked 9, `--diversity=coverage` (lineup #1 stays mean). `--max-exposure=1 --diversity=chalk --min-unique=2` restores chalk lock-in.
 
 ## Do not
 
@@ -73,4 +73,4 @@ NFL (`/optimize-nfl-classic`): no interview / question card. Newest `nfl/data/Fa
 
 ## After a slate run
 
-Record the CSV filename, solver method (`pulp-cbc` vs `greedy`), and whether the lobby matched `ncaaf/docs/sites/fanduel-ncaaf.md` (or `nfl/docs/sites/fanduel-nfl.md`). If FanDuel changed a rule, update the doc + `rules.py` in the same change. NFL uploads land in `nfl/export/`.
+Record the CSV filename, solver method (`pulp-cbc` vs `greedy`), and whether the lobby matched `ncaaf/docs/sites/fanduel-ncaaf.md` (or `nfl/docs/sites/fanduel-nfl.md`). If FanDuel changed a rule, update the doc + `rules.py` in the same change. NFL uploads land in `nfl/export/` when `--export` or `--upload` is set.

@@ -250,6 +250,7 @@ class FlagsTest(unittest.TestCase):
         with self.assertRaises(SystemExit):
             parse_args(["--csv", "x.csv", "--snaps-week", "0"])
         self.assertIsNone(off.upload)
+        self.assertFalse(off.export)
         custom = parse_args(
             [
                 "--csv",
