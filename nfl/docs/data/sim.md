@@ -18,7 +18,7 @@ This is not a play-by-play model and not a sportsbook scrape. The sim never call
 
 The board point estimate stays `week1_score`. `--board` still prints it in the proj column (built before the objective swap). `lineup_proj` is still the sum of `week1_score`. The diagnostic lists the largest `|sim mean − board|` gaps and says which source the ILP mean is using.
 
-Leave the default at `board` until layer 4 (prop-calibrated efficiency and TDs) and a backtest against gangstash `player_stats_weekly` `fd_points` show the sim is at least as accurate as the board.
+Leave the default at `board` until layer 4 (prop-calibrated efficiency and TDs) and a backtest against gangstash `player_stats_weekly` `fd_points` show the sim is at least as accurate as the board. Why a board-optimal lineup sums near 70 while cash scores 120–130: [`projection-scale.md`](projection-scale.md). Shares and the ±20% prop cap are unchanged.
 
 JSON `flags.projection_source` is `board` or `sim`. The top-level `projection_source` string is still the Vegas / week-1 description, not this flag.
 
@@ -120,7 +120,9 @@ Players with no target weeks stay on the deterministic role share, including an 
 
 `PlaceholderEfficiency` in `nfl/sim_efficiency.py` turns opportunities into expected FanDuel points: yards per target / rush and TD rates, plus the 100- and 300-yard bonuses when that expectation crosses the line. It does **not** consume the RNG and it does **not** calibrate medians to prop lines.
 
-`receiving_line(rng, position, targets)` realizes one allocation. Catcher points use that line. QB passing yards and TDs sum the lines from the same world, including the other bucket (WR rates). A standalone `points` call with no `team_receiving` still uses `7.1` yards per attempt so single-player checks keep a QB formula.
+`receiving_line(rng, position, targets)` realizes one allocation and samples receiving yards around that conditional mean (`sigma = max(12, 0.22 × mean)`). Catcher points use that sampled line. QB passing yards and TDs sum the same lines, including the other bucket. A 300-yard passing bonus or a 100-yard rush/rec bonus is +3 only in games whose sampled yards clear the line. It is not `3 × P(clear)` added to every draw, and it is not a cliff on the mean yards. A standalone `points` call with no `team_receiving` samples passing yards around `7.1` yards per attempt.
+
+Fumbles lost, two-point conversions, and return TDs are in `skill_fd_points` (the lobby table). This placeholder does not draw them. DEF in the sim is still the points-allowed bucket plus the +3 sack/turnover prior, not a sack-by-sack draw.
 
 Layer 4 replaces this class. The calls are:
 
@@ -189,4 +191,4 @@ Fixture: `nfl/testdata/sim_layers.json` (DET offense/defense EPA sums, four week
 
 ## Seeds
 
-One `random.Random(seed)` for the slate. Games run in game-id order, players in pid order. Inside an opportunity team the order is: plays gaussian, target-share gammas (pid order, then the other bucket), rush-share gammas only when snaps exist, then receiving lines in that same catcher order (other bucket last). The placeholder receiving line does not call the RNG, so share draws match the previous seed. Empty inputs add no draws beyond the total and the spread, so seeds match the pre-layer sim.
+One `random.Random(seed)` for the slate. Games run in game-id order, players in pid order. Inside an opportunity team the order is: plays gaussian, target-share gammas (pid order, then the other bucket), rush-share gammas only when snaps exist, then one yards gaussian per receiving line (catchers, then the other bucket). Scoring then draws rush yards when that player has rushes. Share draws stay on the gamma sequence. Empty inputs add no draws beyond the total and the spread.

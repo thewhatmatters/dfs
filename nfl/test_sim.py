@@ -1133,6 +1133,107 @@ class _RecordingYards:
         return opportunities.receiving.rec_yd
 
 
+class SampledBonusTest(unittest.TestCase):
+    def test_bonus_fires_per_draw_not_on_the_mean(self):
+        """Expected pass yards sit under 300. Some games still clear it."""
+        from nfl.rules import skill_fd_points
+        from nfl.sim_efficiency import sample_yards
+
+        att = 280.0 / PASS_YPA  # conditional mean is 280, under the bonus
+        mean_yds = att * PASS_YPA
+        qb = _pl(pid="qb", name="QB", position="QB", salary=8000)
+        eff = PlaceholderEfficiency()
+        bonus_games = 0
+        quiet_games = 0
+        for i in range(400):
+            rng = random.Random(i)
+            pts = eff.points(
+                rng, qb, OpportunityCount(pass_attempts=att, rushes=0.0)
+            )
+            yds = sample_yards(random.Random(i), mean_yds)
+            quiet = skill_fd_points(
+                pass_yd=yds,
+                pass_td=att * 0.045,
+                interceptions=att * INT_RATE,
+            )
+            # Recompute with the same seed the points() call used.
+            self.assertAlmostEqual(pts, max(0.0, quiet), places=5)
+            if yds >= 300.0:
+                bonus_games += 1
+                self.assertGreaterEqual(pts, quiet - 1e-6)
+                self.assertAlmostEqual(
+                    skill_fd_points(pass_yd=yds)
+                    - skill_fd_points(pass_yd=0)
+                    - yds * 0.04,
+                    3.0,
+                    places=6,
+                )
+            else:
+                quiet_games += 1
+                self.assertAlmostEqual(
+                    skill_fd_points(pass_yd=yds) - yds * 0.04, 0.0, places=6
+                )
+        self.assertGreater(bonus_games, 30)
+        self.assertGreater(quiet_games, 30)
+
+    def test_attached_line_bonus_is_the_realized_yards(self):
+        from nfl.rules import skill_fd_points
+
+        eff = PlaceholderEfficiency()
+        wr = _pl(pid="wr", name="WR", position="WR")
+        under = ReceivingLine(targets=8, receptions=5, rec_yd=99.9, rec_td=0.4)
+        over = ReceivingLine(targets=8, receptions=5, rec_yd=100.0, rec_td=0.4)
+        pts_under = eff.points(
+            random.Random(0),
+            wr,
+            OpportunityCount(targets=8, rushes=0.0, receiving=under),
+        )
+        pts_over = eff.points(
+            random.Random(0),
+            wr,
+            OpportunityCount(targets=8, rushes=0.0, receiving=over),
+        )
+        self.assertAlmostEqual(
+            pts_over - pts_under,
+            skill_fd_points(rec_yd=100, receptions=5, rec_td=0.4)
+            - skill_fd_points(rec_yd=99.9, receptions=5, rec_td=0.4),
+            places=5,
+        )
+        self.assertAlmostEqual(pts_over - pts_under, 0.01 + 3.0, places=4)
+
+
+class ValueReportTest(unittest.TestCase):
+    def test_cash_and_gpp_flags_use_salary_multiples(self):
+        from nfl.projections import format_value_report, value_flags
+
+        wr = _pl(pid="wr", name="Wideout", position="WR", salary=8000, depth_rank=1)
+        # Board multiple is week1, not a hard-coded 16. Flags below use explicit points.
+        both = value_flags(
+            "WR", proj=16.0, salary=8000, p10=16.0, mean=18.0, p90=24.0
+        )
+        self.assertAlmostEqual(both["multiple"], 2.0, places=3)
+        self.assertTrue(both["cash_ok"])
+        self.assertTrue(both["gpp_ok"])
+        self.assertTrue(both["gpp_3x"])
+        thin_floor = value_flags(
+            "WR", proj=16.0, salary=8000, p10=10.0, mean=18.0, p90=19.0
+        )
+        self.assertFalse(thin_floor["cash_ok"])
+        self.assertFalse(thin_floor["gpp_ok"])
+        qb = value_flags("QB", proj=16.8, salary=8000)
+        self.assertAlmostEqual(qb["multiple"], 2.1, places=3)
+        self.assertFalse(qb["cash_ok"])
+        te = value_flags("TE", proj=6.0, salary=4000)
+        self.assertAlmostEqual(te["multiple"], 1.5, places=3)
+        self.assertTrue(te["cash_ok"])
+        dst = value_flags("D", proj=4.0, salary=3500)
+        self.assertTrue(dst["cash_ok"])
+        text = format_value_report([wr])
+        self.assertIn("Wideout", text)
+        self.assertIn("cash_ok", text)
+        self.assertIn("DEF", text)
+
+
 class ProjectionSourceTest(unittest.TestCase):
     def test_sim_mean_replaces_ilp_objective_board_does_not(self):
         pl = _pl(
@@ -1302,22 +1403,31 @@ class LiveShapeTest(unittest.TestCase):
             team_receiving=(wr, te, other),
         )
         pts = eff.points(rng, qb, shared)
-        sc = FANDUEL_NFL.scoring
+        from nfl.rules import skill_fd_points
+
         pass_yd = wr.rec_yd + te.rec_yd + other.rec_yd
         pass_td = wr.rec_td + te.rec_td + other.rec_td
-        expected = (
-            pass_yd * sc["pass_yd"]
-            + pass_td * sc["pass_td"]
-            + 22.0 * INT_RATE * sc["int"]
+        expected = skill_fd_points(
+            pass_yd=pass_yd,
+            pass_td=pass_td,
+            interceptions=22.0 * INT_RATE,
         )
         self.assertAlmostEqual(pts, max(0.0, expected), places=6)
+
+        class _AtMean:
+            def gauss(self, mu: float, sigma: float) -> float:
+                return mu
+
         legacy = eff.points(
-            rng, qb, OpportunityCount(pass_attempts=22.0, rushes=0.0)
+            _AtMean(), qb, OpportunityCount(pass_attempts=22.0, rushes=0.0)
         )
-        ypa = 22.0 * PASS_YPA * sc["pass_yd"] + 22.0 * 0.045 * sc["pass_td"]
         self.assertAlmostEqual(
             legacy,
-            ypa + 22.0 * INT_RATE * sc["int"],
+            skill_fd_points(
+                pass_yd=22.0 * PASS_YPA,
+                pass_td=22.0 * 0.045,
+                interceptions=22.0 * INT_RATE,
+            ),
             places=4,
         )
         self.assertNotAlmostEqual(pts, legacy, places=2)

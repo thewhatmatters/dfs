@@ -61,6 +61,8 @@ from nfl.lines import (  # noqa: E402
 from nfl.players import filter_pool, load_fanduel_csv  # noqa: E402
 from nfl.projections import (  # noqa: E402
     attach_team_lines,
+    format_value_report,
+    on_default_board,
     print_projection_board,
     projection_board,
     score_player,
@@ -977,6 +979,11 @@ def main(argv: list[str] | None = None) -> int:
             pool, mode=board_mode, sim_by_pid=sim_by_pid or None
         )
         payload["board"] = board_rows
+    value_pool = (
+        pool if args.board == "all" else [p for p in pool if on_default_board(p)]
+    )
+    payload["value_report"] = format_value_report(value_pool, sim_by_pid or None)
+    print(payload["value_report"], file=sys.stderr)
     if args.projection_source == "sim" or args.objective in SIM_OBJECTIVES:
         pool = apply_ilp_objective(
             pool,

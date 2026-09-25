@@ -264,6 +264,110 @@ def on_default_board(player: Player) -> bool:
     return player.prop_fd is not None or player.depth_rank in (1, 2)
 
 
+# Salary multiples (points per $1,000). Report only — not an ILP constraint.
+# Cash wants both the floor and the mean to clear the bar. GPP wants p90.
+# QB is held to 2.5. TE 1.5 is acceptable. DEF is a pay-down.
+CASH_MULTIPLE = {"QB": 2.5, "TE": 1.5, "D": 1.0, "DEF": 1.0}
+GPP_MULTIPLE = {"QB": 2.5, "TE": 1.5, "D": 1.5, "DEF": 1.5}
+DEFAULT_CASH_MULTIPLE = 2.0
+DEFAULT_GPP_MULTIPLE = 2.5
+GPP_STRONG_MULTIPLE = 3.0
+
+
+def salary_multiple(points: float | None, salary: int | None) -> float | None:
+    """``points / (salary/1000)``. None when salary or points are missing."""
+    if points is None or salary is None or int(salary) <= 0:
+        return None
+    return float(points) / (float(salary) / 1000.0)
+
+
+def _multiple_bar(position: str, table: dict[str, float], default: float) -> float:
+    return table.get((position or "").upper(), default)
+
+
+def value_flags(
+    position: str,
+    *,
+    proj: float | None,
+    salary: int | None,
+    p10: float | None = None,
+    mean: float | None = None,
+    p90: float | None = None,
+) -> dict:
+    """cash_ok / gpp_ok from salary multiples. Does not change the solver."""
+    cash_bar = _multiple_bar(position, CASH_MULTIPLE, DEFAULT_CASH_MULTIPLE)
+    gpp_bar = _multiple_bar(position, GPP_MULTIPLE, DEFAULT_GPP_MULTIPLE)
+    proj_x = salary_multiple(proj, salary)
+    p10_x = salary_multiple(p10, salary)
+    mean_x = salary_multiple(mean, salary)
+    p90_x = salary_multiple(p90, salary)
+    if p10_x is not None and mean_x is not None:
+        cash_ok = p10_x >= cash_bar and mean_x >= cash_bar
+    else:
+        cash_ok = proj_x is not None and proj_x >= cash_bar
+    gpp_ok = p90_x is not None and p90_x >= gpp_bar
+    return {
+        "salary": salary,
+        "multiple": None if proj_x is None else round(proj_x, 3),
+        "p10_x": None if p10_x is None else round(p10_x, 3),
+        "mean_x": None if mean_x is None else round(mean_x, 3),
+        "p90_x": None if p90_x is None else round(p90_x, 3),
+        "cash_bar": cash_bar,
+        "gpp_bar": gpp_bar,
+        "cash_ok": cash_ok,
+        "gpp_ok": gpp_ok,
+        "gpp_3x": p90_x is not None and p90_x >= GPP_STRONG_MULTIPLE,
+    }
+
+
+def format_value_report(
+    players: list[Player],
+    sim_by_pid: dict | None = None,
+) -> str:
+    """Board multiple plus sim p10/mean/p90 multiples. Flags are not constraints."""
+    by_pid = sim_by_pid or {}
+    lines = [
+        "value = board proj / (salary/1000)",
+        "cash_ok: p10 and mean clear the bar when a sim exists, else the board "
+        f"(QB {CASH_MULTIPLE['QB']}, TE {CASH_MULTIPLE['TE']}, "
+        f"DEF {CASH_MULTIPLE['DEF']} pay-down, else {DEFAULT_CASH_MULTIPLE})",
+        "gpp_ok: p90 clears the bar "
+        f"(QB {GPP_MULTIPLE['QB']}, TE {GPP_MULTIPLE['TE']}, "
+        f"DEF {GPP_MULTIPLE['DEF']}, else {DEFAULT_GPP_MULTIPLE}); "
+        f"{GPP_STRONG_MULTIPLE:.1f}x is the strong GPP mark",
+        "player  pos team   salary     x   p10x  meanx   p90x  cash  gpp",
+    ]
+    ranked: list[tuple[float, Player]] = []
+    for pl in players:
+        mult = salary_multiple(float(score_player(pl)), pl.salary)
+        ranked.append((-(mult if mult is not None else -1e9), pl))
+    ranked.sort(key=lambda row: (row[0], row[1].pid))
+
+    def _x(val: float | None) -> str:
+        return "   —" if val is None else f"{val:5.2f}"
+
+    for _neg, pl in ranked:
+        st = by_pid.get(pl.pid)
+        flags = value_flags(
+            pl.position,
+            proj=float(score_player(pl)),
+            salary=pl.salary,
+            p10=None if st is None else st.p10,
+            mean=None if st is None else st.mean,
+            p90=None if st is None else st.p90,
+        )
+        lines.append(
+            f"{pl.name}  {pl.position:<3} {(pl.team or ''):<5} "
+            f"{int(pl.salary):7d}  {_x(flags['multiple'])}  "
+            f"{_x(flags['p10_x'])}  {_x(flags['mean_x'])}  {_x(flags['p90_x'])}  "
+            f"{'Y' if flags['cash_ok'] else 'N':>4}  "
+            f"{'Y' if flags['gpp_ok'] else 'N':>3}"
+        )
+    if len(ranked) == 0:
+        lines.append("(no players)")
+    return "\n".join(lines)
+
+
 def board_row(player: Player, sim=None) -> dict:
     implied = player.implied_total
     if (player.position or "").upper() in {"D", "DEF"}:
@@ -276,10 +380,21 @@ def board_row(player: Player, sim=None) -> dict:
         "implied": None if implied is None else round(float(implied), 4),
         "source": board_source(player),
         "proj": round(float(player.projection), 4),
+        "salary": player.salary,
         "game": player.game,
     }
     if sim is not None:
         row.update(sim.to_dict())
+    row.update(
+        value_flags(
+            player.position,
+            proj=float(score_player(player)),
+            salary=player.salary,
+            p10=None if sim is None else sim.p10,
+            mean=None if sim is None else sim.mean,
+            p90=None if sim is None else sim.p90,
+        )
+    )
     return row
 
 
@@ -341,7 +456,7 @@ def print_projection_board(
     if any(r.get("mean") is not None for r in rows):
         print(
             f"    {'player':<{name_w}} pos team  d   implied  src    proj"
-            f"    mean     p10    p50    p90",
+            f"    mean     p10    p50    p90    x  cg",
             file=sys.stderr,
         )
     prev_game: str | None = None
@@ -364,10 +479,17 @@ def print_projection_board(
                 f"  {float(r['mean']):6.2f}  {float(r['p10']):6.2f} "
                 f"{float(r['p50']):6.2f} {float(r['p90']):6.2f}"
             )
+        mult = r.get("multiple")
+        if mult is None:
+            value_s = ""
+        else:
+            cash = "C" if r.get("cash_ok") else "-"
+            gpp = "G" if r.get("gpp_ok") else "-"
+            value_s = f"  {float(mult):4.2f}x {cash}{gpp}"
         print(
             f"    {str(r.get('player') or ''):<{name_w}} {pos:<3} "
             f"{str(r.get('team') or ''):<5} {str(r.get('depth') or '—'):<3} "
             f"{implied_s:>7}  {str(r.get('source') or ''):<5}  "
-            f"{float(r.get('proj') or 0):.2f}{sim_s}",
+            f"{float(r.get('proj') or 0):.2f}{sim_s}{value_s}",
             file=sys.stderr,
         )

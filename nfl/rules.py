@@ -371,6 +371,84 @@ def dst_pa_points(points_allowed: float, scoring: dict[str, float] | None = None
     return float(sc[dst_pa_key(points_allowed)])
 
 
+def skill_fd_points(
+    *,
+    pass_yd: float = 0.0,
+    pass_td: float = 0.0,
+    interceptions: float = 0.0,
+    rush_yd: float = 0.0,
+    rush_td: float = 0.0,
+    rec_yd: float = 0.0,
+    receptions: float = 0.0,
+    rec_td: float = 0.0,
+    fum_lost: float = 0.0,
+    two_pt: float = 0.0,
+    two_pt_pass: float = 0.0,
+    kr_td: float = 0.0,
+    pr_td: float = 0.0,
+    own_fum_td: float = 0.0,
+    scoring: dict[str, float] | None = None,
+) -> float:
+    """FanDuel skill points for one realized game.
+
+    Yardage bonuses are +3 when that game's yards clear the lobby line
+    (300 pass, 100 rush, 100 rec). They are not a fraction of the bonus
+    added to an average.
+    """
+    sc = scoring if scoring is not None else FANDUEL_NFL.scoring
+    pts = (
+        float(pass_yd) * sc["pass_yd"]
+        + float(pass_td) * sc["pass_td"]
+        + float(interceptions) * sc["int"]
+        + float(rush_yd) * sc["rush_yd"]
+        + float(rush_td) * sc["rush_td"]
+        + float(rec_yd) * sc["rec_yd"]
+        + float(receptions) * sc["rec"]
+        + float(rec_td) * sc["rec_td"]
+        + float(fum_lost) * sc["fum_lost"]
+        + float(two_pt) * sc["two_pt"]
+        + float(two_pt_pass) * sc["two_pt_pass"]
+        + float(kr_td) * sc["kr_td"]
+        + float(pr_td) * sc["pr_td"]
+        + float(own_fum_td) * sc["own_fum_td"]
+    )
+    if float(pass_yd) >= 300.0:
+        pts += sc["bonus_pass_yd_300"]
+    if float(rush_yd) >= 100.0:
+        pts += sc["bonus_rush_yd_100"]
+    if float(rec_yd) >= 100.0:
+        pts += sc["bonus_rec_yd_100"]
+    return pts
+
+
+def dst_event_points(
+    *,
+    sacks: float = 0.0,
+    interceptions: float = 0.0,
+    fum_rec: float = 0.0,
+    safeties: float = 0.0,
+    blocked: float = 0.0,
+    xpr: float = 0.0,
+    return_td: float = 0.0,
+    blocked_td: float = 0.0,
+    fum_td: float = 0.0,
+    scoring: dict[str, float] | None = None,
+) -> float:
+    """DEF events other than the points-allowed bucket."""
+    sc = scoring if scoring is not None else FANDUEL_NFL.scoring
+    return (
+        float(sacks) * sc["dst_sack"]
+        + float(interceptions) * sc["dst_int"]
+        + float(fum_rec) * sc["dst_fr"]
+        + float(safeties) * sc["dst_safety"]
+        + float(blocked) * sc["dst_blocked"]
+        + float(xpr) * sc["dst_xpr"]
+        + float(return_td) * sc["dst_rtd"]
+        + float(blocked_td) * sc["dst_brtd"]
+        + float(fum_td) * sc["dst_frtd"]
+    )
+
+
 def dst_projection(implied_opp: float, scoring: dict[str, float] | None = None) -> float:
     """PA bucket from opponent implied total + sack/turnover prior.
 
