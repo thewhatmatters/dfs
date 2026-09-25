@@ -269,7 +269,7 @@ class PayloadTest(unittest.TestCase):
         board = [r for r in rows if r["model"] == "board"]
         sims = [r for r in rows if r["model"] == "sim"]
         self.assertTrue(all("sim_efficiency" not in r["inputs"] for r in board))
-        self.assertTrue(all(r["inputs"]["sim_efficiency"] == "placeholder" for r in sims))
+        self.assertTrue(all(r["inputs"]["sim_efficiency"] == "data" for r in sims))
 
         def load(_args, _today):
             return 2026, 3, entries
@@ -342,7 +342,9 @@ class SimGuardTest(unittest.TestCase):
 
         seen: dict = {}
 
-        bundle = object()
+        from nfl.sim_inputs import SimInputs
+
+        bundle = SimInputs()
 
         def fake(players, n, seed, inputs=None, efficiency=None):
             seen["n"] = n
@@ -362,9 +364,9 @@ class SimGuardTest(unittest.TestCase):
         self.assertEqual(seen["n"], 25)
         self.assertEqual(seen["seed"], 3)
         self.assertEqual(seen["count"], len(entries))
-        from nfl.sim_efficiency import PlaceholderEfficiency
+        from nfl.sim_efficiency import DataEfficiency
 
-        self.assertIsInstance(seen["efficiency"], PlaceholderEfficiency)
+        self.assertIsInstance(seen["efficiency"], DataEfficiency)
 
     def test_data_efficiency_is_passed_into_the_sim(self) -> None:
         from nfl.sim_efficiency import DataEfficiency
@@ -402,7 +404,41 @@ class SimGuardTest(unittest.TestCase):
                 sim_efficiency="data",
             )
         self.assertIsInstance(seen["efficiency"], DataEfficiency)
-        self.assertEqual(parse_args([]).sim_efficiency, "placeholder")
+        self.assertEqual(parse_args([]).sim_efficiency, "data")
+        self.assertEqual(
+            parse_args(["--sim-efficiency", "placeholder"]).sim_efficiency,
+            "placeholder",
+        )
+
+    def test_missing_inputs_publish_the_board_and_do_not_raise(self) -> None:
+        import io
+        from contextlib import redirect_stderr
+
+        from nfl.sim_efficiency import EFFICIENCY_FALLBACK_NOTE
+
+        entries = build_entries(
+            [_line()],
+            [
+                _depth("Patrick Mahomes", "KC", "QB", 1, "00-0033873"),
+                _depth("Josh Allen", "BUF", "QB", 1, "00-0034857"),
+            ],
+        )
+        err = io.StringIO()
+        def boom(*_a, **_k):
+            raise AssertionError("sim should not run")
+
+        with patch(
+            "nfl.publish_projections.load_simulate_games",
+            return_value=boom,
+        ), patch(
+            "nfl.sim_feed.resolve_sim_inputs",
+            return_value=(None, "sim inputs: gangstash unavailable — role shares deterministic"),
+        ), redirect_stderr(err):
+            out = maybe_sim(entries, 10, 1, season=2026, refresh=True, week=3)
+        self.assertIsNone(out)
+        text = err.getvalue()
+        self.assertIn(EFFICIENCY_FALLBACK_NOTE, text)
+        self.assertIn("sim fell back to board; publishing board only", text)
 
     def test_stale_sim_inputs_exit(self) -> None:
         entries = build_entries(

@@ -1171,10 +1171,52 @@ def build_efficiency(
     *,
     before_week: int | None = None,
 ) -> EfficiencyModel:
-    """``placeholder`` (default) or ``data``."""
+    """``placeholder`` or ``data``. ``None`` stays the placeholder.
+
+    Callers that pass ``data`` with no bundle should use
+    ``resolve_run_efficiency`` so a missing feed is logged and does not
+    pretend to be data mode. This function does not change the draws.
+    """
     name = (mode or "placeholder").strip().lower()
     if name == "placeholder":
         return PlaceholderEfficiency()
     if name != "data":
         raise ValueError(f"sim efficiency must be data or placeholder, got {mode!r}")
     return DataEfficiency(inputs, before_week=before_week)
+
+
+EFFICIENCY_FALLBACK_NOTE = (
+    "sim inputs missing; sim efficiency data fell back to placeholder"
+)
+SOURCE_FALLBACK_NOTE = (
+    "sim inputs missing; projection source sim fell back to board"
+)
+
+
+def resolve_run_efficiency(
+    mode: str | None,
+    inputs: SimInputs | None,
+    *,
+    before_week: int | None = None,
+) -> tuple[EfficiencyModel, str, str | None]:
+    """``(model, mode used, note)``.
+
+    ``data`` with no sim inputs uses the placeholder. The note is the log
+    line. A present bundle, including an empty one, stays on ``data``.
+    """
+    requested = (mode or "placeholder").strip().lower()
+    if requested == "data" and inputs is None:
+        return PlaceholderEfficiency(), "placeholder", EFFICIENCY_FALLBACK_NOTE
+    model = build_efficiency(requested, inputs, before_week=before_week)
+    return model, requested, None
+
+
+def projection_source_for_run(
+    source: str | None,
+    inputs: SimInputs | None,
+) -> tuple[str, str | None]:
+    """``(source used, note)``. Missing inputs send ``sim`` back to ``board``."""
+    name = (source or "board").strip().lower()
+    if name == "sim" and inputs is None:
+        return "board", SOURCE_FALLBACK_NOTE
+    return name, None

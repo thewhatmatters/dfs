@@ -11,7 +11,7 @@ python3 -m nfl.publish_projections --refresh --sim 10000
 That is the nightly command. `--refresh` skips the same-day cache so a dead
 read cannot fall back onto an older file. `--sim 10000` also posts
 `model=sim`. Those rows use `resolve_sim_inputs` and `simulate_games`
-the same way `python3 -m nfl.optimize --projection-source sim` does.
+the same way `python3 -m nfl.optimize` does (`--projection-source sim`).
 `mean` is the simulated mean; `p10` / `p50` / `p90` are the same draws.
 If `simulate_games` does not import, the command still posts the board
 and prints one line. A sim-input cache marked stale exits non-zero.
@@ -41,8 +41,10 @@ by every row and both models. Posting that same `run_at` again updates in
 place. A new `run_at` is a new run.
 
 `model_version` is `git rev-parse --short HEAD`. The run log also prints
-`sim_efficiency` (default `placeholder`). Each `model=sim` row stores that
-mode on `inputs.sim_efficiency`. Board rows do not.
+`sim_efficiency` (default `data`). Each `model=sim` row stores that
+mode on `inputs.sim_efficiency`. Board rows do not. Missing sim inputs
+fall back to placeholder, the sim is not posted, and the log says the
+publish stayed on the board.
 
 ## What gets scored
 

@@ -35,7 +35,7 @@ layer 4 (shrunk player rates and a clamped opponent). It is not a
 prop-line calibration. ``simulate_games`` still defaults to the
 placeholder so empty inputs and existing callers keep the same draws.
 The CLI flag is ``--sim-efficiency {placeholder,data}`` (default
-``placeholder`` until data mode beats it). Data mode keeps team rush
+``data``). Missing sim inputs fall back to the placeholder. Data mode keeps team rush
 attempts on the implied script and redistributes the rush-yard budget.
 It does not also scale attempts.
 
@@ -46,8 +46,9 @@ fallback and do not add RNG draws.
 Not a play-by-play copula and not SaberSim.
 
 `--board` stays the point estimate (implied×depth×share×usage, ±20% prop tilt).
-Default ILP (`mean`) stays `week1_score` (`--projection-source board`).
-`--projection-source sim` sets `mean` to each player's simulated mean.
+Default ILP (`mean`) is each player's simulated mean (`--projection-source sim`,
+10000 draws). `--projection-source board` keeps `week1_score`.
+Missing sim inputs fall back to that board.
 `floor` / `ceiling` replace `Player.objective` with that player's sim p10 / p90.
 Lineup Fl/Cl are the joint 9 (sum in the same world), not the sum of
 player p10s.

@@ -26,10 +26,10 @@ that starters slice, and a hindsight slice (the QB who actually took the
 snaps). A questionable player is not handed off. A Q with no stat row, or
 0 offensive snaps, is counted as a DNP and the projection stays.
 
-``--projection-source`` stays ``board`` on the optimizer. This command
-only compares the two. ``--sim-efficiency`` defaults to ``placeholder``
-(league-average rates) until ``data`` beats it. ``data`` scores the sim
-with shrunk prior-week rates.
+The optimizer defaults to ``--projection-source sim``. This command
+still scores the board and the sim. ``--sim-efficiency`` defaults to
+``data``. Missing sim inputs fall back to placeholder and the report
+says so.
 """
 
 from __future__ import annotations
@@ -81,7 +81,7 @@ from nfl.players import Player, load_fanduel_csv
 from nfl.projections import attach_team_lines, score_player
 from nfl.props import attach_props, parse_stamp, props_for_week, rows_to_props
 from nfl.sim import simulate_games
-from nfl.sim_efficiency import build_efficiency
+from nfl.sim_efficiency import resolve_run_efficiency
 from nfl.sim_feed import resolve_sim_inputs
 from nfl.sim_inputs import SimInputError, SimInputs
 from nfl.snaps import SnapsError, attach_snaps, load_optimizer_snaps
@@ -755,7 +755,7 @@ def run_backtest(
     n: int = 400,
     seed: int = 1,
     starters_only: bool = False,
-    efficiency: str = "placeholder",
+    efficiency: str = "data",
 ) -> BacktestReport:
     """Score ``players`` against weekly ``fd_points``. No network."""
     noted = _order_missing(list(missing or []))
@@ -764,7 +764,14 @@ def run_backtest(
     dnp = _questionable_dnps(players, indexed)
     notes = list(notes or ())
     notes.append(f"questionable DNP: {dnp} (projection kept)")
-    model = build_efficiency(efficiency, sim_inputs, before_week=week)
+    model, efficiency, efficiency_note = resolve_run_efficiency(
+        efficiency,
+        sim_inputs,
+        before_week=week,
+    )
+    if efficiency_note:
+        notes.append(efficiency_note)
+        print(efficiency_note, file=sys.stderr)
     qb_pids = hindsight_qb_pids(players, indexed)
     if not indexed and "player_stats_weekly" not in noted:
         noted = _order_missing(noted + ["player_stats_weekly"])
@@ -1270,9 +1277,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--sim-efficiency",
         choices=("placeholder", "data"),
-        default="placeholder",
-        help="layer-4 efficiency: placeholder (default) keeps the "
-        "league-average rates; data uses prior-week gangstash rates",
+        default="data",
+        help="layer-4 efficiency (default data). placeholder keeps the "
+        "league-average rates. Missing sim inputs fall back to placeholder "
+        "and the report says so.",
     )
     args = ap.parse_args(argv)
     if args.week < 1 or args.season < 1:
