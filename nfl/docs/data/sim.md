@@ -44,6 +44,8 @@ spread_sigma = 10 × scale_game
 
 `1.15` is the per-play EPA standard deviation that leaves the sigmas at the old constants (`0.12` and `10`). Missing variance uses scale `1`.
 
+`--sim-calibration team` (off by default) replaces the `0.12` fraction with `0.257`. The 2024+2025 holdout measured a sim game-total SD of 6.3 against actual residuals of 13–14; `0.257` is the fraction that maps that 6.3 onto about 13.5 with the same EPA scale. It is not the optimizer default. Confirm the 2024 residual before treating 0.257 as final.
+
 **Scoring variance for a team** is the mean of:
 
 - that team's **offense** EPA variance
@@ -73,7 +75,7 @@ pass_tds = prop_pass_tds, or (implied / 7) × clamp(pass_rate × 1.08, 0.40, 0.8
 
 `plays_mu` is `pass_n + rush_n` when that sum is one game (40–95). Otherwise it is 63. `margin` is this team's drawn points minus the opponent's. A trailing team passes more. A leading team runs more.
 
-Passing yards and passing TDs are **not** target volume times a league rate. The level is the Vegas implied total times the scripted pass rate. `prop_pass_yds` replaces the yard anchor. `prop_pass_tds` replaces the TD anchor. A 22-point team at a 0.57 pass rate is about 220 passing yards. The receiving lines are still one shared draw; they are rescaled so they sum to a sample around that anchor. A high implied total raises the starter QB even when the script trims his pass rate.
+Passing yards and passing TDs are **not** target volume times a league rate. The level is the Vegas implied total times the scripted pass rate. `--sim-calibration team` multiplies that anchor, the pass-attempt count, and the rush-attempt count by this team's drawn points / implied, after the script. Teammates then move with their own score. The opposing DEF is already the points-allowed bucket of that score, so the QB moves against that DEF. Both teams share the game total, so the two QBs move together when the total is the wide one. The default path does not apply that scale: the anchor stays on the implied total, and the margin only changes the pass rate. `prop_pass_yds` replaces the yard anchor. `prop_pass_tds` replaces the TD anchor. A 22-point team at a 0.57 pass rate is about 220 passing yards. The receiving lines are still one shared draw; they are rescaled so they sum to a sample around that anchor. A high implied total raises the starter QB even when the script trims his pass rate.
 
 **Neutral pass rate** (offense row only):
 
@@ -152,6 +154,8 @@ One prior week sits mostly on the prior. A bellcow week is about 20 carries and 
 Opponent defense scales pass efficiency by pass EPA and success allowed, then yards per dropback allowed versus 6.0 (yards per attempt versus 7.1 only when dropback is missing), then sack rate versus 6.5%. Rush efficiency uses rush EPA and success allowed, then yards per carry allowed versus 4.3. Early-down rates win when those columns are present. The sample is shrunk with a 100-play prior. Each multiplier is clamped to ±15%. One EPA per play above the league is +0.50 before that clamp. The rush-yard budget then multiplies the pass-tilt complement by that rush multiplier and clamps the product again to ±15%. Red-zone TD rate (offense, and defense allowed) nudges the team TD anchor, clamped to ±15%. Defense air yards per attempt are stored and are not in the multiplier.
 
 Offense pass EPA versus rush EPA, plus the same gap in what the defense allows, tilts the pass yard anchor by at most ±8%. Rush attempts stay on the implied-total script. The rush-yard budget takes the complement (`2 - tilt`) times the opponent rush multiplier, and that product is clamped again to ±15% (`COMBINED_CLAMP`), so 1.08 × 1.15 cannot become 1.24. Team rush yards are `sum(rushes × prior yards per carry) × that one scale`. A hot yards-per-carry or rush TD rate only steals share from other rushers. Receiving yards and receiving TDs were already rescaled to the pass anchor, so a hot tight end rate redistributes that pie and does not add to it. O, D, IR, and NA players are left out of target and rush shares. Their share is renormalized onto active teammates.
+
+`--sim-calibration rates` (off by default) writes the opponent pass multiplier onto the team pass-yard anchor. Without that, the multiplier only changes yards per target, and the receiving lines are then rescaled to the anchor, so a team-wide factor cancels. The same step sets red-zone TD elasticity to 0.35 (the default elasticity is 1.0). A 1:1 gap plus the ±15% clamp pins a late-season rate, and a ±10% move of that rate does not change points. 0.35 keeps a typical team inside the clamp and gives the rate a slope. `--sim-calibration level` scales team rush attempts toward offense `rush_yards / pace_games` from weeks already in the bundle, shrunk to the implied-total budget with a 4-game prior. That is the team's own history. It is not a constant chosen to match a later season. A missing `rush_yards` or `pace_games` leaves the budget alone. DEF stays the points-allowed bucket plus the +3 event prior: widening the total only moves that expectation by a few tenths, and a flat add-on would be fit to a pooled residual rather than to one season's history.
 
 Every new column is optional. `None` leaves that piece on the path above, so an empty bundle and a history with none of these columns stay on the placeholder draws.
 
@@ -248,6 +252,9 @@ The reader is `fetch_player_stats_weekly` (`dataset=player_stats_weekly&season=&
 python3 -m nfl.holdout --season 2024 --weeks 1-18 --n 3000 --json-out results/holdout-2024.json
 python3 -m nfl.holdout --season 2025 --weeks 1-18 --n 3000 --json-out results/holdout-2025.json
 python3 -m nfl.holdout --season 2026 --weeks 2 --n 3000 --json-out results/holdout-2026-w2.json
+python3 -m nfl.holdout --season 2025 --weeks 1-18 --n 3000 --calibration all --json-out results/holdout-2025-cal.json
 ```
+
+`--calibration` defaults to `off` (the current data mode). `team`, `level`, `rates`, or `all` score the opt-in sim. The report field is `sim_calibration`. Nothing in that mode becomes the optimizer default unless the 2025 holdout beats `off`.
 
 `--seasons 2024,2025` scores both. Each week runs the placeholder sim and the data sim. The text and the JSON report pooled starters and the full pool (mean error and MAE by position for board, sim-placeholder, and sim-data), calibration (share of actuals at or below the 10th through 90th percentile of that player's draws, and p10–p90 coverage), the SD of simulated game margin and total against the actual games and against closing-line residuals, Pearson correlations for QB–WR1, QB–TE1, QB–RB1, QB vs opposing DEF, QB vs opposing QB, and WR1–WR2, and the average weekly Spearman of projection vs actual. One week (the last requested week other than week 1) is rerun with opponent pass and rush multipliers, pace, red-zone TD rate, and depth-1 target/carry shares moved ±10%. `props_closing` is the prop baseline when that season has rows; 2024, 2025, and 2026 weeks 1–2 skip it.

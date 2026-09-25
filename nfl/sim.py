@@ -38,6 +38,8 @@ The CLI flag is ``--sim-efficiency {placeholder,data}`` (default
 ``data``). Missing sim inputs fall back to the placeholder. Data mode keeps team rush
 attempts on the implied script and redistributes the rush-yard budget.
 It does not also scale attempts.
+``--sim-calibration`` defaults to ``off``. ``team`` / ``level`` / ``rates``
+are opt-in and do not replace that default until a 2025 holdout says so.
 
 Inputs are ``SimInputs`` (team stats, weekly targets, optional snaps).
 The sim does not call Gangstash. Empty inputs reproduce the role-share
@@ -91,6 +93,7 @@ from nfl.sim_efficiency import (
     PlaceholderEfficiency,
     ReceivingLine,
     expected_receiving_line,
+    RZ_TD_ELASTICITY,
     clamp,
     sample_yards,
     shrink,
@@ -118,6 +121,17 @@ PA_FLOOR = 0.0
 # scale=1 point of the EPA dispersion map.
 TOTAL_SIGMA_FRAC = 0.12
 SPREAD_SIGMA = 10.0
+# Opt-in. The 2024+2025 holdout measured sim game-total SD at 6.3 against
+# actual residuals of 13–14. ``0.12 × |total| × EPA scale`` is that 6.3,
+# so ``0.257 × |total| × the same scale`` targets about 13.5. Not the
+# default until a 2025-only holdout says the calibrated sim wins.
+CALIBRATED_TOTAL_SIGMA_FRAC = 0.257
+# Rush-yard level. Prior games of ``rush_yards / pace_games`` shrink
+# toward the implied-total budget. One game stays mostly on the formula.
+RUSH_LEVEL_PRIOR_GAMES = 4.0
+RUSH_LEVEL_YARDS_MIN = 40.0
+RUSH_LEVEL_YARDS_MAX = 250.0
+CALIBRATION_STEPS = frozenset({"team", "level", "rates"})
 # Per-play EPA sd that leaves total/spread sigma at the constants above.
 EPA_SD_REF = 1.15
 EPA_SCALE_MIN = 0.60
@@ -317,6 +331,31 @@ def simulate_pool(
     return simulate_games(players, n=n, seed=seed).by_pid
 
 
+def parse_calibration(raw: str | None) -> frozenset[str]:
+    """``off``, ``all``, or a comma list of ``team``, ``level``, ``rates``.
+
+    ``team`` widens the game total and scales production by drawn team
+    points / implied. ``level`` lifts team rush yards toward prior-week
+    ``rush_yards``. ``rates`` puts the opponent pass multiplier on the
+    pass-yard anchor and softens the red-zone TD elasticity. Default is
+    off: the optimizer keeps today's data-mode draws until a 2025 holdout
+    says otherwise.
+    """
+    text = (raw or "off").strip().lower()
+    if text in {"", "off", "none"}:
+        return frozenset()
+    if text == "all":
+        return frozenset(CALIBRATION_STEPS)
+    parts = {part.strip() for part in text.split(",") if part.strip()}
+    unknown = parts - CALIBRATION_STEPS
+    if unknown:
+        names = ", ".join(sorted(unknown))
+        raise ValueError(
+            f"unknown sim calibration {names}; use off, all, team, level, rates"
+        )
+    return frozenset(parts)
+
+
 def simulate_games(
     players: list[Player],
     *,
@@ -324,13 +363,20 @@ def simulate_games(
     seed: int = DEFAULT_SEED,
     inputs: SimInputs | None = None,
     efficiency: EfficiencyModel | None = None,
+    calibration: str = "off",
 ) -> GameSim:
     """n slate worlds. Players in a game share total+margin; games do not.
 
     ``inputs`` turns on EPA dispersion, scripted volume, and Dirichlet
     shares. ``None`` or an empty bundle keeps deterministic role shares
     and the fixed total/spread sigmas (same RNG steps as before).
+
+    ``calibration="off"`` (default) keeps those draws. ``team``, ``level``,
+    and ``rates`` are the opt-in steps; ``all`` is the three together.
+    They do not add RNG calls. ``team`` only changes the total sigma and
+    multiplies anchors by drawn team points / implied.
     """
+    cal = parse_calibration(calibration)
     if n <= 0:
         return GameSim(by_pid={}, draws={})
     bundle = inputs or SimInputs()
@@ -363,44 +409,57 @@ def simulate_games(
     raw: dict[str, list[float]] = {p.pid: [] for p in players}
     score_points = eff.points
     game_rows: list[tuple[str, str, str, float, float]] = []
-    for _ in range(n):
-        for key, group, team_preps in slate:
-            home_pts, away_pts, away, home = _draw_game(rng, group, index)
-            if away is not None and home is not None:
-                game_rows.append(
-                    (key, away, home, float(away_pts), float(home_pts))
+    total_frac = CALIBRATED_TOTAL_SIGMA_FRAC if "team" in cal else None
+    restore_elasticity = None
+    if "rates" in cal and hasattr(eff, "set_rz_elasticity"):
+        restore_elasticity = eff.set_rz_elasticity(RZ_TD_ELASTICITY)
+    try:
+        for _ in range(n):
+            for key, group, team_preps in slate:
+                home_pts, away_pts, away, home = _draw_game(
+                    rng, group, index, total_frac=total_frac
                 )
-            if away is None or home is None:
+                if away is not None and home is not None:
+                    game_rows.append(
+                        (key, away, home, float(away_pts), float(home_pts))
+                    )
+                if away is None or home is None:
+                    for pl in group:
+                        team_pts, opp_pts = _solo_world(rng, pl)
+                        raw[pl.pid].append(
+                            _score_fallback(pl, team_pts, opp_pts, group, index)
+                        )
+                    continue
+                counts: dict[str, OpportunityCount] = {}
+                for prep in team_preps:
+                    margin = _team_margin(prep.team, home_pts, away_pts, away, home)
+                    team_pts = _team_points(prep.team, home_pts, away_pts, away, home)
+                    counts.update(
+                        _draw_team_opportunities(
+                            rng,
+                            prep.players,
+                            margin,
+                            index,
+                            eff,
+                            prep,
+                            team_pts=team_pts,
+                            calibration=cal,
+                        )
+                    )
                 for pl in group:
-                    team_pts, opp_pts = _solo_world(rng, pl)
-                    raw[pl.pid].append(
-                        _score_fallback(pl, team_pts, opp_pts, group, index)
-                    )
-                continue
-            counts: dict[str, OpportunityCount] = {}
-            for prep in team_preps:
-                margin = _team_margin(prep.team, home_pts, away_pts, away, home)
-                counts.update(
-                    _draw_team_opportunities(
-                        rng,
-                        prep.players,
-                        margin,
-                        index,
-                        eff,
-                        prep,
-                    )
-                )
-            for pl in group:
-                opp_count = counts.get(pl.pid)
-                if opp_count is None:
-                    team_pts, opp_pts = _player_world(
-                        pl, home_pts, away_pts, away, home
-                    )
-                    raw[pl.pid].append(
-                        _score_fallback(pl, team_pts, opp_pts, group, index)
-                    )
-                else:
-                    raw[pl.pid].append(score_points(rng, pl, opp_count))
+                    opp_count = counts.get(pl.pid)
+                    if opp_count is None:
+                        team_pts, opp_pts = _player_world(
+                            pl, home_pts, away_pts, away, home
+                        )
+                        raw[pl.pid].append(
+                            _score_fallback(pl, team_pts, opp_pts, group, index)
+                        )
+                    else:
+                        raw[pl.pid].append(score_points(rng, pl, opp_count))
+    finally:
+        if restore_elasticity is not None:
+            eff.set_rz_elasticity(restore_elasticity)
     draws = {pid: tuple(xs) for pid, xs in raw.items()}
     layered = _layered_pids(groups, opportunity, index)
     by_pid: dict[str, SimStats] = {}
@@ -552,6 +611,7 @@ def _draw_game(
     rng: random.Random,
     group: list[Player],
     index: _HistoryIndex | None = None,
+    total_frac: float | None = None,
 ) -> tuple[float, float, str | None, str | None]:
     total_mu, spread_home_mu, away, home = _vegas(group)
     if away is None or home is None:
@@ -562,6 +622,8 @@ def _draw_game(
         home_var = index.scoring_var(home, away)
         away_var = index.scoring_var(away, home)
     total_sigma, spread_sigma = game_sigmas(total_mu, home_var, away_var)
+    if total_frac is not None and TOTAL_SIGMA_FRAC > 0:
+        total_sigma *= float(total_frac) / TOTAL_SIGMA_FRAC
     total_d = _gauss_floor(
         rng,
         total_mu,
@@ -977,6 +1039,35 @@ def team_rush_attempts(plays: float, rush_rate: float, implied: float) -> float:
     return min(scripted, max(0.0, budget))
 
 
+def rush_yard_budget(attempts: float) -> float:
+    """Team rush yards implied by the attempt count at the RB yards-per-carry prior."""
+    ypc = YARDS_PER_RUSH.get("RB", 4.4) or 4.4
+    return max(0.0, float(attempts)) * ypc
+
+
+def rush_history_scale(stat: TeamStat | None, model_yards: float) -> float:
+    """Scale the rush budget toward prior-week rush yards per game.
+
+    Uses offense ``rush_yards / pace_games``, shrunk toward ``model_yards``
+    with a 4-game prior. Missing, or a per-game total outside 40–250,
+    stays 1. This is the team's own history, not a constant fit to a
+    later season.
+    """
+    if stat is None or stat.rush_yards is None or not stat.pace_games:
+        return 1.0
+    games = float(stat.pace_games)
+    yards = float(stat.rush_yards)
+    if games <= 0 or model_yards <= 1e-6 or yards <= 0:
+        return 1.0
+    per_game = yards / games
+    if per_game < RUSH_LEVEL_YARDS_MIN or per_game > RUSH_LEVEL_YARDS_MAX:
+        return 1.0
+    target = shrink(per_game, games, float(model_yards), RUSH_LEVEL_PRIOR_GAMES)
+    if target <= 0:
+        return 1.0
+    return target / float(model_yards)
+
+
 def mean_target_share(
     weeks: list[TargetWeek],
     snaps: list[SnapWeek] | None = None,
@@ -1341,6 +1432,20 @@ def _team_margin(
     return 0.0
 
 
+def _team_points(
+    team: str,
+    home_pts: float,
+    away_pts: float,
+    away: str | None,
+    home: str | None,
+) -> float:
+    if home and team == home:
+        return float(home_pts)
+    if away and team == away:
+        return float(away_pts)
+    return 0.0
+
+
 def _layered_pids(
     groups: dict[str, list[Player]],
     opportunity: frozenset[str],
@@ -1621,6 +1726,8 @@ def _tilt_anchors(
     yard_anchor: float,
     rush_attempts: float,
     td_anchor: float,
+    *,
+    apply_pass_multiplier: bool = False,
 ) -> tuple[float, float, float]:
     """Pass-vs-rush tilt and a red-zone TD nudge. Placeholder has neither.
 
@@ -1628,12 +1735,22 @@ def _tilt_anchors(
     on the implied script. Data mode puts the rush complement on the
     rush-yard budget (``allocate_rush``), so volume and efficiency do not
     both scale.
+
+    ``apply_pass_multiplier`` puts the opponent pass multiplier on the
+    yard anchor. Without it, that multiplier only touches yards per
+    target, and ``_scale_receiving`` then wipes a team-wide factor.
     """
     scale_fn = getattr(eff, "pass_anchor_scale", None)
     if scale_fn is not None:
         tilt = float(scale_fn(team, opponent or None))
         if tilt != 1.0:
             yard_anchor *= tilt
+    if apply_pass_multiplier:
+        mult_fn = getattr(eff, "pass_multiplier", None)
+        if mult_fn is not None:
+            mult = float(mult_fn(opponent or None))
+            if mult != 1.0:
+                yard_anchor *= mult
     td_fn = getattr(eff, "td_anchor_scale", None)
     if td_fn is not None:
         td_scale = float(td_fn(team, opponent or None))
@@ -1767,6 +1884,8 @@ def _draw_team_opportunities(
     index: _HistoryIndex,
     eff: EfficiencyModel,
     prep: _OppPrep | None = None,
+    team_pts: float | None = None,
+    calibration: frozenset[str] | None = None,
 ) -> dict[str, OpportunityCount]:
     """Plays, script, anchors, joint shares. Empty if no target history.
 
@@ -1799,9 +1918,28 @@ def _draw_team_opportunities(
     td_anchor = pass_td_anchor(implied, pass_rate, td_prop)
     pass_attempts = plays * pass_rate
     rush_attempts = team_rush_attempts(plays, rush_rate, implied)
+    cal = calibration or frozenset()
     yard_anchor, rush_attempts, td_anchor = _tilt_anchors(
-        eff, team, opponent, yard_anchor, rush_attempts, td_anchor
+        eff,
+        team,
+        opponent,
+        yard_anchor,
+        rush_attempts,
+        td_anchor,
+        apply_pass_multiplier="rates" in cal,
     )
+    if "level" in cal:
+        rush_attempts *= rush_history_scale(offense, rush_yard_budget(rush_attempts))
+    if "team" in cal and implied > 0 and team_pts is not None:
+        # Own drawn score, not the opponent's. Teammates move together.
+        # The opposing DEF is scored from these same points, so a bigger
+        # offensive game lowers that DEF. Both teams ride the game total,
+        # so the two QBs move together when the total is wide.
+        score_scale = max(0.0, float(team_pts)) / implied
+        yard_anchor *= score_scale
+        td_anchor *= score_scale
+        rush_attempts *= score_scale
+        pass_attempts *= score_scale
     team_targets = pass_attempts * prep.tpa
     drawn = draw_simplex(rng, prep.simplex_means, prep.kappa)
     target_share = {pl.pid: drawn[i] for i, pl in enumerate(catchers)}

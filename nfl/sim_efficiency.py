@@ -85,6 +85,10 @@ LEAGUE_RUSH_SUCCESS = 0.42
 LEAGUE_RZ_TD = 0.55
 RZ_PRIOR_PLAYS = 25.0
 RZ_TD_CLAMP = 0.15
+# 1.0 is a 1:1 gap. Week-18 red-zone rates then sit on the ±15% clamp, so
+# moving the rate ±10% does not change the multiplier. The calibrated sim
+# sets a lower elasticity so a typical team still moves inside the clamp.
+RZ_TD_ELASTICITY = 0.35
 # Pass yard anchor moves at most this far. The rush-yard budget takes the
 # complement, then the product with the opponent rush multiplier is clamped
 # again so the two cannot stack.
@@ -642,6 +646,19 @@ class DataEfficiency:
         self._td_mult: dict[tuple[str, str], float] = {}
         self._pass_scale: dict[tuple[str, str], float] = {}
         self._rush_scale: dict[tuple[str, float], float] = {}
+        # 1.0 keeps the 1:1 red-zone gap. ``set_rz_elasticity`` is the
+        # calibrated path and clears the TD-multiplier cache.
+        self.rz_elasticity = 1.0
+
+    def set_rz_elasticity(self, value: float) -> float:
+        """Set the red-zone TD elasticity and drop the cached multipliers.
+
+        Returns the previous value so the caller can restore it.
+        """
+        previous = float(self.rz_elasticity)
+        self.rz_elasticity = float(value)
+        self._td_mult.clear()
+        return previous
 
     def rates_for(self, player: Player | None, position: str) -> dict[str, float]:
         """Shrunk rates. No history returns the position prior, unadjusted.
@@ -987,7 +1004,9 @@ class DataEfficiency:
         off_s = shrink(off_rate, off_n, LEAGUE_RZ_TD, RZ_PRIOR_PLAYS)
         def_s = shrink(def_rate, def_n, LEAGUE_RZ_TD, RZ_PRIOR_PLAYS)
         gap = (off_s - LEAGUE_RZ_TD) + (def_s - LEAGUE_RZ_TD)
-        mult = 1.0 + (gap / LEAGUE_RZ_TD if LEAGUE_RZ_TD else 0.0)
+        elasticity = float(self.rz_elasticity)
+        raw = gap / LEAGUE_RZ_TD if LEAGUE_RZ_TD else 0.0
+        mult = 1.0 + elasticity * raw
         return clamp(mult, 1.0 - RZ_TD_CLAMP, 1.0 + RZ_TD_CLAMP)
 
     def pass_anchor_scale(self, team: str, opponent: str | None) -> float:

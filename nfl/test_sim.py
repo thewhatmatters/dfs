@@ -17,6 +17,7 @@ from nfl.sim import (
     SimStats,
     DEFAULT_DRAWS,
     SPREAD_SIGMA,
+    CALIBRATED_TOTAL_SIGMA_FRAC,
     TOTAL_SIGMA_FRAC,
     apply_ilp_objective,
     draw_simplex,
@@ -27,8 +28,10 @@ from nfl.sim import (
     mean_target_share,
     model_point,
     neutral_pass_rate_of,
+    parse_calibration,
     passing_qb,
     pearson,
+    rush_history_scale,
     rush_share_means,
     scripted_pass_rate,
     share_kappa,
@@ -44,6 +47,8 @@ from nfl.sim import (
 from nfl.sim_efficiency import (
     INT_RATE,
     PASS_YPA,
+    RZ_TD_ELASTICITY,
+    DataEfficiency,
     OpportunityCount,
     PlaceholderEfficiency,
     ReceivingLine,
@@ -125,6 +130,9 @@ class FlagsTest(unittest.TestCase):
         default_seed = parse_args(["--csv", "x.csv"])
         self.assertEqual(default_seed.sim_seed, 1)
         self.assertEqual(default_seed.sim_efficiency, "data")
+        self.assertEqual(default_seed.sim_calibration, "off")
+        calibrated = parse_args(["--csv", "x.csv", "--sim-calibration", "all"])
+        self.assertEqual(calibrated.sim_calibration, "all")
         placeholder = parse_args(
             ["--csv", "x.csv", "--sim-efficiency", "placeholder"]
         )
@@ -2160,6 +2168,186 @@ class LowTotalQbTest(unittest.TestCase):
         self.assertGreater(gs.by_pid["willis"].mean, 12.0)
         self.assertLess(gs.by_pid["willis"].mean, 20.0)
         self.assertGreater(gs.by_pid["willis"].p90, role_share + 2.0)
+
+
+def _opp_slate():
+    """One game, both teams on the opportunity path (a WR with target weeks)."""
+
+    def side(team, opponent, home):
+        game = f"{opponent}@{team}" if home else f"{team}@{opponent}"
+        common = dict(
+            team=team,
+            opponent=opponent,
+            game=game,
+            implied_total=22.0,
+            implied_opp=22.0,
+            total=44.0,
+            spread=0.0,
+            depth_rank=1,
+        )
+        qb = _pl(pid=f"{team}-qb", name=f"{team} QB", position="QB", salary=8000, **common)
+        wr = _pl(pid=f"{team}-wr", name=f"{team} WR", position="WR", salary=7000, **common)
+        rb = _pl(pid=f"{team}-rb", name=f"{team} RB", position="RB", salary=6500, **common)
+        dst_fields = dict(common)
+        dst_fields["depth_rank"] = None
+        dst = _pl(
+            pid=f"{team}-def",
+            name=f"{team} DEF",
+            position="DEF",
+            salary=4000,
+            **dst_fields,
+        )
+        weeks = []
+        for week in (1, 2, 3):
+            weeks.append(
+                TargetWeek(
+                    season=2024,
+                    week=week,
+                    position="WR",
+                    player_name=wr.name,
+                    team_fd=team,
+                    targets=8.0,
+                    target_share=0.25,
+                    team_targets=32.0,
+                    team_pass_attempts=34.0,
+                )
+            )
+        return [qb, wr, rb, dst], weeks
+
+    det, det_weeks = side("DET", "GB", True)
+    gb, gb_weeks = side("GB", "DET", False)
+    inputs = SimInputs(targets=tuple(det_weeks + gb_weeks))
+    return det + gb, inputs
+
+
+class CalibrationTest(unittest.TestCase):
+    def test_off_is_empty_and_unknown_raises(self) -> None:
+        self.assertEqual(parse_calibration(None), frozenset())
+        self.assertEqual(parse_calibration("off"), frozenset())
+        self.assertEqual(
+            parse_calibration("all"),
+            frozenset({"team", "level", "rates"}),
+        )
+        with self.assertRaises(ValueError):
+            parse_calibration("weather")
+
+    def test_default_path_matches_uncalibrated_draws(self) -> None:
+        players, inputs = _opp_slate()
+        bare = simulate_games(players, n=30, seed=3, inputs=inputs)
+        named = simulate_games(
+            players, n=30, seed=3, inputs=inputs, calibration="off"
+        )
+        self.assertEqual(bare.draws, named.draws)
+        self.assertEqual(len(bare.game_draws), 30)
+
+    def test_team_step_widens_the_total_and_flips_opponent_signs(self) -> None:
+        players, inputs = _opp_slate()
+        base = simulate_games(players, n=2500, seed=1, inputs=inputs)
+        wide = simulate_games(
+            players, n=2500, seed=1, inputs=inputs, calibration="team"
+        )
+        base_totals = [away + home for _g, _a, _h, away, home in base.game_draws]
+        wide_totals = [away + home for _g, _a, _h, away, home in wide.game_draws]
+        self.assertGreater(
+            _std(wide_totals),
+            _std(base_totals) * (CALIBRATED_TOTAL_SIGMA_FRAC / TOTAL_SIGMA_FRAC) * 0.85,
+        )
+        def pair(sim, left, right):
+            return pearson(list(sim.draws[left]), list(sim.draws[right]))
+
+        # Script-only path: trailing team passes more, so the QB rises when
+        # his own score (and the opposing DEF's points allowed) is low.
+        self.assertGreater(pair(base, "DET-qb", "GB-def"), 0.05)
+        self.assertLess(pair(base, "DET-qb", "GB-qb"), -0.05)
+        # Drawn team score: QB up with his own points, down with the DEF
+        # that allowed them, and up with the other QB through the total.
+        self.assertLess(pair(wide, "DET-qb", "GB-def"), -0.15)
+        self.assertGreater(pair(wide, "DET-qb", "GB-qb"), 0.05)
+        self.assertGreater(pair(wide, "DET-qb", "DET-wr"), 0.3)
+        det_pts = [row[4] for row in wide.game_draws]
+        self.assertGreater(pearson(list(wide.draws["DET-qb"]), det_pts), 0.45)
+        self.assertGreater(pearson(list(wide.draws["DET-rb"]), det_pts), 0.25)
+
+    def test_rush_history_lifts_the_rb_when_asked(self) -> None:
+        players, inputs = _opp_slate()
+        offense = TeamStat(
+            team_fd="DET",
+            side="offense",
+            pass_rate=0.57,
+            rush_yards=115.0 * 8,
+            pace_games=8,
+        )
+        leveled = SimInputs(targets=inputs.targets, team_stats=(offense,))
+        self.assertGreater(rush_history_scale(offense, 90.0), 1.1)
+        base = simulate_games(players, n=400, seed=2, inputs=leveled)
+        lifted = simulate_games(
+            players, n=400, seed=2, inputs=leveled, calibration="level"
+        )
+        self.assertGreater(
+            lifted.by_pid["DET-rb"].mean,
+            base.by_pid["DET-rb"].mean + 0.4,
+        )
+        # The other team has no rush history, so its back stays put.
+        self.assertAlmostEqual(
+            lifted.by_pid["GB-rb"].mean,
+            base.by_pid["GB-rb"].mean,
+            places=4,
+        )
+
+    def test_pass_multiplier_reaches_the_anchor_only_when_rates_are_on(self) -> None:
+        players, inputs = _opp_slate()
+        soft = TeamStat(
+            team_fd="GB",
+            side="defense",
+            week=1,
+            n=400,
+            pass_n=250,
+            yards_per_dropback_allowed=8.5,
+            pass_epa_per_play=0.35,
+            pass_success_rate=0.60,
+        )
+        bundle = SimInputs(
+            targets=inputs.targets,
+            team_weeks=(soft,),
+            team_stats=(soft,),
+        )
+        eff = DataEfficiency(bundle, before_week=2)
+        self.assertGreater(eff.pass_multiplier("GB"), 1.05)
+        off = simulate_games(
+            players, n=200, seed=4, inputs=bundle, efficiency=eff, calibration="off"
+        )
+        on = simulate_games(
+            players, n=200, seed=4, inputs=bundle, efficiency=eff, calibration="rates"
+        )
+        # DET's opponent is GB, so only DET's passing game sees the multiplier.
+        self.assertGreater(on.by_pid["DET-qb"].mean, off.by_pid["DET-qb"].mean + 0.3)
+        self.assertGreater(on.by_pid["DET-wr"].mean, off.by_pid["DET-wr"].mean + 0.15)
+        self.assertAlmostEqual(
+            on.by_pid["GB-qb"].mean, off.by_pid["GB-qb"].mean, places=4
+        )
+        # Elasticity is restored after the run.
+        self.assertEqual(eff.rz_elasticity, 1.0)
+
+    def test_softer_red_zone_elasticity_gives_a_rate_a_slope(self) -> None:
+        def bundle(rate: float) -> SimInputs:
+            off = TeamStat(
+                team_fd="DET",
+                side="offense",
+                week=1,
+                n=800,
+                red_zone_td_rate=rate,
+            )
+            return SimInputs(team_weeks=(off,))
+
+        stiff = DataEfficiency(bundle(0.70), before_week=2)
+        self.assertAlmostEqual(stiff.td_multiplier("DET", "GB"), 1.0 + 0.15, places=4)
+        stiff.set_rz_elasticity(RZ_TD_ELASTICITY)
+        moved = stiff.td_multiplier("DET", "GB")
+        self.assertGreater(moved, 1.02)
+        self.assertLess(moved, 1.0 + 0.15)
+        higher = DataEfficiency(bundle(0.77), before_week=2)
+        higher.set_rz_elasticity(RZ_TD_ELASTICITY)
+        self.assertGreater(higher.td_multiplier("DET", "GB"), moved + 0.02)
 
 
 if __name__ == "__main__":

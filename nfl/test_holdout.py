@@ -454,6 +454,7 @@ class ReportTest(unittest.TestCase):
             load=self._load,
             prop_fetch=lambda season: ([], "props_closing: no rows"),
         )
+        self.assertEqual(report["sim_calibration"], "off")
         self.assertFalse(report["props"]["available"])
         self.assertIn("no rows", report["props"]["notes"][0])
         self.assertGreater(report["errors"]["full"]["board"]["QB"]["n"], 0)
@@ -519,7 +520,18 @@ class ReportTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("--sensitivity-week", proc.stdout)
+        self.assertIn("--calibration", proc.stdout)
         self.assertIn("±10%", proc.stdout)
+
+    def test_unknown_calibration_is_a_choke(self) -> None:
+        proc = subprocess.run(
+            [sys.executable, "-m", "nfl.holdout", "--season", "2024", "--calibration", "weather"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("choke HOLDOUT", proc.stderr)
 
     def test_main_writes_json_without_network(self) -> None:
         def boom(*_args, **_kwargs):

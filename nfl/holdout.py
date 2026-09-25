@@ -5,7 +5,12 @@ python3 -m nfl.holdout --season 2024 --weeks 1-18 --n 3000 --json-out results/ho
 python3 -m nfl.holdout --season 2025 --weeks 1-18 --n 3000 --json-out results/holdout-2025.json
 python3 -m nfl.holdout --season 2026 --weeks 2 --n 3000 --json-out results/holdout-2026-w2.json
 python3 -m nfl.holdout --seasons 2024,2025 --weeks 1-18 --n 3000 --json-out results/holdout-2024-2025.json
+python3 -m nfl.holdout --season 2025 --weeks 1-18 --n 3000 --calibration all
 ```
+
+``--calibration`` defaults to ``off`` (current draws). ``team``, ``level``,
+``rates``, or ``all`` turn on the opt-in sim. The report records
+``sim_calibration``.
 
 Each week uses the depth-chart pool (no FanDuel CSV) and only inputs from
 before that week, the same rule as ``nfl.backtest``. Week 1 therefore has
@@ -52,7 +57,7 @@ from nfl.players import Player
 from nfl.projections import score_player
 from nfl.props import norm_prop, prop_field
 from nfl.rules import FANDUEL_NFL
-from nfl.sim import GameSim, simulate_games
+from nfl.sim import GameSim, parse_calibration, simulate_games
 from nfl.sim_efficiency import DataEfficiency, build_efficiency, resolve_run_efficiency
 from nfl.sim_feed import resolve_sim_inputs
 from nfl.sim_inputs import CarryWeek, SimInputError, SimInputs, TargetWeek, TeamStat
@@ -683,6 +688,7 @@ def _sensitivity(
     week: int,
     n: int,
     seed: int,
+    calibration: str = "off",
 ) -> dict:
     report = {}
     for kind in _SENSITIVITY:
@@ -697,6 +703,7 @@ def _sensitivity(
                 seed=seed,
                 inputs=bundle,
                 efficiency=model,
+                calibration=calibration,
             )
             buckets: dict[str, list[float]] = defaultdict(list)
             for pl in players:
@@ -736,10 +743,13 @@ def run_holdout(
     run_sensitivity: bool = True,
     load=None,
     prop_fetch=None,
+    calibration: str = "off",
 ) -> dict:
     """Score every requested week. Network stays inside ``load`` and props."""
     loader = load or load_week
     props_of = prop_fetch or fetch_prop_rows
+    cal_name = (calibration or "off").strip().lower() or "off"
+    parse_calibration(cal_name)
     draws_n = max(1, int(n))
     sens_week = pick_sensitivity_week(weeks, sensitivity_week) if run_sensitivity else None
     errors = {
@@ -810,6 +820,7 @@ def run_holdout(
                 seed=int(seed),
                 inputs=loaded.sim_inputs,
                 efficiency=build_efficiency("placeholder", loaded.sim_inputs),
+                calibration=cal_name,
             )
             data_model, data_mode, data_note = resolve_run_efficiency(
                 "data",
@@ -822,6 +833,7 @@ def run_holdout(
                 seed=int(seed),
                 inputs=loaded.sim_inputs,
                 efficiency=data_model,
+                calibration=cal_name,
             )
             if data_note:
                 print(data_note, file=sys.stderr)
@@ -985,6 +997,7 @@ def run_holdout(
                     week=int(week),
                     n=draws_n,
                     seed=int(seed),
+                    calibration=cal_name,
                 )
 
     prop_by_pos: dict[str, list[tuple[float, float]]] = defaultdict(list)
@@ -1009,6 +1022,7 @@ def run_holdout(
         "weeks": [int(week) for week in weeks],
         "n": draws_n,
         "seed": int(seed),
+        "sim_calibration": cal_name,
         "seed_prior_season": bool(seed_prior_season),
         "prior_weeks_rule": "weeks 1..W-1 only; week 1 is empty unless --seed-prior-season",
         "scored": scored,
@@ -1112,6 +1126,8 @@ def format_report(report: dict) -> str:
             seed=report["seed"],
         )
     ]
+    if report.get("sim_calibration") not in (None, "", "off"):
+        lines.append(f"sim-calibration: {report['sim_calibration']}")
     if report.get("seed_prior_season"):
         lines.append("seed-prior-season: on")
     else:
@@ -1257,6 +1273,13 @@ def main(argv: list[str] | None = None) -> int:
         default=3000,
         help="sim draws per week (default 3000)",
     )
+    ap.add_argument(
+        "--calibration",
+        default="off",
+        help="opt-in sim steps: off (default), team, level, rates, all. "
+        "off is the current data mode. Do not treat a non-off run as the "
+        "default until it beats data mode on 2025.",
+    )
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--json-out", default=None, help="write the report JSON here")
     ap.add_argument(
@@ -1274,6 +1297,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         seasons = parse_seasons(args.seasons, args.season)
         weeks = parse_weeks(args.weeks)
+        parse_calibration(args.calibration)
     except ValueError as exc:
         print(f"choke HOLDOUT: {exc}", file=sys.stderr)
         return 1
@@ -1287,6 +1311,7 @@ def main(argv: list[str] | None = None) -> int:
         seed=args.seed,
         seed_prior_season=args.seed_prior_season,
         sensitivity_week=args.sensitivity_week,
+        calibration=args.calibration,
     )
     text = format_report(report)
     print(text)
