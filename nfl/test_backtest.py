@@ -1510,8 +1510,26 @@ class LiveBacktestFixesTest(unittest.TestCase):
         self.assertIn("DEF", positions)
         def_row = next(row for row in report.rows if row.position == "DEF")
         self.assertEqual(def_row.n, 1)
-        self.assertIn("DEF", report.to_text())
-        self.assertIn("sim efficiency: placeholder", report.to_text())
+        text = report.to_text()
+        self.assertIn("DEF", text)
+        self.assertEqual(
+            text.splitlines()[0],
+            "backtest season 2026 week 2  n 1  sim efficiency: placeholder",
+        )
+        data = run_backtest(
+            [defense],
+            [dst],
+            season=2026,
+            week=2,
+            n=20,
+            seed=1,
+            sim_inputs=None,
+            efficiency="data",
+        )
+        self.assertEqual(
+            data.to_text().splitlines()[0],
+            "backtest season 2026 week 2  n 1  sim efficiency: data",
+        )
         starter_pos = [row.position for row in report.starters]
         self.assertIn("DEF", starter_pos)
 

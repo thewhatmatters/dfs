@@ -240,6 +240,78 @@ class PayloadTest(unittest.TestCase):
         self.assertTrue(all(r["run_at"] == board[0]["run_at"] for r in sims))
         self.assertIn("sim: 5 rows", summarize(rows))
 
+    def test_sim_rows_name_the_efficiency_mode(self) -> None:
+        import csv
+        import io
+        import tempfile
+        from contextlib import redirect_stderr
+        from pathlib import Path
+
+        entries = self._entries()
+
+        class Stats:
+            def __init__(self) -> None:
+                self.mean = 12.5
+                self.p10 = 6.0
+                self.p50 = 11.0
+                self.p90 = 20.0
+
+        sim = {e.player.pid: Stats() for e in entries}
+        rows = projection_rows(
+            entries,
+            season=2026,
+            week=3,
+            season_type="REG",
+            run_at="2026-09-25T04:00:00+00:00",
+            model_version="abc1234",
+            sim_by_pid=sim,
+        )
+        board = [r for r in rows if r["model"] == "board"]
+        sims = [r for r in rows if r["model"] == "sim"]
+        self.assertTrue(all("sim_efficiency" not in r["inputs"] for r in board))
+        self.assertTrue(all(r["inputs"]["sim_efficiency"] == "placeholder" for r in sims))
+
+        def load(_args, _today):
+            return 2026, 3, entries
+
+        with patch("nfl.publish_projections.load_slate", load), patch(
+            "nfl.publish_projections.maybe_sim", return_value=sim
+        ), patch(
+            "nfl.publish_projections.model_version", return_value="abc1234"
+        ), patch("nfl.publish_projections.post_projection_rows") as post:
+            with tempfile.TemporaryDirectory() as tmp:
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    rc = main(
+                        [
+                            "--dry-run",
+                            "--out-dir",
+                            tmp,
+                            "--sim",
+                            "10",
+                            "--sim-efficiency",
+                            "data",
+                        ]
+                    )
+                files = list(Path(tmp).iterdir())
+                payload = json.loads(next(p for p in files if p.suffix == ".json").read_text())
+                with next(p for p in files if p.suffix == ".csv").open(encoding="utf-8") as fh:
+                    written = list(csv.DictReader(fh))
+        post.assert_not_called()
+        self.assertEqual(rc, 0)
+        log = err.getvalue()
+        self.assertIn("model_version=abc1234", log)
+        self.assertIn("sim_efficiency=data", log)
+        json_sims = [r for r in payload["rows"] if r["model"] == "sim"]
+        json_board = [r for r in payload["rows"] if r["model"] == "board"]
+        self.assertTrue(json_sims)
+        self.assertTrue(all(r["inputs"]["sim_efficiency"] == "data" for r in json_sims))
+        self.assertTrue(all("sim_efficiency" not in r["inputs"] for r in json_board))
+        csv_sims = [r for r in written if r["model"] == "sim"]
+        self.assertTrue(
+            all(json.loads(r["inputs"])["sim_efficiency"] == "data" for r in csv_sims)
+        )
+
 
 class SimGuardTest(unittest.TestCase):
     def test_missing_sim_publishes_board_only(self) -> None:

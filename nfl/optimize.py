@@ -967,6 +967,7 @@ def main(argv: list[str] | None = None) -> int:
     game_sim = None
     if sim_n > 0:
         print(sim_header(sim_n), file=sys.stderr)
+        print(f"sim efficiency: {args.sim_efficiency}", file=sys.stderr)
         weeks = args.targets_weeks or (
             [args.targets_week] if args.targets_week else None
         )
@@ -1183,11 +1184,13 @@ def _print_lineups(
     sim_by_pid: dict,
 ) -> None:
     lu = lu_dicts[0]
-    print(
+    summary = (
         f"{lu['method']}  objective {args.objective}  "
-        f"remain ${lu['salary_remaining']:,}  teams {lu['teams']}",
-        file=sys.stderr,
+        f"remain ${lu['salary_remaining']:,}  teams {lu['teams']}"
     )
+    if _sim_n(args) > 0:
+        summary += f"  sim efficiency: {args.sim_efficiency}"
+    print(summary, file=sys.stderr)
     if len(lu_dicts) != args.n_lineups:
         print(
             f"lineups {len(lu_dicts)}/{args.n_lineups}  "

@@ -40,7 +40,9 @@ The key is the header only. A query-string key is not sent (the API returns
 by every row and both models. Posting that same `run_at` again updates in
 place. A new `run_at` is a new run.
 
-`model_version` is `git rev-parse --short HEAD`.
+`model_version` is `git rev-parse --short HEAD`. The run log also prints
+`sim_efficiency` (default `placeholder`). Each `model=sim` row stores that
+mode on `inputs.sim_efficiency`. Board rows do not.
 
 ## What gets scored
 
