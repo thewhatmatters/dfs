@@ -9,7 +9,11 @@ JAC↔JAX, WAS↔WSH. FanDuel book else median of US books.
 and maps `home_team_fd` / `away_team_fd` through the same FanDuel abbrevs.
 The optimizer passes gangstash. `--lines-file` (CSV or JSON) and
 `--lines-json` replay a file and ignore the live source. A past `--week`
-prefers `dataset=closing_lines`, then `game_lines`.
+prefers `dataset=closing_lines`, then `game_lines`. A lines file accepts
+FanDuel columns and the nflverse schedule columns (`home_team`,
+`away_team`, `spread_line`, `total_line`, `home_implied_tt`,
+`away_implied_tt`, `season`, `week`). `JAX`→`JAC` and `LA`→`LAR`.
+An unrecognized column, or a file that matches no slate game, is an error.
 
 implied_home = (total - home_spread) / 2
 implied_away = (total + home_spread) / 2
@@ -369,6 +373,164 @@ def parse_odds_games(
     return {fd: out[fd] for fd in {h for _, _, h in slate} | {a for _, a, _ in slate}}
 
 
+# Simple files (CSV or JSON without bookmakers). nflverse schedule names
+# are included. Anything else is an error — do not ignore extra columns.
+_LINE_COLUMNS = frozenset(
+    {
+        "home",
+        "away",
+        "home_team",
+        "away_team",
+        "home_team_fd",
+        "away_team_fd",
+        "spread",
+        "total",
+        "overUnder",
+        "spread_line",
+        "total_line",
+        "home_implied",
+        "away_implied",
+        "home_implied_total",
+        "away_implied_total",
+        "home_implied_tt",
+        "away_implied_tt",
+        "implied_home",
+        "implied_away",
+        "home_team_total",
+        "away_team_total",
+        "home_moneyline",
+        "away_moneyline",
+        "homeMoneyline",
+        "awayMoneyline",
+        "provider",
+        "commence_time",
+        "season",
+        "week",
+    }
+)
+
+
+def _reject_unknown_columns(rows: list[dict]) -> None:
+    unknown: set[str] = set()
+    for row in rows:
+        for key in row:
+            name = "" if key is None else str(key).strip()
+            if not name:
+                unknown.add("(blank)")
+                continue
+            if name not in _LINE_COLUMNS:
+                unknown.add(name)
+    if unknown:
+        raise LinesError(
+            "unrecognized line columns: " + ", ".join(sorted(unknown))
+        )
+
+
+def _cell_int(value: object) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError) as e:
+        raise LinesError(f"bad season or week in lines file: {value!r}") from e
+
+
+def _filter_line_rows(
+    rows: list[dict],
+    *,
+    season: int | None,
+    week: int | None,
+) -> list[dict]:
+    """Keep one season and week when the file has those columns.
+
+    A file with no season/week columns is already one slate. Several
+    seasons or weeks and no ``--season`` / ``--week`` is an error.
+    """
+    has_season = any(row.get("season") not in (None, "") for row in rows)
+    has_week = any(row.get("week") not in (None, "") for row in rows)
+    if season is None and week is None:
+        seasons = {
+            str(_cell_int(row.get("season")))
+            for row in rows
+            if row.get("season") not in (None, "")
+        }
+        weeks = {
+            str(_cell_int(row.get("week")))
+            for row in rows
+            if row.get("week") not in (None, "")
+        }
+        if len(seasons) > 1 or len(weeks) > 1:
+            raise LinesError(
+                "lines file has more than one season or week; pass --season and --week"
+            )
+        return rows
+    kept: list[dict] = []
+    for row in rows:
+        if season is not None and has_season:
+            raw = _cell_int(row.get("season"))
+            if raw is None or raw != int(season):
+                continue
+        if week is not None and has_week:
+            raw = _cell_int(row.get("week"))
+            if raw is None or raw != int(week):
+                continue
+        kept.append(row)
+    if not kept:
+        raise LinesError(
+            f"lines file matched 0 games for season {season} week {week}"
+        )
+    return kept
+
+
+def _normalize_line_row(row: dict) -> dict:
+    """Copy nflverse names onto the simple-file names."""
+    out = dict(row)
+    if not (out.get("home") or out.get("home_team_fd")) and out.get("home_team"):
+        out["home"] = out["home_team"]
+    if not (out.get("away") or out.get("away_team_fd")) and out.get("away_team"):
+        out["away"] = out["away_team"]
+    if out.get("spread") in (None, "") and out.get("spread_line") not in (None, ""):
+        out["spread"] = out["spread_line"]
+    if out.get("total") in (None, "") and out.get("total_line") not in (None, ""):
+        out["total"] = out["total_line"]
+    if out.get("home_implied_tt") not in (None, "") and not any(
+        out.get(key) not in (None, "")
+        for key in (
+            "home_implied",
+            "home_implied_total",
+            "implied_home",
+            "home_team_total",
+        )
+    ):
+        out["home_implied"] = out["home_implied_tt"]
+    if out.get("away_implied_tt") not in (None, "") and not any(
+        out.get(key) not in (None, "")
+        for key in (
+            "away_implied",
+            "away_implied_total",
+            "implied_away",
+            "away_team_total",
+        )
+    ):
+        out["away_implied"] = out["away_implied_tt"]
+    return out
+
+
+def _prepare_simple_rows(
+    rows: list[dict],
+    *,
+    season: int | None,
+    week: int | None,
+) -> list[dict]:
+    if not rows:
+        raise LinesError("lines file has no line rows")
+    _reject_unknown_columns(rows)
+    return [
+        _normalize_line_row(row)
+        for row in _filter_line_rows(rows, season=season, week=week)
+    ]
+
+
 def _fd_cell(raw: object) -> str:
     text = str(raw or "").strip()
     if not text:
@@ -419,6 +581,8 @@ def parse_simple_games(
         if not away or not home:
             continue
         index[(away, home)] = row
+    if not index:
+        raise LinesError("lines file matched 0 games")
     out: dict[str, TeamLine] = {}
     missing: list[str] = []
     for game, away_fd, home_fd in slate:
@@ -455,6 +619,8 @@ def load_lines_json(
     start: datetime | None = None,
     end: datetime | None = None,
     source: str = "lines-json",
+    season: int | None = None,
+    week: int | None = None,
 ) -> dict[str, TeamLine]:
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     if isinstance(raw, dict) and "games" in raw:
@@ -464,19 +630,24 @@ def load_lines_json(
     first = raw[0]
     if "bookmakers" in first and "home_team" in first:
         return parse_odds_games(raw, slate, start=start, end=end)
-    return parse_simple_games(raw, slate, source=source)
+    prepared = _prepare_simple_rows(raw, season=season, week=week)
+    return parse_simple_games(prepared, slate, source=source)
 
 
 def load_lines_csv(
     path: Path,
     slate: list[tuple[str, str, str]],
+    *,
+    season: int | None = None,
+    week: int | None = None,
 ) -> dict[str, TeamLine]:
-    """CSV with ``home,away,spread,total`` or implied-total columns."""
+    """CSV with FanDuel or nflverse line columns. Extra columns are an error."""
     with Path(path).open(newline="", encoding="utf-8") as fh:
         rows = [dict(row) for row in csv.DictReader(fh)]
     if not rows:
         raise LinesError(f"{path} has no line rows")
-    return parse_simple_games(rows, slate, source="lines-file")
+    prepared = _prepare_simple_rows(rows, season=season, week=week)
+    return parse_simple_games(prepared, slate, source="lines-file")
 
 
 def load_lines_file(
@@ -485,12 +656,22 @@ def load_lines_file(
     *,
     start: datetime | None = None,
     end: datetime | None = None,
+    season: int | None = None,
+    week: int | None = None,
 ) -> dict[str, TeamLine]:
     """CSV or JSON. Wins over the live lines source."""
     path = Path(path)
     if path.suffix.lower() == ".csv":
-        return load_lines_csv(path, slate)
-    return load_lines_json(path, slate, start=start, end=end, source="lines-file")
+        return load_lines_csv(path, slate, season=season, week=week)
+    return load_lines_json(
+        path,
+        slate,
+        start=start,
+        end=end,
+        source="lines-file",
+        season=season,
+        week=week,
+    )
 
 
 def _odds_key() -> str:
@@ -666,9 +847,13 @@ def ingest_slate_lines(
     start, end = slate_window(day)
 
     if lines_file is not None:
-        return load_lines_file(lines_file, slate, start=start, end=end)
+        return load_lines_file(
+            lines_file, slate, start=start, end=end, season=season, week=week
+        )
     if lines_json is not None:
-        return load_lines_json(lines_json, slate, start=start, end=end)
+        return load_lines_json(
+            lines_json, slate, start=start, end=end, season=season, week=week
+        )
 
     src = (source or "oddsapi").strip().lower()
     if src == "gangstash" and week is not None:

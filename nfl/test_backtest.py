@@ -6,7 +6,7 @@ import io
 import json
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import date
 from pathlib import Path
 from unittest.mock import patch
@@ -22,7 +22,7 @@ from nfl.backtest import (
 )
 from nfl.props import props_for_week
 from nfl.sim import simulate_games
-from nfl.gangstash import GangstashDataKeyMissing, dataset_cache_file
+from nfl.gangstash import GangstashDataError, GangstashDataKeyMissing, dataset_cache_file
 from nfl.gangstash_data import fetch_player_stats_weekly
 from nfl.players import Player
 from nfl.projections import week1_score
@@ -192,20 +192,14 @@ class BacktestReportTest(unittest.TestCase):
                 "nfl.backtest.resolve_sim_inputs",
                 return_value=(None, "sim inputs: gangstash unavailable — role shares deterministic"),
             ), patch("nfl.gangstash.http_json", side_effect=AssertionError("network")):
-                buf = io.StringIO()
-                with redirect_stdout(buf):
+                err = io.StringIO()
+                with redirect_stderr(err):
                     code = main(
                         ["--csv", str(csv_path), "--season", "2026", "--week", "2", "--n", "20"]
                     )
-        self.assertEqual(code, 0)
-        text = buf.getvalue()
-        self.assertIn(
-            "missing: closing_lines, game_lines, depth, injuries, targets, snaps, props, sim_inputs",
-            text,
-        )
-        self.assertIn("pool: full", text)
-        self.assertIn("pool: starters", text)
-        self.assertIn("QB", text)
+        self.assertEqual(code, 1)
+        self.assertIn("choke LINES:", err.getvalue())
+        self.assertIn("no lines", err.getvalue())
 
     def test_index_actuals_uses_fd_points(self) -> None:
         rows = [
@@ -394,7 +388,17 @@ class WeekScopeTest(unittest.TestCase):
                 return_value=(None, ""),
             ), patch("nfl.gangstash.http_json", side_effect=AssertionError("network")):
                 code = main(
-                    ["--csv", str(csv_path), "--season", "2026", "--week", "2", "--n", "5"]
+                    [
+                        "--csv",
+                        str(csv_path),
+                        "--season",
+                        "2026",
+                        "--week",
+                        "2",
+                        "--n",
+                        "5",
+                        "--allow-missing-lines",
+                    ]
                 )
         self.assertEqual(code, 0)
         self.assertEqual(targets.call_args.kwargs["weeks"], [1])
@@ -516,12 +520,15 @@ class WeekScopeTest(unittest.TestCase):
                 }
             ],
         )
-        names = [pl.name for pl in players]
-        self.assertNotIn("Sam Darnold", names)
-        self.assertIn("Drew Lock", names)
+        by_name = {pl.name: pl for pl in players}
+        self.assertIn("Sam Darnold", by_name)
+        self.assertIn("Drew Lock", by_name)
+        self.assertIsNone(by_name["Sam Darnold"].depth_rank)
+        self.assertEqual(by_name["Drew Lock"].depth_rank, 1)
         self.assertNotIn("injuries", gaps)
         gs = simulate_games(players, n=40, seed=1)
         self.assertGreater(gs.by_pid["lock"].mean, 12.0)
+        self.assertLess(gs.by_pid["darnold"].mean, 0.5)
 
     def test_starters_are_depth_1_who_played(self) -> None:
         starter = _pl(
@@ -547,7 +554,31 @@ class WeekScopeTest(unittest.TestCase):
             _actual("Bench WR", "MIA", 4.0, targets=2),
         ]
         self.assertTrue(is_starter(starter, actuals[0]))
-        self.assertFalse(is_starter(bench, actuals[1]))
+        self.assertTrue(is_starter(bench, actuals[1]))
+        fourth = _pl(
+            pid="w4",
+            name="Fourth WR",
+            position="WR",
+            team="MIA",
+            opponent="NE",
+            game="NE@MIA",
+            depth_rank=4,
+        )
+        self.assertFalse(
+            is_starter(fourth, _actual("Fourth WR", "MIA", 3.0, targets=1))
+        )
+        backup_qb = _pl(
+            pid="qb2",
+            name="Backup QB",
+            position="QB",
+            team="MIA",
+            opponent="NE",
+            game="NE@MIA",
+            depth_rank=2,
+        )
+        self.assertFalse(
+            is_starter(backup_qb, _actual("Backup QB", "MIA", 4.0, pass_attempts=10))
+        )
         sat = _pl(
             pid="z",
             name="Sat WR",
@@ -568,7 +599,7 @@ class WeekScopeTest(unittest.TestCase):
             missing=[],
         )
         self.assertEqual(report.n, 2)
-        self.assertEqual(report.starters_n, 1)
+        self.assertEqual(report.starters_n, 2)
         only = run_backtest(
             [starter, bench],
             actuals,
@@ -579,7 +610,332 @@ class WeekScopeTest(unittest.TestCase):
             starters_only=True,
         )
         self.assertEqual(only.pool, "starters")
-        self.assertEqual(only.n, 1)
+        self.assertEqual(only.n, 2)
+
+    def test_csv_doubtful_hands_off_and_questionable_stays(self) -> None:
+        darnold = _pl(
+            pid="darnold",
+            name="Sam Darnold",
+            position="QB",
+            team="SEA",
+            opponent="NE",
+            game="NE@SEA",
+            salary=8000,
+            injury="D",
+            depth_rank=None,
+            implied_total=None,
+        )
+        lock = _pl(
+            pid="lock",
+            name="Drew Lock",
+            position="QB",
+            team="SEA",
+            opponent="NE",
+            game="NE@SEA",
+            salary=6000,
+            injury="",
+            depth_rank=None,
+            implied_total=None,
+        )
+        murray = _pl(
+            pid="murray",
+            name="Kyler Murray",
+            position="QB",
+            team="ARI",
+            opponent="LAR",
+            game="LAR@ARI",
+            salary=7800,
+            injury="Q",
+            depth_rank=None,
+            implied_total=None,
+        )
+        wentz = _pl(
+            pid="wentz",
+            name="Carson Wentz",
+            position="QB",
+            team="ARI",
+            opponent="LAR",
+            game="LAR@ARI",
+            salary=5600,
+            injury="",
+            depth_rank=None,
+            implied_total=None,
+        )
+        players, _gaps, _notes = apply_week_context(
+            [darnold, lock, murray, wentz],
+            season=2026,
+            week=2,
+            line_rows=[
+                {
+                    "home_team_fd": "SEA",
+                    "away_team_fd": "NE",
+                    "season": 2026,
+                    "week": 2,
+                    "spread": -3.0,
+                    "total": 44.0,
+                },
+                {
+                    "home_team_fd": "ARI",
+                    "away_team_fd": "LAR",
+                    "season": 2026,
+                    "week": 2,
+                    "spread": 1.0,
+                    "total": 45.0,
+                },
+            ],
+            depth_raw=[
+                _depth("Sam Darnold", "SEA", "QB", 1),
+                _depth("Drew Lock", "SEA", "QB", 2),
+                _depth("Kyler Murray", "ARI", "QB", 1),
+                _depth("Carson Wentz", "ARI", "QB", 2),
+            ],
+        )
+        by_name = {pl.name: pl for pl in players}
+        self.assertIsNone(by_name["Sam Darnold"].depth_rank)
+        self.assertEqual(by_name["Drew Lock"].depth_rank, 1)
+        self.assertEqual(by_name["Kyler Murray"].depth_rank, 1)
+        self.assertEqual(by_name["Carson Wentz"].depth_rank, 2)
+        before = by_name["Kyler Murray"].objective
+        report = run_backtest(
+            players,
+            [
+                _actual("Sam Darnold", "SEA", 0.0, pass_attempts=0),
+                _actual("Drew Lock", "SEA", 21.4, pass_attempts=30),
+                _actual("Kyler Murray", "ARI", 0.0, pass_attempts=0),
+                _actual("Carson Wentz", "ARI", 6.3, pass_attempts=12),
+            ],
+            season=2026,
+            week=2,
+            n=20,
+            seed=1,
+        )
+        self.assertEqual(by_name["Kyler Murray"].objective, before)
+        self.assertIn("questionable DNP: 1 (projection kept)", report.to_text())
+        self.assertTrue(
+            is_starter(
+                by_name["Drew Lock"],
+                _actual("Drew Lock", "SEA", 21.4, pass_attempts=30),
+            )
+        )
+
+    def test_nflverse_lines_file_filters_week_and_maps_teams(self) -> None:
+        from nfl.lines import load_lines_csv
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "lines.csv"
+            path.write_text(
+                "home_team,away_team,spread_line,total_line,home_implied_tt,away_implied_tt,season,week\n"
+                "MIA,NE,6.5,41.5,17.5,24.0,2026,2\n"
+                "LA,JAX,-3,47,25,22,2026,3\n",
+                encoding="utf-8",
+            )
+            by_team = load_lines_csv(
+                path,
+                [("NE@MIA", "NE", "MIA")],
+                season=2026,
+                week=2,
+            )
+        self.assertAlmostEqual(by_team["MIA"].implied_home or 0, 17.5, places=2)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "rams.csv"
+            path.write_text(
+                "home_team,away_team,spread_line,total_line,season,week\n"
+                "LA,JAX,-3,47,2026,2\n",
+                encoding="utf-8",
+            )
+            rams = load_lines_csv(
+                path,
+                [("JAC@LAR", "JAC", "LAR")],
+                season=2026,
+                week=2,
+            )
+        self.assertIn("LAR", rams)
+        self.assertIn("JAC", rams)
+
+    def test_unrecognized_line_column_is_a_hard_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "players.csv"
+            lines_path = root / "lines.csv"
+            csv_path.write_text(
+                "Id,Position,Nickname,Salary,Team,Opponent,Game,FPPG,Injury Indicator,Roster Position\n"
+                "1,QB,Malik Willis,7000,MIA,NE,NE@MIA,,,\n",
+                encoding="utf-8",
+            )
+            lines_path.write_text(
+                "home_team,away_team,spread_line,total_line,extra_book,season,week\n"
+                "MIA,NE,-6.5,41.5,pinnacle,2026,2\n",
+                encoding="utf-8",
+            )
+            with patch(
+                "nfl.backtest.fetch_player_stats_weekly",
+                return_value=([_actual("Malik Willis", "MIA", 14.0)], {}),
+            ):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    code = main(
+                        [
+                            "--csv",
+                            str(csv_path),
+                            "--season",
+                            "2026",
+                            "--week",
+                            "2",
+                            "--lines-file",
+                            str(lines_path),
+                        ]
+                    )
+        self.assertEqual(code, 1)
+        text = err.getvalue()
+        self.assertIn("unrecognized line columns", text)
+        self.assertIn("extra_book", text)
+        self.assertIn("choke LINES:", text)
+
+    def test_zero_matched_line_games_is_a_hard_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            csv_path = root / "players.csv"
+            lines_path = root / "lines.csv"
+            csv_path.write_text(
+                "Id,Position,Nickname,Salary,Team,Opponent,Game,FPPG,Injury Indicator,Roster Position\n"
+                "1,QB,Malik Willis,7000,MIA,NE,NE@MIA,,,\n",
+                encoding="utf-8",
+            )
+            lines_path.write_text(
+                "home_team,away_team,spread_line,total_line,season,week\n"
+                "DAL,PHI,-3,44,2026,3\n",
+                encoding="utf-8",
+            )
+            with patch(
+                "nfl.backtest.fetch_player_stats_weekly",
+                return_value=([_actual("Malik Willis", "MIA", 14.0)], {}),
+            ):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    code = main(
+                        [
+                            "--csv",
+                            str(csv_path),
+                            "--season",
+                            "2026",
+                            "--week",
+                            "2",
+                            "--lines-file",
+                            str(lines_path),
+                        ]
+                    )
+        self.assertEqual(code, 1)
+        self.assertIn("0 games", err.getvalue())
+
+    def test_unknown_closing_lines_is_loud_and_refuses_to_score(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = Path(tmp) / "players.csv"
+            csv_path.write_text(
+                "Id,Position,Nickname,Salary,Team,Opponent,Game,FPPG,Injury Indicator,Roster Position\n"
+                "1,QB,QB One,8000,DET,NO,NO@DET,,,\n",
+                encoding="utf-8",
+            )
+            with patch(
+                "nfl.backtest.fetch_player_stats_weekly",
+                return_value=([_actual("QB One", "DET", 11.0)], {}),
+            ), patch(
+                "nfl.backtest.fetch_closing_lines",
+                side_effect=GangstashDataError("gangstash closing_lines Unknown dataset"),
+            ), patch(
+                "nfl.backtest.fetch_game_lines",
+                return_value=([], {}),
+            ), patch(
+                "nfl.backtest.fetch_week_injuries",
+                side_effect=GangstashDataError("gangstash injuries Unknown dataset"),
+            ), patch(
+                "nfl.backtest.fetch_depth_charts",
+                return_value=([], {}),
+            ), patch(
+                "nfl.backtest.load_optimizer_targets",
+                return_value=([], {}),
+            ), patch(
+                "nfl.backtest.load_optimizer_snaps",
+                return_value=([], {}),
+            ), patch(
+                "nfl.backtest.fetch_props",
+                return_value=([], {}),
+            ), patch(
+                "nfl.backtest.resolve_sim_inputs",
+                return_value=(None, ""),
+            ):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    code = main(
+                        ["--csv", str(csv_path), "--season", "2026", "--week", "2", "--n", "5"]
+                    )
+        self.assertEqual(code, 1)
+        text = err.getvalue()
+        self.assertIn("closing_lines: not available (Unknown dataset)", text)
+        self.assertIn("choke LINES:", text)
+        self.assertNotIn("injuries", text)
+
+    def test_depth_uses_the_snapshot_closest_before_the_week(self) -> None:
+        from datetime import datetime, timezone
+
+        from nfl.depth import depth_rows_for_backtest
+
+        kickoff = datetime(2026, 9, 14, 17, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            early = root / "2026-09-08" / "depth_charts"
+            late = root / "2026-09-20" / "depth_charts"
+            early.mkdir(parents=True)
+            late.mkdir(parents=True)
+            early_row = {
+                "player_name": "Drew Lock",
+                "team_fd": "SEA",
+                "pos_grp": "3WR 1TE",
+                "pos_abb": "QB",
+                "pos_rank": 1,
+                "snapshot_at": "2026-09-08T12:00:00Z",
+            }
+            (early / "chart.json").write_text(
+                json.dumps({"data": [early_row], "truncated": False}),
+                encoding="utf-8",
+            )
+            (late / "chart.json").write_text(
+                json.dumps(
+                    {
+                        "data": [
+                            {
+                                "player_name": "Sam Darnold",
+                                "team_fd": "SEA",
+                                "pos_grp": "3WR 1TE",
+                                "pos_abb": "QB",
+                                "pos_rank": 1,
+                                "snapshot_at": "2026-09-20T12:00:00Z",
+                            }
+                        ],
+                        "truncated": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            rows, note = depth_rows_for_backtest(
+                [_depth("Sam Darnold", "SEA", "QB", 1)],
+                season=2026,
+                week=2,
+                kickoff=kickoff,
+                cache_root=root,
+            )
+            empty, current = depth_rows_for_backtest(
+                [],
+                season=2026,
+                week=2,
+                kickoff=kickoff,
+                cache_root=root / "missing",
+            )
+        self.assertEqual(rows[0]["player_name"], "Drew Lock")
+        self.assertIn("snapshot", note)
+        self.assertNotIn("no week column", note)
+        self.assertEqual(empty, [])
+        self.assertIn("current chart", current)
+        self.assertNotIn("no week column", current)
 
 
 def week2_fixture_report() -> str:

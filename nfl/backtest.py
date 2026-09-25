@@ -5,14 +5,16 @@ python3 -m nfl.backtest --csv nfl/data/<players-list>.csv --season 2026 --week 2
 ```
 
 Builds the board and the sim the way ``nfl.optimize`` does for that week:
-closing lines (then game lines), week injuries, depth, prior-week targets
-and snaps, and the latest pre-kickoff prop snapshot. An empty source is
-named on ``missing:`` and the week still scores. Targets and snaps are
-prior weeks only. Props from another week are dropped.
+closing lines (then game lines), the FanDuel injury column, depth, prior-week
+targets and snaps, and the latest pre-kickoff prop snapshot. An empty
+optional source is named on ``missing:`` and the week still scores. Lines
+are not optional: no lines is a hard stop unless ``--allow-missing-lines``.
+Targets and snaps are prior weeks only. Props from another week are dropped.
 
-``--lines-file`` is a CSV or JSON of historical lines. ``--starters-only``
-prints depth-1 players who played (plus DEF). The default prints both the
-full pool and that starters slice.
+``--lines-file`` is a CSV or JSON of historical lines (FanDuel or nflverse
+columns). ``--starters-only`` prints the effective depth chart who played:
+QB/RB/TE depth 1, WR depth 1–3, plus DEF. The default prints both the full
+pool and that starters slice.
 
 ``--projection-source`` stays ``board`` on the optimizer. This command
 only compares the two.
@@ -27,7 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from nfl.depth import attach_depth_ranks, scope_depth_rows
+from nfl.depth import attach_depth_ranks, depth_rows_for_backtest, scope_depth_rows
 from nfl.gangstash import (
     GangstashDataError,
     GangstashDataKeyMissing,
@@ -46,7 +48,7 @@ from nfl.gangstash_data import (
     map_game_lines,
     parse_player_stat_row,
 )
-from nfl.injuries import apply_injuries, injury_rows_from_records
+from nfl.injuries import handoff_chart, injury_rows_from_records, stamp_injuries
 from nfl.lines import (
     LinesError,
     load_lines_file,
@@ -267,11 +269,25 @@ def _played(row: dict) -> bool:
     return False
 
 
+_STARTER_RANKS = {
+    "QB": frozenset({1}),
+    "RB": frozenset({1}),
+    "TE": frozenset({1}),
+    "WR": frozenset({1, 2, 3}),
+}
+
+
 def is_starter(player: Player, row: dict) -> bool:
-    """Depth-1 skill players who played, plus every DEF with an actual."""
-    if (player.position or "").upper() in {"D", "DEF"}:
+    """Effective chart who played, plus every DEF.
+
+    QB, RB, and TE are depth 1 after an O/D/IR/NA handoff. WR is the top
+    three. A promoted backup counts.
+    """
+    pos = (player.position or "").upper()
+    if pos in {"D", "DEF"}:
         return True
-    if player.depth_rank != 1:
+    ranks = _STARTER_RANKS.get(pos)
+    if ranks is None or player.depth_rank not in ranks:
         return False
     return _played(row)
 
@@ -494,10 +510,13 @@ def apply_week_context(
     prop_rows: list[dict] | None = None,
     kickoff: datetime | None = None,
     lines_attached: bool = False,
+    depth_note: str | None = None,
 ) -> tuple[list[Player], list[str], list[str]]:
     """Join the same overlays the optimizer uses. Empty bags are missing.
 
     ``lines_attached`` means a ``--lines-file`` already set implied totals.
+    Injury codes come from the FanDuel CSV. ``injury_raw`` is used only
+    when a gangstash injuries payload was actually returned.
     """
     gaps: list[str] = []
     notes: list[str] = []
@@ -513,13 +532,13 @@ def apply_week_context(
     if injury_raw:
         parsed = injury_rows_from_records(injury_raw, season=season, week=week)
         if parsed:
-            players, _stats = apply_injuries(players, parsed)
-        else:
-            gaps.append("injuries")
-    else:
-        gaps.append("injuries")
+            players = stamp_injuries(players, parsed)
 
     chart, note = _depth_table(depth_raw or [], season=season, week=week)
+    if depth_note:
+        note = depth_note
+    elif note.startswith("depth chart has no week column"):
+        note = f"depth: current chart (no cached snapshot before week {int(week)})"
     if chart:
         players, _stats = attach_depth_ranks(
             players,
@@ -527,10 +546,11 @@ def apply_week_context(
             score_fn=lambda pl, rank: score_player(pl, rank),
             source="gangstash",
         )
-        if note:
-            notes.append(note)
     else:
         gaps.append("depth")
+    players = handoff_chart(players)
+    if note:
+        notes.append(note)
 
     if target_rows:
         players, _stats = attach_targets(players, target_rows)
@@ -568,6 +588,9 @@ def run_backtest(
     """Score ``players`` against weekly ``fd_points``. No network."""
     noted = _order_missing(list(missing or []))
     indexed = index_actual_rows(actual_rows)
+    dnp = _questionable_dnps(players, indexed)
+    notes = list(notes or ())
+    notes.append(f"questionable DNP: {dnp} (projection kept)")
     if not indexed and "player_stats_weekly" not in noted:
         noted = _order_missing(noted + ["player_stats_weekly"])
     game_sim = simulate_games(
@@ -620,6 +643,23 @@ def run_backtest(
         pool="full",
         notes=tuple(notes or ()),
     )
+
+
+def _questionable_dnps(
+    players: list[Player],
+    indexed: dict[tuple[str, str], dict],
+) -> int:
+    """Q on the CSV who recorded no counting stat. The projection stays."""
+    n = 0
+    for pl in players:
+        if (pl.injury or "").strip().upper() != "Q":
+            continue
+        info = indexed.get(((pl.team or "").upper(), match_key(pl.name)))
+        if info is None:
+            continue
+        if not _played(info["row"]):
+            n += 1
+    return n
 
 
 def _load_usage(
@@ -680,12 +720,30 @@ def _load_usage(
     return targets, snaps
 
 
+def _fetch_rows(fn) -> tuple[list[dict], str]:
+    """``(rows, error)``. An empty payload is rows ``[]`` and error ``""``."""
+    try:
+        rows, _meta = fn()
+    except (
+        GangstashDataKeyMissing,
+        GangstashKeyMissing,
+        GangstashTruncated,
+        GangstashDataError,
+        GangstashError,
+    ) as e:
+        return [], str(e)
+    if not isinstance(rows, list):
+        return [], ""
+    return [row for row in rows if isinstance(row, dict)], ""
+
+
 def _load_live(
     players: list[Player],
     *,
     season: int,
     week: int,
     lines_file: Path | None = None,
+    allow_missing_lines: bool = False,
 ) -> tuple[list[Player], list[dict], SimInputs | None, list[str], list[str]]:
     missing: list[str] = []
     notes: list[str] = []
@@ -705,31 +763,43 @@ def _load_live(
     lines_attached = False
     kickoff: datetime | None = None
     line_rows: list[dict] = []
+    closing_unknown = False
     if lines_file is not None:
         slate = slate_from_players(players)
         try:
             by_team = load_lines_file(
-                lines_file, slate, start=_WIDE_START, end=_WIDE_END
+                lines_file,
+                slate,
+                start=_WIDE_START,
+                end=_WIDE_END,
+                season=season,
+                week=week,
             )
-        except (LinesError, OSError, ValueError):
-            missing.append("game_lines")
-        else:
-            players = attach_team_lines(players, by_team)
-            lines_attached = True
-            stamps = [
-                parse_stamp(line.commence_time)
-                for line in by_team.values()
-                if line.commence_time
-            ]
-            stamps = [stamp for stamp in stamps if stamp is not None]
-            if stamps:
-                kickoff = min(stamps)
+        except (LinesError, OSError, ValueError) as e:
+            raise LinesError(str(e)) from e
+        players = attach_team_lines(players, by_team)
+        lines_attached = True
+        stamps = [
+            parse_stamp(line.commence_time)
+            for line in by_team.values()
+            if line.commence_time
+        ]
+        stamps = [stamp for stamp in stamps if stamp is not None]
+        if stamps:
+            kickoff = min(stamps)
     else:
-        closing = _try_rows(
-            "closing_lines",
-            lambda: fetch_closing_lines(season=season, week=week),
-            missing,
+        closing, closing_err = _fetch_rows(
+            lambda: fetch_closing_lines(season=season, week=week)
         )
+        if closing_err and "unknown dataset" in closing_err.lower():
+            closing_unknown = True
+            print(
+                "closing_lines: not available (Unknown dataset)",
+                file=sys.stderr,
+            )
+            notes.append("closing_lines: not available (Unknown dataset)")
+        if closing_err or not closing:
+            missing.append("closing_lines")
         closing = rows_for_season_week(closing, season, week)
         joined, ok = _join_line_rows(players, closing)
         if ok:
@@ -737,14 +807,15 @@ def _load_live(
             lines_attached = True
             kickoff = earliest_kickoff(closing)
             line_rows = closing
+            missing = [name for name in missing if name != "closing_lines"]
         else:
             if "closing_lines" not in missing:
                 missing.append("closing_lines")
-            game = _try_rows(
-                "game_lines",
-                lambda: fetch_game_lines(season=season, week=week),
-                missing,
+            game, game_err = _fetch_rows(
+                lambda: fetch_game_lines(season=season, week=week)
             )
+            if game_err or not game:
+                missing.append("game_lines")
             game = rows_for_season_week(game, season, week)
             joined, ok = _join_line_rows(players, game)
             if ok:
@@ -755,16 +826,26 @@ def _load_live(
                 missing = [name for name in missing if name != "game_lines"]
             elif "game_lines" not in missing:
                 missing.append("game_lines")
+        if not lines_attached and not allow_missing_lines:
+            detail = "no lines for this slate"
+            if closing_unknown:
+                detail += "; closing_lines: not available (Unknown dataset)"
+            detail += "; pass --lines-file or --allow-missing-lines"
+            raise LinesError(detail)
 
-    injury_raw = _try_rows(
-        "injuries",
-        lambda: fetch_week_injuries(season=season, week=week),
-        missing,
+    injury_raw, injury_err = _fetch_rows(
+        lambda: fetch_week_injuries(season=season, week=week)
     )
-    depth_raw = _try_rows(
-        "depth",
-        lambda: fetch_depth_charts(season=season, week=week),
-        missing,
+    if injury_err:
+        injury_raw = []
+    depth_fetched, _depth_err = _fetch_rows(
+        lambda: fetch_depth_charts(season=season, week=week)
+    )
+    depth_raw, depth_note = depth_rows_for_backtest(
+        depth_fetched,
+        season=season,
+        week=week,
+        kickoff=kickoff,
     )
     target_rows, snap_rows = _load_usage(
         players, season=season, week=week, missing=missing
@@ -774,7 +855,7 @@ def _load_live(
         lambda: fetch_props(season=season, week=week),
         missing,
     )
-    players, gaps, notes = apply_week_context(
+    players, gaps, context_notes = apply_week_context(
         players,
         season=season,
         week=week,
@@ -786,7 +867,9 @@ def _load_live(
         prop_rows=prop_rows,
         kickoff=kickoff or earliest_kickoff(line_rows),
         lines_attached=lines_attached,
+        depth_note=depth_note,
     )
+    notes.extend(context_notes)
     missing.extend(gaps)
     window = prior_weeks(week)
     try:
@@ -816,13 +899,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--lines-file",
         default=None,
-        help="CSV or JSON historical lines (spread/total or implied totals). "
+        help="CSV or JSON historical lines (FanDuel or nflverse columns). "
         "Wins over closing_lines and game_lines.",
+    )
+    ap.add_argument(
+        "--allow-missing-lines",
+        action="store_true",
+        help="score even when no closing, game, or file lines joined",
     )
     ap.add_argument(
         "--starters-only",
         action="store_true",
-        help="score only depth-1 players who played, plus DEF",
+        help="score QB/RB/TE depth 1 and WR depth 1-3 who played, plus DEF",
     )
     args = ap.parse_args(argv)
     if args.week < 1 or args.season < 1:
@@ -840,7 +928,11 @@ def main(argv: list[str] | None = None) -> int:
             season=args.season,
             week=args.week,
             lines_file=lines_path,
+            allow_missing_lines=args.allow_missing_lines,
         )
+    except LinesError as e:
+        print(f"choke LINES: {e}", file=sys.stderr)
+        return 1
     except (
         GangstashDataKeyMissing,
         GangstashKeyMissing,

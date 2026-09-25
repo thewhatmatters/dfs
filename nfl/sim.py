@@ -18,9 +18,12 @@ share that world:
    they are scaled to the pass anchor. Backups get no team passing volume.
    A rush-yard prop sets that RB's rush-yard mean. Missing history keeps
    the deterministic role share (team points × depth × position share × usage)
-   except the passing QB: that QB is scored from the pass-yard and pass-TD
-   anchors (scaled by drawn team points / implied) plus a rush-yard floor.
-   Other QBs on that team score 0.
+   except the passing QB. With no catcher history that QB is the pass-yard
+   and pass-TD anchors (scaled by drawn team points / implied) plus a
+   rush-yard floor. With catcher history the same passing floor is the
+   implied-total anchor, and the rush count is his own carries or at least
+   max(league rush share, that yard floor). Other QBs on that team score 0.
+   O, D, IR, and NA do not keep the starter job.
 
 Efficiency (yards per opportunity, TD rates) is ``PlaceholderEfficiency``
 in ``nfl/sim_efficiency.py``. Layer 4 replaces that class; it is not a
@@ -47,6 +50,7 @@ import math
 import random
 from dataclasses import dataclass, field, replace
 
+from nfl.injuries import is_inactive
 from nfl.names import match_key
 from nfl.players import Player
 from nfl.projections import (
@@ -118,12 +122,14 @@ DEFAULT_TARGETS_PER_ATTEMPT = 0.90
 DEFAULT_SHARE_KAPPA = 10.0
 KAPPA_MIN = 2.0
 KAPPA_MAX = 80.0
-# QB keeps this fraction of team rushes; RBs split the rest.
+# League-average share of team rushes for a starter QB. RBs split the rest.
+# On the opportunity path the starter takes his own carry history when he
+# has it, otherwise at least this share and the yard floor below.
 QB_RUSH_SHARE = 0.08
-# Role-share path (no catcher history) used to score a depth-1 QB as
-# implied × 0.50. Implied 17.5 landed near 8.8 with p90 near 11.4.
-# The passing QB on that path now uses the pass anchors plus this rush
-# floor: max(12, 0.8 × implied) yards, or the rush-yard prop.
+# Implied 17.5 used to be team points × 0.50 (about 8.8, p90 about 11.4).
+# The passing QB now adds this rush floor on every path: max(12, 0.8 ×
+# implied) yards, or the rush-yard prop. The passing floor is the
+# implied-total yard and TD anchor.
 QB_RUSH_YARDS_FLOOR = 12.0
 QB_RUSH_YARDS_PER_IMPLIED = 0.8
 # Passing yards ≈ implied total × scripted pass rate × this.
@@ -565,11 +571,40 @@ def _solo_world(rng: random.Random, player: Player) -> tuple[float, float]:
 
 
 def starter_qb_rush_yards(player: Player) -> float:
-    """Rush-yard mean for a passing QB who is not on the opportunity path."""
+    """Rush-yard floor for the passing QB. A rush prop replaces it."""
     if player.prop_rush_yds is not None:
         return max(0.0, float(player.prop_rush_yds))
     implied = float(player.implied_total or 0.0)
     return max(QB_RUSH_YARDS_FLOOR, implied * QB_RUSH_YARDS_PER_IMPLIED)
+
+
+def starter_qb_rush_attempts(
+    player: Player | None,
+    team_rushes: float,
+    index: _HistoryIndex,
+) -> float:
+    """Rush attempts for the passing QB on the opportunity path.
+
+    Own carry history wins. Otherwise a snap share scales the league rush
+    share. The result is at least that share and at least the yard floor
+    (``starter_qb_rush_yards`` / yards per carry). Passing yards stay the
+    scaled receiving lines.
+    """
+    league = max(0.0, float(team_rushes)) * QB_RUSH_SHARE
+    if player is None:
+        return league
+    carries = index.mean_carries(player)
+    if carries is not None and carries > 0:
+        hist = float(carries)
+    else:
+        snap = index.snap_mean(player)
+        if snap is not None and snap > 0:
+            hist = league * min(1.0, float(snap))
+        else:
+            hist = league
+    yards = starter_qb_rush_yards(player)
+    floor_att = (yards / QB_YPC) if QB_YPC else 0.0
+    return max(hist, floor_att)
 
 
 def starter_qb_points(
@@ -613,6 +648,8 @@ def _score_fallback(
     index: _HistoryIndex | None,
 ) -> float:
     """Role share, except the passing QB (anchors) and his backups (0)."""
+    if (player.position or "").upper() == "QB" and is_inactive(player):
+        return 0.0
     if (player.position or "").upper() != "QB":
         return _score_world(player, team_pts, opp_pts)
     team = (player.team or "").upper()
@@ -1214,9 +1251,10 @@ def passing_qb(players: list[Player]) -> Player | None:
     Prefer a lone depth-1. Several depth-1 QBs: the one with a passing
     prop (``prop_pass_yds`` or ``prop_pass_tds``), else higher salary,
     else pid. No depth-1: the QB with a passing prop, else the lowest
-    depth rank. Everyone else is a backup and scores ~0 on this path.
+    depth rank. O, D, IR, and NA are skipped so the next healthy QB
+    gets the attempts. Everyone else is a backup and scores ~0.
     """
-    qbs = [p for p in players if (p.position or "").upper() == "QB"]
+    qbs = [p for p in players if (p.position or "").upper() == "QB" and not is_inactive(p)]
     if not qbs:
         return None
     depth1 = [p for p in qbs if p.depth_rank == 1]
@@ -1482,8 +1520,13 @@ def _draw_team_opportunities(
     else:
         rush_share = rush_means
 
-    qb_rushes = rush_attempts * QB_RUSH_SHARE
-    rb_pool = rush_attempts * (1.0 - QB_RUSH_SHARE)
+    # Passing floor is yard_anchor / td_anchor (implied total × pass rate,
+    # or the passing prop). Rush floor is the starter's own history or
+    # the league share, and at least the yard floor.
+    qb_rushes = starter_qb_rush_attempts(starter, rush_attempts, index)
+    if rush_attempts > 0:
+        qb_rushes = min(qb_rushes, rush_attempts)
+    rb_pool = max(0.0, rush_attempts - qb_rushes)
     rb_rushes = _rb_rush_attempts(rbs, rush_share, rb_pool)
     out: dict[str, OpportunityCount] = {}
     lines: list[ReceivingLine] = []

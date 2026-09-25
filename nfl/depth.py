@@ -14,9 +14,10 @@ import csv
 import json
 import sys
 from dataclasses import replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+from nfl import gangstash as gangstash_mod
 from nfl.gangstash import GangstashDataError, GangstashDataKeyMissing, GangstashTruncated
 from nfl.gangstash_data import fetch_depth_charts, map_depth_slots
 from nfl.http import HttpError, http_json
@@ -31,6 +32,7 @@ from nfl.ourlads import (
 )
 from nfl.ourlads import _dedupe as dedupe_depth_rows
 from nfl.players import Player, load_fanduel_csv
+from nfl.props import parse_stamp
 from nfl.teams import ALIASES, TeamRef, require_mapped
 
 ESPN_DEPTH = (
@@ -226,6 +228,97 @@ def scope_depth_rows(
             continue
         kept.append(row)
     return kept, ""
+
+
+def _depth_payload_rows(payload: object) -> list[dict]:
+    if isinstance(payload, dict):
+        raw = payload.get("data")
+    else:
+        raw = payload
+    if not isinstance(raw, list):
+        return []
+    return [row for row in raw if isinstance(row, dict)]
+
+
+def _depth_file_stamp(path: Path, rows: list[dict]) -> datetime | None:
+    stamps = [
+        stamp
+        for row in rows
+        if (stamp := parse_stamp(row.get("snapshot_at"))) is not None
+    ]
+    if stamps:
+        return max(stamps)
+    try:
+        day = date.fromisoformat(path.parents[1].name)
+    except ValueError:
+        return None
+    return datetime(day.year, day.month, day.day, tzinfo=timezone.utc)
+
+
+def week_kickoff_guess(season: int, week: int) -> datetime | None:
+    """Thursday of the 2026 week. Other seasons are not guessed."""
+    if int(season) != 2026 or int(week) < 1:
+        return None
+    return datetime(2026, 9, 10, tzinfo=timezone.utc) + timedelta(days=7 * (int(week) - 1))
+
+
+def depth_rows_for_backtest(
+    fetched: list[dict],
+    *,
+    season: int,
+    week: int,
+    kickoff: datetime | None,
+    cache_root: Path | None = None,
+) -> tuple[list[dict], str]:
+    """Cached chart closest before this week, else the fetched current chart.
+
+    A file whose rows have ``week`` is used only when that week matches.
+    A file with no week column is the chart as of that cache day.
+    """
+    cutoff = kickoff
+    approximated = False
+    if cutoff is None:
+        cutoff = week_kickoff_guess(season, week)
+        approximated = cutoff is not None
+    if cutoff is not None and cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=timezone.utc)
+    root = cache_root or gangstash_mod.DATA_CACHE_DIR
+    best: tuple[datetime, list[dict]] | None = None
+    if cutoff is not None and root.is_dir():
+        for path in sorted(root.glob("*/depth_charts/*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            rows = _depth_payload_rows(payload)
+            stamp = _depth_file_stamp(path, rows)
+            if stamp is None or stamp >= cutoff:
+                continue
+            dated = any(row.get("week") not in (None, "") for row in rows)
+            if dated:
+                kept, _note = scope_depth_rows(rows, season=season, week=week)
+                if not kept:
+                    continue
+                rows = kept
+            if not rows:
+                continue
+            if best is None or stamp > best[0]:
+                best = (stamp, rows)
+    if best is not None:
+        stamp = best[0].isoformat()
+        extra = ""
+        if approximated and kickoff is None:
+            extra = " (2026 week start approximated)"
+        return best[1], (
+            f"depth: snapshot {stamp} (closest before week {int(week)}){extra}"
+        )
+    if kickoff is None and not approximated:
+        note = (
+            f"depth: current chart (no kickoff for season {int(season)} week {int(week)})"
+        )
+    else:
+        note = f"depth: current chart (no cached snapshot before week {int(week)})"
+    return list(fetched), note
 
 
 def ingest_gangstash_slate_depth(
