@@ -127,24 +127,31 @@ The passing QB does not stay on that role share, including when his receivers ha
 
 **Inputs:** `targets` rows: `season`, `week`, `position`, `player_name`, `team_fd`, `targets`, `target_share`, `team_targets`, `team_pass_attempts`, `gsis_id` (optional `player_id`). `snaps` rows: the same identity fields plus `offense_pct` (fraction, or a percent above `1.5`).
 
-### Efficiency (placeholder, layer 4 later)
+### Efficiency (layer 4)
 
-`PlaceholderEfficiency` in `nfl/sim_efficiency.py` turns opportunities into FanDuel points: yards per target / rush and TD rates, plus the 100- and 300-yard bonuses when that game's sampled yards cross the line. Passing props are applied as the team anchor before this class scores the line. A rush-yard prop is that RB's rush attempts (`prop / 4.4`).
+`PlaceholderEfficiency` uses one league rate per position. `DataEfficiency` replaces those rates with shrunk history from `player_stats_weekly` and `team_stats_weekly`. `--sim-efficiency {placeholder,data}` selects them. The default on `--sim` and `nfl.backtest` is `data`. `simulate_games` with no efficiency argument still uses the placeholder, so an empty bundle keeps the same draws. Neither class changes `week1_score` or the ILP.
 
-`receiving_line(rng, position, targets)` realizes one allocation and samples receiving yards around that conditional mean (`sigma = max(12, 0.22 × mean)`). Catcher points use that sampled line. QB passing yards and TDs sum the same lines, including the other bucket. A 300-yard passing bonus or a 100-yard rush/rec bonus is +3 only in games whose sampled yards clear the line. It is not `3 × P(clear)` added to every draw, and it is not a cliff on the mean yards. A standalone `points` call with no `team_receiving` samples passing yards around `7.1` yards per attempt.
+Both classes turn opportunities into FanDuel points: yards per target / rush and TD rates, plus the 100- and 300-yard bonuses when that game's sampled yards cross the line. Passing props are applied as the team anchor before this class scores the line. A rush-yard prop is that RB's rush attempts (`prop / 4.4`).
 
-Fumbles lost, two-point conversions, and return TDs are in `skill_fd_points` (the lobby table). This placeholder does not draw them. DEF in the sim is still the points-allowed bucket plus the +3 sack/turnover prior, not a sack-by-sack draw.
+`receiving_line(rng, position, targets, player=None)` realizes one allocation and samples receiving yards around that conditional mean (`sigma = max(12, 0.22 × mean)`). Catcher points use that sampled line. QB passing yards and TDs sum the same lines, including the other bucket. A 300-yard passing bonus or a 100-yard rush/rec bonus is +3 only in games whose sampled yards clear the line. It is not `3 × P(clear)` added to every draw, and it is not a cliff on the mean yards. A standalone `points` call with no `team_receiving` samples passing yards around the player's yards per attempt (7.1 when he has no history).
 
-Layer 4 replaces this class. The calls are:
+Fumbles lost, two-point conversions, and return TDs are in `skill_fd_points` (the lobby table). This layer does not draw them. DEF in the sim is still the points-allowed bucket plus the +3 sack/turnover prior, not a sack-by-sack draw.
 
-```python
-receiving_line(rng, position, targets) -> ReceivingLine
-points(rng, player, OpportunityCount(...)) -> float
-```
+Data mode, prior-count blend `(n * observed + prior_n * prior) / (n + prior_n)`:
 
-`rng` and the player's `prop_*` fields are there for that replacement (residual yards, lumpy TD counts, prop medians). Layer 4 must draw inside `receiving_line` and leave `points` reading the attached line, or the QB will not match his catchers.
+| Level | Targets | Carries | Pass attempts |
+|---|---:|---:|---:|
+| Player | 25 | 20 | 40 |
+| Team and position | 60 | 40 | 80 |
+| League and position | 200 | 150 | 250 |
 
-Until then, a catcher's points are linear in his targets, which is why the share draw shows up cleanly in the correlations.
+The league rate is shrunk toward the placeholder constants. A player with no history stays on those constants. The backtest sets `before_week` to the scored week, so week N and later rows are dropped. A season-to-date `team_stats` row (no week) is not used for that cutoff. The optimizer, with no week cutoff, uses `team_weeks` when the feed has them and otherwise the season board.
+
+Opponent defense scales pass efficiency by pass EPA and success allowed, and rush efficiency by rush EPA and success allowed. Early-down rates win when those columns are present. The sample is shrunk with a 100-play prior. The multiplier is clamped to ±15%. One EPA per play above the league is +0.50 before that clamp. Red-zone TD rate (offense, and defense allowed) nudges the team TD anchor, clamped to ±15%.
+
+Offense pass EPA versus rush EPA, plus the same gap in what the defense allows, tilts the pass yard anchor by at most ±8%. Rush attempts take the complement (`2 - tilt`), so Vegas stays the scoring center. After that, player rates only redistribute the anchored passing yards and TDs across catchers.
+
+Optional columns stay `None` and are skipped until the aggregator ships them: `receiving_air_yards`, `target_share`, `air_yards_share`, `wopr`, `red_zone_targets`, `red_zone_carries`, `goal_line_carries` on a player-week; `plays_per_game`, `seconds_per_play`, and the neutral pair on a team-week; `yards_per_carry_allowed`, `yards_per_dropback_allowed`, `yards_per_attempt_allowed`, `sack_rate`, `air_yards_per_attempt_allowed` on a defense. Air yards, red-zone targets, and goal-line carries blend 10% into yards per target or the TD rate when present. Yards allowed and sack rate blend into the opponent multiplier and still hit the ±15% clamp. Plays per game and seconds per play are stored and do not change layer 2.
 
 ## Gangstash feed
 
@@ -158,6 +165,7 @@ When `--sim` runs and `--sim-inputs` is omitted, `nfl/sim_feed.py` builds `SimIn
 | Target shares | `targets`, that same week list, or every week the season query returns | one player-week each, not the single-share usage aggregate |
 | RB rush shares | `snaps`, same window, `position=RB` | `offense_pct` |
 | RB carry shares | `player_stats_weekly`, same window | `carries` or `rushing_attempts` (skipped when the dataset is missing) |
+| Layer 4 rates | `player_stats_weekly` and `team_stats_weekly`, same window | counting stats, EPA, success, red-zone TD rate. Optional columns when present |
 
 No key and no cache for every dataset prints one line and keeps role shares:
 

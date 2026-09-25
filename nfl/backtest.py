@@ -22,7 +22,8 @@ snaps). A questionable player is not handed off. A Q with no stat row, or
 0 offensive snaps, is counted as a DNP and the projection stays.
 
 ``--projection-source`` stays ``board`` on the optimizer. This command
-only compares the two.
+only compares the two. ``--sim-efficiency data`` (the default) scores the
+sim with shrunk prior-week rates. ``placeholder`` keeps the league averages.
 """
 
 from __future__ import annotations
@@ -66,6 +67,7 @@ from nfl.players import Player, load_fanduel_csv
 from nfl.projections import attach_team_lines, score_player
 from nfl.props import attach_props, parse_stamp, props_for_week, rows_to_props
 from nfl.sim import simulate_games
+from nfl.sim_efficiency import build_efficiency
 from nfl.sim_feed import resolve_sim_inputs
 from nfl.sim_inputs import SimInputError, SimInputs
 from nfl.snaps import SnapsError, attach_snaps, load_optimizer_snaps
@@ -659,6 +661,7 @@ def run_backtest(
     n: int = 400,
     seed: int = 1,
     starters_only: bool = False,
+    efficiency: str = "data",
 ) -> BacktestReport:
     """Score ``players`` against weekly ``fd_points``. No network."""
     noted = _order_missing(list(missing or []))
@@ -666,6 +669,8 @@ def run_backtest(
     dnp = _questionable_dnps(players, indexed)
     notes = list(notes or ())
     notes.append(f"questionable DNP: {dnp} (projection kept)")
+    notes.append(f"sim efficiency: {efficiency}")
+    model = build_efficiency(efficiency, sim_inputs, before_week=week)
     qb_pids = hindsight_qb_pids(players, indexed)
     if not indexed and "player_stats_weekly" not in noted:
         noted = _order_missing(noted + ["player_stats_weekly"])
@@ -674,6 +679,7 @@ def run_backtest(
         n=max(1, int(n)),
         seed=int(seed),
         inputs=sim_inputs,
+        efficiency=model,
     )
     full: list[tuple[str, float, float, float]] = []
     starters: list[tuple[str, float, float, float]] = []
@@ -1008,6 +1014,13 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="score QB/RB/TE depth 1 and WR depth 1-3 who played, plus DEF",
     )
+    ap.add_argument(
+        "--sim-efficiency",
+        choices=("placeholder", "data"),
+        default="data",
+        help="layer-4 efficiency: data uses prior-week gangstash rates "
+        "(default); placeholder keeps the league-average rates",
+    )
     args = ap.parse_args(argv)
     if args.week < 1 or args.season < 1:
         print("choke BACKTEST: season and week must be >= 1", file=sys.stderr)
@@ -1049,6 +1062,7 @@ def main(argv: list[str] | None = None) -> int:
         n=args.n,
         seed=args.seed,
         starters_only=args.starters_only,
+        efficiency=args.sim_efficiency,
     )
     print(report.to_text())
     return 0

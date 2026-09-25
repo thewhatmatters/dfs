@@ -129,6 +129,8 @@ def load_gangstash_sim_inputs(
         targets=targets,
         snaps=snaps,
         carries=carries,
+        player_weeks=_player_week_rows(stat_rows),
+        team_weeks=_weekly_team_rows(weekly_rows),
     )
     if inputs.empty:
         return None, UNAVAILABLE_NOTE
@@ -150,7 +152,9 @@ def load_gangstash_sim_inputs(
     note = (
         f"sim inputs: gangstash team_stats {len(inputs.team_stats)}  "
         f"targets {len(inputs.targets)}  snaps {len(inputs.snaps)}  "
-        f"carries {len(inputs.carries)}"
+        f"carries {len(inputs.carries)}  "
+        f"player_weeks {len(inputs.player_weeks)}  "
+        f"team_weeks {len(inputs.team_weeks)}"
     )
     if stale:
         note += "  stale cache"
@@ -286,7 +290,65 @@ def _as_row(stat: TeamStat) -> dict:
         "rush_epa_sq_sum": stat.rush_epa_sq_sum,
         "pass_epa_var": stat.pass_epa_var,
         "rush_epa_var": stat.rush_epa_var,
+        "week": stat.week,
+        "pass_epa_per_play": stat.pass_epa_per_play,
+        "rush_epa_per_play": stat.rush_epa_per_play,
+        "pass_success_rate": stat.pass_success_rate,
+        "rush_success_rate": stat.rush_success_rate,
+        "success_rate": stat.success_rate,
+        "explosive_rate": stat.explosive_rate,
+        "red_zone_td_rate": stat.red_zone_td_rate,
+        "third_down_rate": stat.third_down_rate,
+        "early_down_pass_epa_per_play": stat.early_down_pass_epa_per_play,
+        "early_down_pass_n": stat.early_down_pass_n,
+        "early_down_pass_success_rate": stat.early_down_pass_success_rate,
+        "early_down_rush_epa_per_play": stat.early_down_rush_epa_per_play,
+        "early_down_rush_n": stat.early_down_rush_n,
+        "early_down_rush_success_rate": stat.early_down_rush_success_rate,
+        "plays_per_game": stat.plays_per_game,
+        "seconds_per_play": stat.seconds_per_play,
+        "neutral_plays_per_game": stat.neutral_plays_per_game,
+        "neutral_seconds_per_play": stat.neutral_seconds_per_play,
+        "yards_per_carry_allowed": stat.yards_per_carry_allowed,
+        "yards_per_dropback_allowed": stat.yards_per_dropback_allowed,
+        "yards_per_attempt_allowed": stat.yards_per_attempt_allowed,
+        "sack_rate": stat.sack_rate,
+        "air_yards_per_attempt_allowed": stat.air_yards_per_attempt_allowed,
     }
+
+
+def _mapped_team_row(row: dict) -> dict | None:
+    team = _fd(str(row.get("team_fd") or row.get("team") or ""))
+    if team is None:
+        return None
+    mapped = dict(row)
+    mapped["team_fd"] = team
+    return mapped
+
+
+def _weekly_team_rows(rows: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for row in rows:
+        mapped = _mapped_team_row(row)
+        if mapped is not None:
+            out.append(mapped)
+    return out
+
+
+def _player_week_rows(rows: list[dict]) -> list[dict]:
+    """Every skill row, with FanDuel abbrevs. Optional columns pass through."""
+    out: list[dict] = []
+    for row in rows:
+        mapped = _mapped_team_row(row)
+        if mapped is None:
+            continue
+        opp = row.get("opponent") or row.get("opponent_fd") or row.get("opp")
+        if opp:
+            opp_fd = _fd(str(opp))
+            if opp_fd:
+                mapped["opponent"] = opp_fd
+        out.append(mapped)
+    return out
 
 
 def _targets(rows: list[dict]) -> list[dict]:

@@ -26,8 +26,11 @@ share that world:
    O, D, IR, and NA do not keep the starter job.
 
 Efficiency (yards per opportunity, TD rates) is ``PlaceholderEfficiency``
-in ``nfl/sim_efficiency.py``. Layer 4 replaces that class; it is not a
-prop-line calibration.
+or ``DataEfficiency`` in ``nfl/sim_efficiency.py``. ``DataEfficiency`` is
+layer 4 (shrunk player rates and a clamped opponent). It is not a
+prop-line calibration. ``simulate_games`` still defaults to the
+placeholder so empty inputs and existing callers keep the same draws.
+The CLI flag is ``--sim-efficiency {placeholder,data}`` (default ``data``).
 
 Inputs are ``SimInputs`` (team stats, weekly targets, optional snaps).
 The sim does not call Gangstash. Empty inputs reproduce the role-share
@@ -46,6 +49,7 @@ player p10s.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import math
 import random
 from dataclasses import dataclass, field, replace
@@ -1359,10 +1363,17 @@ def _realize_receiving(
     rng: random.Random,
     position: str,
     targets: float,
+    player: Player | None = None,
 ) -> ReceivingLine:
     fn = getattr(eff, "receiving_line", None)
     if fn is None:
         return expected_receiving_line(position, targets)
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "player" in params:
+        return fn(rng, position, targets, player=player)
     return fn(rng, position, targets)
 
 
@@ -1438,6 +1449,33 @@ def _rb_rush_attempts(
     return out
 
 
+def _tilt_anchors(
+    eff: EfficiencyModel,
+    team: str,
+    opponent: str,
+    yard_anchor: float,
+    rush_attempts: float,
+    td_anchor: float,
+) -> tuple[float, float, float]:
+    """Pass-vs-rush tilt and a red-zone TD nudge. Placeholder has neither.
+
+    A pass-anchor scale above 1 raises passing yards and trims rush
+    attempts by the complement, so the Vegas total stays the center.
+    """
+    scale_fn = getattr(eff, "pass_anchor_scale", None)
+    if scale_fn is not None:
+        tilt = float(scale_fn(team, opponent or None))
+        if tilt != 1.0:
+            yard_anchor *= tilt
+            rush_attempts *= max(0.0, 2.0 - tilt)
+    td_fn = getattr(eff, "td_anchor_scale", None)
+    if td_fn is not None:
+        td_scale = float(td_fn(team, opponent or None))
+        if td_scale != 1.0:
+            td_anchor *= td_scale
+    return yard_anchor, rush_attempts, td_anchor
+
+
 def _team_implied(players: list[Player]) -> float:
     for pl in players:
         if pl.implied_total is not None and float(pl.implied_total) > 0:
@@ -1481,6 +1519,14 @@ def _draw_team_opportunities(
     td_anchor = pass_td_anchor(implied, pass_rate, td_prop)
     pass_attempts = plays * pass_rate
     rush_attempts = team_rush_attempts(plays, rush_rate, implied)
+    opponent = ""
+    for pl in team_players:
+        if (pl.opponent or "").strip():
+            opponent = (pl.opponent or "").upper()
+            break
+    yard_anchor, rush_attempts, td_anchor = _tilt_anchors(
+        eff, team, opponent, yard_anchor, rush_attempts, td_anchor
+    )
     team_targets = pass_attempts * index.targets_per_attempt(team)
 
     means = [
@@ -1533,7 +1579,7 @@ def _draw_team_opportunities(
     raw_by_pid: dict[str, tuple[float, float, ReceivingLine]] = {}
     for pl in catchers:
         targets = team_targets * target_share[pl.pid]
-        line = _realize_receiving(eff, rng, pl.position or "WR", targets)
+        line = _realize_receiving(eff, rng, pl.position or "WR", targets, pl)
         lines.append(line)
         raw_by_pid[pl.pid] = (targets, rb_rushes.get(pl.pid, 0.0), line)
     other_targets = team_targets * other_share

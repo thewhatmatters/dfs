@@ -116,6 +116,32 @@ class TeamStat:
     rush_epa_sq_sum: float | None = None
     pass_epa_var: float | None = None
     rush_epa_var: float | None = None
+    week: int | None = None
+    pass_epa_per_play: float | None = None
+    rush_epa_per_play: float | None = None
+    pass_success_rate: float | None = None
+    rush_success_rate: float | None = None
+    success_rate: float | None = None
+    explosive_rate: float | None = None
+    red_zone_td_rate: float | None = None
+    third_down_rate: float | None = None
+    early_down_pass_epa_per_play: float | None = None
+    early_down_pass_n: int | None = None
+    early_down_pass_success_rate: float | None = None
+    early_down_rush_epa_per_play: float | None = None
+    early_down_rush_n: int | None = None
+    early_down_rush_success_rate: float | None = None
+    # Optional. Absent until the aggregator ships them. None leaves layer 2
+    # and the efficiency model on the columns above.
+    plays_per_game: float | None = None
+    seconds_per_play: float | None = None
+    neutral_plays_per_game: float | None = None
+    neutral_seconds_per_play: float | None = None
+    yards_per_carry_allowed: float | None = None
+    yards_per_dropback_allowed: float | None = None
+    yards_per_attempt_allowed: float | None = None
+    sack_rate: float | None = None
+    air_yards_per_attempt_allowed: float | None = None
 
     @property
     def is_offense(self) -> bool:
@@ -205,6 +231,43 @@ class CarryWeek:
 
 
 @dataclass(frozen=True)
+class PlayerWeek:
+    """One player-week of counting stats for the efficiency layer.
+
+    Optional columns stay ``None`` until the aggregator ships them. A missing
+    column is not a zero.
+    """
+
+    season: int
+    week: int
+    position: str
+    player_name: str
+    team_fd: str
+    opponent: str | None = None
+    gsis_id: str | None = None
+    player_id: str | None = None
+    targets: float = 0.0
+    receptions: float = 0.0
+    receiving_yards: float = 0.0
+    receiving_tds: float = 0.0
+    carries: float = 0.0
+    rushing_yards: float = 0.0
+    rushing_tds: float = 0.0
+    pass_attempts: float = 0.0
+    completions: float = 0.0
+    passing_yards: float = 0.0
+    passing_tds: float = 0.0
+    interceptions: float = 0.0
+    receiving_air_yards: float | None = None
+    target_share: float | None = None
+    air_yards_share: float | None = None
+    wopr: float | None = None
+    red_zone_targets: float | None = None
+    red_zone_carries: float | None = None
+    goal_line_carries: float | None = None
+
+
+@dataclass(frozen=True)
 class SimInputs:
     """Bundle passed into ``simulate_games``. Empty means today's fallback."""
 
@@ -212,10 +275,18 @@ class SimInputs:
     targets: tuple[TargetWeek, ...] = ()
     snaps: tuple[SnapWeek, ...] = ()
     carries: tuple[CarryWeek, ...] = ()
+    player_weeks: tuple[PlayerWeek, ...] = ()
+    team_weeks: tuple[TeamStat, ...] = ()
 
     @property
     def empty(self) -> bool:
-        return not self.team_stats and not self.targets and not self.snaps
+        return (
+            not self.team_stats
+            and not self.targets
+            and not self.snaps
+            and not self.player_weeks
+            and not self.team_weeks
+        )
 
 
 def team_stat_from_row(row: dict) -> TeamStat | None:
@@ -245,6 +316,40 @@ def team_stat_from_row(row: dict) -> TeamStat | None:
         rush_epa_sq_sum=_float(_pick(row, "rush_epa_sq_sum", "epa_sq_sum_rush")),
         pass_epa_var=_float(_pick(row, "pass_epa_var")),
         rush_epa_var=_float(_pick(row, "rush_epa_var")),
+        week=_int(_pick(row, "week")),
+        pass_epa_per_play=_float(_pick(row, "pass_epa_per_play")),
+        rush_epa_per_play=_float(_pick(row, "rush_epa_per_play")),
+        pass_success_rate=_unit_rate(_float(_pick(row, "pass_success_rate"))),
+        rush_success_rate=_unit_rate(_float(_pick(row, "rush_success_rate"))),
+        success_rate=_unit_rate(_float(_pick(row, "success_rate"))),
+        explosive_rate=_unit_rate(_float(_pick(row, "explosive_rate"))),
+        red_zone_td_rate=_unit_rate(_float(_pick(row, "red_zone_td_rate"))),
+        third_down_rate=_unit_rate(_float(_pick(row, "third_down_rate"))),
+        early_down_pass_epa_per_play=_float(
+            _pick(row, "early_down_pass_epa_per_play")
+        ),
+        early_down_pass_n=_int(_pick(row, "early_down_pass_n")),
+        early_down_pass_success_rate=_unit_rate(
+            _float(_pick(row, "early_down_pass_success_rate"))
+        ),
+        early_down_rush_epa_per_play=_float(
+            _pick(row, "early_down_rush_epa_per_play")
+        ),
+        early_down_rush_n=_int(_pick(row, "early_down_rush_n")),
+        early_down_rush_success_rate=_unit_rate(
+            _float(_pick(row, "early_down_rush_success_rate"))
+        ),
+        plays_per_game=_float(_pick(row, "plays_per_game")),
+        seconds_per_play=_float(_pick(row, "seconds_per_play")),
+        neutral_plays_per_game=_float(_pick(row, "neutral_plays_per_game")),
+        neutral_seconds_per_play=_float(_pick(row, "neutral_seconds_per_play")),
+        yards_per_carry_allowed=_float(_pick(row, "yards_per_carry_allowed")),
+        yards_per_dropback_allowed=_float(_pick(row, "yards_per_dropback_allowed")),
+        yards_per_attempt_allowed=_float(_pick(row, "yards_per_attempt_allowed")),
+        sack_rate=_unit_rate(_float(_pick(row, "sack_rate"))),
+        air_yards_per_attempt_allowed=_float(
+            _pick(row, "air_yards_per_attempt_allowed")
+        ),
     )
 
 
@@ -326,11 +431,60 @@ def snap_week_from_row(row: dict) -> SnapWeek | None:
     )
 
 
+def player_week_from_row(row: dict) -> PlayerWeek | None:
+    """Map a ``player_stats_weekly`` row. None when name, team, or week is blank."""
+    if not isinstance(row, dict):
+        return None
+    name = _str(_pick(row, "player_name", "name", "player"))
+    team = _str(_pick(row, "team_fd", "team", "recent_team")).upper()
+    week = _int(_pick(row, "week"))
+    if not name or not team or week is None:
+        return None
+    pos = _str(_pick(row, "position", "pos")).upper() or "WR"
+    opponent = _str(_pick(row, "opponent", "opponent_fd", "opp")).upper() or None
+
+    def _count(*keys: str) -> float:
+        val = _float(_pick(row, *keys))
+        return 0.0 if val is None else val
+
+    return PlayerWeek(
+        season=_int(_pick(row, "season")) or 0,
+        week=week,
+        position=pos,
+        player_name=name,
+        team_fd=team,
+        opponent=opponent,
+        gsis_id=_str(_pick(row, "gsis_id")) or None,
+        player_id=_str(_pick(row, "player_id")) or None,
+        targets=_count("targets"),
+        receptions=_count("receptions"),
+        receiving_yards=_count("receiving_yards", "rec_yards"),
+        receiving_tds=_count("receiving_tds", "rec_tds"),
+        carries=_count("carries", "rushing_attempts", "rush_attempts"),
+        rushing_yards=_count("rushing_yards", "rush_yards"),
+        rushing_tds=_count("rushing_tds", "rush_tds"),
+        pass_attempts=_count("pass_attempts", "attempts"),
+        completions=_count("completions"),
+        passing_yards=_count("passing_yards", "pass_yards"),
+        passing_tds=_count("passing_tds", "pass_tds"),
+        interceptions=_count("interceptions", "ints"),
+        receiving_air_yards=_float(_pick(row, "receiving_air_yards")),
+        target_share=_unit_rate(_float(_pick(row, "target_share"))),
+        air_yards_share=_unit_rate(_float(_pick(row, "air_yards_share"))),
+        wopr=_float(_pick(row, "wopr")),
+        red_zone_targets=_float(_pick(row, "red_zone_targets")),
+        red_zone_carries=_float(_pick(row, "red_zone_carries")),
+        goal_line_carries=_float(_pick(row, "goal_line_carries")),
+    )
+
+
 def sim_inputs_from_records(
     team_stats: list[dict] | None = None,
     targets: list[dict] | None = None,
     snaps: list[dict] | None = None,
     carries: list[dict] | None = None,
+    player_weeks: list[dict] | None = None,
+    team_weeks: list[dict] | None = None,
 ) -> SimInputs:
     """Build inputs from gangstash-shaped row dicts. Skips blank rows."""
     stats = tuple(
@@ -376,11 +530,23 @@ def sim_inputs_from_records(
                 player_id=week.player_id,
             )
         )
+    players = tuple(
+        row
+        for row in (player_week_from_row(r) for r in (player_weeks or []))
+        if row is not None
+    )
+    weekly = tuple(
+        row
+        for row in (team_stat_from_row(r) for r in (team_weeks or []))
+        if row is not None
+    )
     return SimInputs(
         team_stats=stats,
         targets=weeks,
         snaps=snap_rows,
         carries=carry_rows + tuple(extra),
+        player_weeks=players,
+        team_weeks=weekly,
     )
 
 
@@ -393,7 +559,7 @@ def load_sim_inputs(path: str | Path) -> SimInputs:
         raise SimInputError(f"sim inputs {file}: {e}") from e
     if not isinstance(payload, dict):
         raise SimInputError(f"sim inputs {file} is not an object")
-    for key in ("team_stats", "targets", "snaps", "carries"):
+    for key in ("team_stats", "targets", "snaps", "carries", "player_weeks", "team_weeks"):
         if key in payload and not isinstance(payload[key], list):
             raise SimInputError(f"sim inputs {file} field {key} is not a list")
     return sim_inputs_from_records(
@@ -401,4 +567,6 @@ def load_sim_inputs(path: str | Path) -> SimInputs:
         payload.get("targets") or [],
         payload.get("snaps") or [],
         payload.get("carries") or [],
+        payload.get("player_weeks") or [],
+        payload.get("team_weeks") or [],
     )
