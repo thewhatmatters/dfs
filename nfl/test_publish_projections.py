@@ -283,7 +283,7 @@ class ExitTest(unittest.TestCase):
     def test_missing_key_exits_before_fetch(self) -> None:
         with patch(
             "nfl.publish_projections.projections_key",
-            side_effect=ProjectionsKeyMissing("GANGSTASH_PROJECTIONS_KEY is not set"),
+            side_effect=ProjectionsKeyMissing("GANGSTASH_PROJECTIONS_WRITER_KEY is not set"),
         ), patch("nfl.publish_projections.load_slate") as load, patch(
             "nfl.publish_projections.post_projection_rows"
         ) as post:

@@ -15,20 +15,20 @@ and on the layered-sim branch when `inputs` is left unset). If that function
 is missing, the same command still posts the board and prints one line.
 
 `--dry-run` writes `nfl/data/projections/` (gitignored) and does not POST.
-It does not need `GANGSTASH_PROJECTIONS_KEY`.
+It does not need `GANGSTASH_PROJECTIONS_WRITER_KEY`.
 
 ## Keys
 
 | env | role |
 |-----|------|
 | `GANGSTASH_API_KEY` | reads: game lines, depth, targets, snaps, props |
-| `GANGSTASH_PROJECTIONS_KEY` | write only |
+| `GANGSTASH_PROJECTIONS_WRITER_KEY` | write only |
 
 Write request:
 
 ```
 POST https://vmzgpslqoeuqmdchdekm.supabase.co/functions/v1/projections
-x-api-key: $GANGSTASH_PROJECTIONS_KEY
+x-api-key: $GANGSTASH_PROJECTIONS_WRITER_KEY
 {"rows": [ ... ]}
 ```
 
@@ -72,7 +72,7 @@ Sim rows: `mean` / `p10` / `p50` / `p90` from `simulate_games`.
 
 Exit status is non-zero and stderr starts with `publish projections:`.
 
-- `GANGSTASH_PROJECTIONS_KEY` missing (unless `--dry-run`)
+- `GANGSTASH_PROJECTIONS_WRITER_KEY` missing (unless `--dry-run`)
 - no `game_lines` for the target week, or that cache is stale
 - a slate team has no skill depth
 - read key missing, HTTP error, or a stale cache for lines, depth, targets, snaps, or props

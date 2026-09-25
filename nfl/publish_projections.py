@@ -7,7 +7,7 @@ props. A FanDuel players CSV is optional (salary and FanDuel id only).
     python3 -m nfl.publish_projections --refresh
     python3 -m nfl.publish_projections --dry-run
 
-Write key: GANGSTASH_PROJECTIONS_KEY, header `x-api-key` only.
+Write key: GANGSTASH_PROJECTIONS_WRITER_KEY, header `x-api-key` only.
 Read key: GANGSTASH_API_KEY (existing /data and /props clients).
 
 `--sim N` also posts model=sim when `nfl.sim.simulate_games` imports.
@@ -93,7 +93,7 @@ class PublishError(Exception):
 
 
 class ProjectionsKeyMissing(PublishError):
-    """No GANGSTASH_PROJECTIONS_KEY."""
+    """No GANGSTASH_PROJECTIONS_WRITER_KEY."""
 
 
 class StaleInputs(PublishError):
@@ -111,9 +111,9 @@ class PublishEntry:
 
 
 def projections_key() -> str:
-    k = envmod.get("GANGSTASH_PROJECTIONS_KEY")
+    k = envmod.get("GANGSTASH_PROJECTIONS_WRITER_KEY")
     if not k:
-        raise ProjectionsKeyMissing("GANGSTASH_PROJECTIONS_KEY is not set")
+        raise ProjectionsKeyMissing("GANGSTASH_PROJECTIONS_WRITER_KEY is not set")
     return k
 
 
@@ -160,7 +160,7 @@ def post_projection_rows(
 ) -> tuple[int, int]:
     """POST `{"rows": ...}` in chunks of 5000. Key stays in the header."""
     if not key:
-        raise ProjectionsKeyMissing("GANGSTASH_PROJECTIONS_KEY is not set")
+        raise ProjectionsKeyMissing("GANGSTASH_PROJECTIONS_WRITER_KEY is not set")
     send = poster or _post_chunk
     inserted = 0
     updated = 0

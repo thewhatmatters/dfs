@@ -180,5 +180,5 @@ See [`projections.md`](projections.md).
 
 ```
 POST .../functions/v1/projections
-x-api-key: $GANGSTASH_PROJECTIONS_KEY
+x-api-key: $GANGSTASH_PROJECTIONS_WRITER_KEY
 ```
