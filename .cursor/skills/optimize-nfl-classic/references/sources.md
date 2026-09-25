@@ -10,7 +10,7 @@ Do not duplicate grant text or HTTP recipes here. Ingest stays in
 `nfl/gangstash_data.py`. Default `/data` datasets: `nfl/docs/data/gangstash.md`.
 Lineups (`python3 -m nfl.targets --refresh`, `python3 -m nfl.snaps --refresh`) is the legacy optional CSV path: `nfl/docs/data/lineups-authorization.md`.
 
-On failure, report the **id** (e.g. `LINES_KEY`, `INJ_ESPN`, `DEPTH_OURLADS`,
+On failure, report the **id** (e.g. `LINES_GANGSTASH_KEY`, `INJ_ESPN`, `DEPTH_OURLADS`,
 `DEPTH_ESPN`, `PROPS_GANGSTASH_KEY`) and the stop-vs-degrade row. Green runs do not
 dump the catalog. Do not scrape FanDuel. Default depth is gangstash.
 OurLads remains `--depth-source=ourlads`

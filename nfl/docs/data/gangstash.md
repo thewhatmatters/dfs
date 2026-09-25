@@ -35,7 +35,7 @@ GANGSTASH_LIVE_SMOKE=1 python3 -m unittest nfl.test_gangstash_data.LiveSmokeTest
 
 | flag | choices | default | what it reads |
 |------|---------|---------|----------------|
-| `--lines-source` | `gangstash`, `oddsapi` | **gangstash** | Vegas spread + total → implied team totals |
+| `--lines-source` | `gangstash` | **gangstash** | Vegas spread + total → implied team totals |
 | `--targets-source` | `gangstash`, `lineups` | **gangstash** | RB/WR/TE `target_share` for the existing usage tilt |
 | `--snaps-source` | `gangstash`, `lineups` | **gangstash** | RB/WR/TE `snap_share` (RB rush-role tilt) |
 | `--depth-source` | `gangstash`, `ourlads`, `espn` | **gangstash** | depth rank prior |
@@ -47,7 +47,7 @@ GANGSTASH_LIVE_SMOKE=1 python3 -m unittest nfl.test_gangstash_data.LiveSmokeTest
 | `--refresh-snaps` | flag | off | bypass the gangstash snaps day cache |
 | `--lines-json` | path | unset | replay file; wins over `--lines-source` |
 
-Unset `--targets-weeks` / `--snaps-weeks` omit `week`, so the window is whatever completed weeks gangstash has loaded (2026 weeks 1–2 today; week 3 is not loaded yet). A missing `GANGSTASH_API_KEY` with no cache degrades targets, snaps, and depth, and stops lines (no silent FPPG). The stderr line names the previous flags: `--lines-source=oddsapi --targets-source=lineups --snaps-source=lineups --depth-source=ourlads`.
+Unset `--targets-weeks` / `--snaps-weeks` omit `week`, so the window is whatever completed weeks gangstash has loaded (2026 weeks 1–2 today; week 3 is not loaded yet). A missing `GANGSTASH_API_KEY` with no cache degrades targets, snaps, and depth, and stops lines (no silent FPPG). The lines error names gangstash. The stderr line for the other three names `--targets-source=lineups --snaps-source=lineups --depth-source=ourlads`. Game lines have no fallback.
 
 `--skip-targets` / `--skip-snaps` / `--skip-depth` still skip those joins.
 Gangstash `offense_pct` is a 0–1 fraction, the same scale as Lineups
@@ -126,23 +126,24 @@ or a payload with no `player_name` column, is `TARGETS_GANGSTASH`.
 **`game_lines`:** `game_id`, `season`, `week`, `commence_time`,
 `home_team_fd`, `away_team_fd`, `spread` (home line; negative = home
 favored), `total`, `home_moneyline`, `away_moneyline`, `updated_at`.
-Moneylines are flat fields, not an object. Implied totals use the same
-formula as the Odds API (`nfl/lines.py`). Rows outside the slate window are
+Moneylines are flat fields, not an object. Implied totals
+(`nfl/lines.py`): `implied_home = (total - home_spread) / 2`,
+`implied_away = (total + home_spread) / 2`. Rows outside the slate window are
 dropped when `commence_time` is present. A missing slate game is
 `LINES_GANGSTASH` (stop). No key and no cache is `LINES_GANGSTASH_KEY`
 (stop — no silent FPPG).
 
 **`closing_lines`:** same join as `game_lines`. A past week
 (`nfl.optimize --week`, `nfl.backtest`) tries this dataset first. Live rows
-use `home_team`, `away_team`, `home_line` (negative when home is favored,
-the Odds sign, not flipped), `total`, `implied_home_total`,
+use `home_team`, `away_team`, `home_line` (negative when home is favored),
+`total`, `implied_home_total`,
 `implied_away_total`, and `kickoff` (null on the rows seen so far). Implied
 totals win when both are present: total is the sum, and home spread is away
 implied minus home implied. nflverse-shaped rows may still send
 `home_implied_total` / `home_implied_tt` and `spread_line` (positive when
 home is favored, stored as `-spread_line`) with `total_line` rather than the
-final-score `total`. A plain `spread` column is already the Odds sign and is
-not flipped. A row that still has no spread and total is skipped. If the
+final-score `total`. A plain `spread` column is already negative when home
+is favored and is not flipped. A row that still has no spread and total is skipped. If the
 close then does not cover the slate, the week uses `game_lines` instead of
 raising. Unknown dataset is still printed (`closing_lines: not available
 (Unknown dataset)`) and is not a quiet skip. If `game_lines` also fails and
@@ -159,7 +160,7 @@ moneylines, `*_spread_odds`, `under_odds`, `over_odds`, and
 `home_implied_tt` / `away_implied_tt` are ignored. On that file, `home_line`
 stays ignored because `spread_line` is the schedule column (positive when
 home is favored). The live closing API is the path that reads `home_line`
-as the Odds sign. `JAX`→`JAC`, `LA`→`LAR`.
+as negative when home is favored. `JAX`→`JAC`, `LA`→`LAR`.
 A missing required column, or zero games after the season/week filter, is
 an error. A simple file (no nflverse schedule columns) still errors on a
 column the reader does not know.

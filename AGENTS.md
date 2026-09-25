@@ -34,7 +34,7 @@ python3 -m nfl.depth --csv "nfl/data/<players-list>.csv"             # OurLads N
 # NFL optimize defaults to gangstash lines, targets, snaps, and depth (GANGSTASH_API_KEY).
 # Nightly projections: python3 -m nfl.publish_projections --refresh --sim 10000
 #   Write key GANGSTASH_PROJECTIONS_WRITER_KEY. See nfl/docs/data/projections.md.
-# Fallbacks: --lines-source=oddsapi --targets-source=lineups --snaps-source=lineups --depth-source=ourlads
+# NFL game lines are gangstash only. Other fallbacks: --targets-source=lineups --snaps-source=lineups --depth-source=ourlads
 # Legacy optional Lineups refresh: python3 -m nfl.targets --refresh && python3 -m nfl.snaps --refresh
 # After week 1: CFBD pass/rush mix — ncaaf/docs/data/play-distribution.md (not live until 2026 boxes)
 ```

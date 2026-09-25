@@ -76,10 +76,10 @@ class GangstashDataKeyMissing(GangstashDataError):
     """No GANGSTASH_API_KEY and no usable /data cache."""
 
 
-# Old CLI sources. Printed when the key is missing and no cache exists.
+# Legacy sources for targets, snaps, and depth. Game lines have no fallback:
+# a missing gangstash lines key stops the run.
 FALLBACK_FLAGS = (
-    "--lines-source=oddsapi --targets-source=lineups "
-    "--snaps-source=lineups --depth-source=ourlads"
+    "--targets-source=lineups --snaps-source=lineups --depth-source=ourlads"
 )
 
 

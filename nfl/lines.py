@@ -1,16 +1,14 @@
 """Ingest NFL spread/total and derive implied team totals.
 
-Default source is The Odds API (`--lines-source=oddsapi`). Sport dump is the
-whole season (~272 games). Filter `commence_time` to this slate's weekend
-(CSV date / 2026-09-13 kickoffs), then join by Odds full name.
-JAC↔JAX, WAS↔WSH. FanDuel book else median of US books.
+Game lines come from gangstash only (`dataset=game_lines`, BettingPros
+consensus). `home_team_fd` / `away_team_fd` map through FanDuel abbrevs.
+There is no Odds API client and no odds fallback. A missing gangstash key
+or cache is `LINES_GANGSTASH_KEY` and stops the run.
 
-`--lines-source=gangstash` reads `dataset=game_lines` (BettingPros consensus)
-and maps `home_team_fd` / `away_team_fd` through the same FanDuel abbrevs.
-The optimizer passes gangstash. `--lines-file` (CSV or JSON) and
-`--lines-json` replay a file and ignore the live source. A past `--week`
-prefers `dataset=closing_lines`, then `game_lines`. A lines file accepts
-FanDuel columns and the nflverse schedule columns (`home_team`,
+`--lines-file` (CSV or JSON) and `--lines-json` replay a simple file and
+ignore the live source. An Odds API dump (`bookmakers`) is rejected.
+A past `--week` prefers `dataset=closing_lines`, then `game_lines`. A lines
+file accepts FanDuel columns and the nflverse schedule columns (`home_team`,
 `away_team`, `spread_line`, `total_line`, `home_implied_tt`,
 `away_implied_tt`, `season`, `week`). `JAX`→`JAC` and `LA`→`LAR`.
 A file with ``season``, ``week``, ``home_team``, ``away_team``,
@@ -29,15 +27,12 @@ from __future__ import annotations
 import csv
 import json
 import re
-import statistics
-import urllib.parse
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from nfl import env as envmod
 from nfl.gangstash import GangstashDataError, GangstashDataKeyMissing, GangstashTruncated
 from nfl.gangstash_data import (
     GangstashGameLine,
@@ -45,25 +40,9 @@ from nfl.gangstash_data import (
     fetch_game_lines,
     map_game_lines,
 )
-from nfl.http import HttpAuthError, HttpError, http_json
-from nfl.teams import UnmappedTeam, lookup_odds, require_fd, require_mapped
+from nfl.teams import UnmappedTeam, require_fd, require_mapped
 
-ODDS_URL = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl/odds"
-CACHE_DIR = Path(__file__).resolve().parent / "data" / "odds-lines"
 CHICAGO = ZoneInfo("America/Chicago")
-
-LINES_KEY_MISSING = """No betting-lines API key.
-
-Week-1 default objective is Vegas implied team totals (spread + total),
-not CSV FPPG. Refusing to silently use FPPG.
-
-Install:
-  https://the-odds-api.com/
-  export ODDS_API_KEY='your-key'
-  # or: printf 'ODDS_API_KEY=your-key\\n' >> .env && chmod 600 .env
-
-Then re-run: python3 -m nfl.optimize --csv ...
-"""
 
 
 class LinesError(Exception):
@@ -266,119 +245,7 @@ def _team_line(
     )
 
 
-def _odds_market(book: dict, key: str) -> dict | None:
-    for m in book.get("markets") or []:
-        if m.get("key") == key:
-            return m
-    return None
-
-
-def _odds_point(market: dict | None, name: str) -> float | None:
-    if not market:
-        return None
-    want = name.casefold()
-    for outcome in market.get("outcomes") or []:
-        if str(outcome.get("name") or "").casefold() == want:
-            return _num(outcome.get("point"))
-    return None
-
-
-def _odds_price(market: dict | None, name: str) -> float | None:
-    if not market:
-        return None
-    want = name.casefold()
-    for outcome in market.get("outcomes") or []:
-        if str(outcome.get("name") or "").casefold() == want:
-            return _num(outcome.get("price"))
-    return None
-
-
-def parse_odds_games(
-    payload: list[dict],
-    slate: list[tuple[str, str, str]],
-    *,
-    start: datetime | None = None,
-    end: datetime | None = None,
-) -> dict[str, TeamLine]:
-    rows = payload
-    if start is not None and end is not None:
-        rows = filter_commence(payload, start, end)
-    index: dict[tuple[str, str], dict] = {}
-    for row in rows:
-        home_ref = lookup_odds(str(row.get("home_team") or ""))
-        away_ref = lookup_odds(str(row.get("away_team") or ""))
-        if home_ref is None or away_ref is None:
-            continue
-        index[(away_ref.fd, home_ref.fd)] = row
-
-    out: dict[str, TeamLine] = {}
-    missing: list[str] = []
-    for game, away_fd, home_fd in slate:
-        row = index.get((away_fd, home_fd))
-        if row is None:
-            missing.append(game)
-            continue
-        home_ref = require_fd(home_fd)
-        away_ref = require_fd(away_fd)
-        books = list(row.get("bookmakers") or [])
-        preferred = [b for b in books if b.get("key") in {"fanduel", "draftkings", "betmgm"}]
-        books_ord = preferred + [b for b in books if b not in preferred]
-        home_spreads: list[float] = []
-        totals: list[float] = []
-        home_mls: list[float] = []
-        away_mls: list[float] = []
-        provider = "median"
-        for book in books_ord:
-            spreads = _odds_market(book, "spreads")
-            tot = _odds_market(book, "totals")
-            h2h = _odds_market(book, "h2h")
-            hs = None
-            for odds_name in home_ref.odds:
-                hs = _odds_point(spreads, odds_name)
-                if hs is not None:
-                    break
-            over = _odds_point(tot, "Over")
-            if hs is not None:
-                home_spreads.append(hs)
-            if over is not None:
-                totals.append(over)
-            for odds_name in home_ref.odds:
-                ml = _odds_price(h2h, odds_name)
-                if ml is not None:
-                    home_mls.append(ml)
-                    break
-            for odds_name in away_ref.odds:
-                ml = _odds_price(h2h, odds_name)
-                if ml is not None:
-                    away_mls.append(ml)
-                    break
-            if book.get("key") == "fanduel" and hs is not None and over is not None:
-                provider = "fanduel"
-                home_spreads = [hs]
-                totals = [over]
-                break
-        if not home_spreads or not totals:
-            missing.append(game)
-            continue
-        out[home_fd] = _team_line(
-            game=game,
-            home_fd=home_fd,
-            away_fd=away_fd,
-            home_spread=float(statistics.median(home_spreads)),
-            total=float(statistics.median(totals)),
-            home_ml=statistics.median(home_mls) if home_mls else None,
-            away_ml=statistics.median(away_mls) if away_mls else None,
-            provider=provider,
-            source="odds-api",
-            commence_time=str(row.get("commence_time") or "") or None,
-        )
-        out[away_fd] = out[home_fd]
-    if missing:
-        raise LinesError("no Odds API line for slate game(s): " + ", ".join(missing))
-    return {fd: out[fd] for fd in {h for _, _, h in slate} | {a for _, a, _ in slate}}
-
-
-# Simple files (CSV or JSON without bookmakers). An nflverse schedule is
+# Simple files (CSV or JSON). An nflverse schedule is
 # recognized by its required columns and may carry the rest of the schedule
 # (game_id, moneylines, home_line, *_spread_odds, …). Those are ignored.
 _NFLVERSE_REQUIRED = (
@@ -700,7 +567,10 @@ def load_lines_json(
         raise LinesError(f"{path} is not a JSON array of games")
     first = raw[0]
     if "bookmakers" in first and "home_team" in first:
-        return parse_odds_games(raw, slate, start=start, end=end)
+        raise LinesError(
+            "Odds API line files are not supported; game lines come from gangstash "
+            "(GANGSTASH_API_KEY) or a simple spread/total file"
+        )
     prepared = _prepare_simple_rows(raw, season=season, week=week)
     return parse_simple_games(prepared, slate, source=source)
 
@@ -748,40 +618,6 @@ def load_lines_file(
         season=season,
         week=week,
     )
-
-
-def _odds_key() -> str:
-    k = envmod.get("ODDS_API_KEY") or envmod.get("THE_ODDS_API_KEY")
-    if not k:
-        raise LinesKeyMissing(LINES_KEY_MISSING)
-    return k
-
-
-def fetch_odds(*, refresh: bool = False) -> list[dict]:
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    path = CACHE_DIR / f"{date.today().isoformat()}.json"
-    if path.is_file() and path.stat().st_size > 2 and not refresh:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-        if isinstance(raw, list):
-            return raw
-    key = _odds_key()
-    params = {
-        "apiKey": key,
-        "regions": "us",
-        "markets": "h2h,spreads,totals",
-        "oddsFormat": "american",
-    }
-    url = ODDS_URL + "?" + urllib.parse.urlencode(params)
-    try:
-        payload, _hdrs = http_json(url)
-    except HttpAuthError as e:
-        raise LinesAuthError(str(e)) from e
-    except HttpError as e:
-        raise LinesError(f"Odds API {e}") from e
-    if not isinstance(payload, list):
-        raise LinesError("Odds API did not return an array")
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    return payload
 
 
 def team_lines_from_gangstash(
@@ -916,15 +752,14 @@ def ingest_slate_lines(
     lines_file: Path | None = None,
     slate_day: date | None = None,
     refresh: bool = False,
-    source: str = "oddsapi",
+    source: str = "gangstash",
     season: int | None = None,
     week: int | None = None,
 ) -> dict[str, TeamLine]:
     """Return TeamLine keyed by FanDuel abbrev for every slate team.
 
-    `source` is `oddsapi` or `gangstash`. `--lines-file` wins, then
-    `--lines-json`. A set ``week`` on the gangstash path prefers
-    ``closing_lines`` and falls back to ``game_lines``.
+    The live source is gangstash. `--lines-file` wins, then `--lines-json`.
+    A set ``week`` prefers ``closing_lines`` and then ``game_lines``.
     """
     slate = slate_from_players(players)
     fd_teams = {a for _, a, _ in slate} | {h for _, _, h in slate}
@@ -941,21 +776,20 @@ def ingest_slate_lines(
             lines_json, slate, start=start, end=end, season=season, week=week
         )
 
-    src = (source or "oddsapi").strip().lower()
-    if src == "gangstash" and week is not None:
+    src = (source or "gangstash").strip().lower()
+    if src != "gangstash":
+        raise LinesError(
+            f"unknown --lines-source {source!r}; game lines come from gangstash only "
+            "(GANGSTASH_API_KEY, dataset=game_lines or closing_lines)"
+        )
+    if week is not None:
         return _ingest_week_lines(
             slate,
             season=int(season or day.year),
             week=int(week),
             refresh=refresh,
         )
-    if src == "gangstash":
-        return _ingest_gangstash_lines(slate, slate_day=day, refresh=refresh)
-    if src != "oddsapi":
-        raise LinesError(f"unknown --lines-source {source!r} (oddsapi|gangstash)")
-
-    payload = fetch_odds(refresh=refresh)
-    return parse_odds_games(payload, slate, start=start, end=end)
+    return _ingest_gangstash_lines(slate, slate_day=day, refresh=refresh)
 
 
 def unique_games(by_team: dict[str, TeamLine]) -> list[TeamLine]:

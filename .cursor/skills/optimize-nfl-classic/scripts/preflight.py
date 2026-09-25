@@ -54,12 +54,12 @@ def check_lines(lines_json: str | None):
     sys.path.insert(0, str(REPO_ROOT))
     from nfl.env import get  # noqa: WPS433
 
-    if get("ODDS_API_KEY") or get("THE_ODDS_API_KEY"):
-        return ("ready", None, "lines source odds")
+    if get("GANGSTASH_API_KEY"):
+        return ("ready", None, "lines source gangstash")
     return (
         "gated",
-        "LINES_KEY",
-        "set ODDS_API_KEY — will not fall back to FPPG",
+        "LINES_GANGSTASH_KEY",
+        "set GANGSTASH_API_KEY — gangstash is the only lines source; will not fall back to FPPG",
     )
 
 

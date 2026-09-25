@@ -52,7 +52,7 @@ def lines_id(exc: BaseException) -> str:
     text = str(exc).casefold()
     if "json" in text:
         return "LINES_JSON"
-    return "LINES_ODDS"
+    return "LINES_GANGSTASH"
 
 
 def depth_id(exc: BaseException) -> str:

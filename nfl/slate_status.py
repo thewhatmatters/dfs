@@ -353,7 +353,7 @@ def build_slate_status(
             },
         ),
         "props": _feed_blob(
-            source="odds",
+            source="gangstash",
             skipped=props_skipped,
             matched=p_m,
             eligible=p_e,
@@ -361,7 +361,6 @@ def build_slate_status(
             missing=p_miss,
             extra={
                 "joined": 0 if props_skipped else p_m,
-                "credits_remaining": props.get("credits_remaining"),
                 "reason": props.get("reason"),
                 "def": {
                     "matched": 0 if props_skipped else def_prop_m,
@@ -433,11 +432,9 @@ def format_slate_status(status: Mapping) -> str:
         extra = " (no Gangstash key)" if why == "PROPS_GANGSTASH_KEY" else ""
         lines.append(f"props  skipped{extra}")
     else:
-        cred = props.get("credits_remaining")
-        cred_s = f"  credits_left {cred}" if cred is not None else ""
         lines.append(
             f"props  {props.get('matched', props.get('joined', 0))} / "
-            f"{props.get('eligible', 0)} relevant skill{cred_s}"
+            f"{props.get('eligible', 0)} relevant skill"
         )
     lines.append(
         f"dst  {dst.get('matched', 0)} / {dst.get('eligible', 0)} "

@@ -25,14 +25,14 @@ Repo-root `scripts/optimize.py` is NCAAF — do not use it for NFL.
 ## What it needs
 
 Python 3, a FanDuel NFL classic CSV, `pulp` for the exact solve, and
-**`GANGSTASH_API_KEY`** (default lines, targets, snaps, depth, and player props). **`ODDS_API_KEY`** is the `--lines-source=oddsapi` fallback. See repo `.env.example`. Cached depth, ESPN
+**`GANGSTASH_API_KEY`** (game lines, targets, snaps, depth, and player props). Game lines have no other source. See repo `.env.example`. Cached depth, ESPN
 injuries, and Gangstash props; do not `--refresh-props` unless asked.
 `python3 -m nfl.depth --csv …` refreshes `nfl/data/depth.csv`.
 
 ## How it works (high level)
 
 1. Confirm FanDuel NFL rules (9 slots, $60k, 3 teams min, house max 3 per team / FanDuel 4, DST).
-2. Drop IR/NA. Join gangstash lines, depth, targets, and snaps (oddsapi / ourlads / lineups are fallbacks), ESPN injuries, player props (cached).
+2. Drop IR/NA. Join gangstash lines, depth, targets, and snaps (ourlads / lineups are fallbacks for depth, targets, and snaps), ESPN injuries, player props (cached).
 3. Maximize week1_score + house QB+WR/TE stack premium under roster/cap/team/house DST / stack-qb rules. Printed Proj stays week1_score.
 4. `--bring-back=N` (default 0) optionally requires opposing WR/TE vs a QB pass stack. `--stack-qb` on. `--max-per-team=4` restores lobby.
 5. `--n-lineups>1` defaults to coverage, not chalk lock-in: exposure cap 0.60, min-unique 3 vs every locked 9, coverage penalty after the first mean 9. Salary / stack-qb / house DST rules stay intact.

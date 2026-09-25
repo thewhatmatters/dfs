@@ -629,7 +629,7 @@ def _inputs(
     if player.snap_share is not None:
         tags.append("gs-snap" if player.snaps_source == "gangstash" else "lineups-snap")
     if player.prop_fd is not None:
-        tags.append("gs-props" if (player.prop_book or "") == "gangstash" else "odds-props")
+        tags.append("gs-props")
     if dst and player.implied_opp is not None:
         tags.append("vegas-dst")
     out = {
