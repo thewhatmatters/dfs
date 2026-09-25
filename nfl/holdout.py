@@ -13,11 +13,10 @@ no season-to-date board. ``--seed-prior-season`` (default off) replaces
 week 1 sim inputs with the prior season's week 18.
 
 ``--population pregame`` (default) keeps depth-chart starters even when the
-box score is a zero or missing. A missing row scores 0 unless that week's
-injuries list the player Out or IR before kickoff (``date_modified`` when
-the row has one, otherwise the weekly status). Actuals match ``gsis_id``
-first and the name second. ``--population played`` restores the legacy
-starter filter. The report above does not import NumPy or SciPy.
+box score is a zero or missing. A missing row scores 0 unless injuries list
+the player Out or IR before that team's kickoff. ``--population played``
+is the old name-only join and does not skip duplicate draws. The report
+above does not import NumPy or SciPy.
 
 A pool row whose sim draws are not length ``n`` (the same pid listed twice)
 is skipped and named on stderr. The depth pool itself is not deduped.
@@ -54,13 +53,12 @@ from pathlib import Path
 from nfl.backtest import (
     DepthPoolError,
     _STARTER_RANKS,
+    _kickoff_stamp,
     _load_live,
     _position,
-    earliest_kickoff,
     index_actual_rows,
     index_dst_rows,
     is_starter,
-    rows_for_season_week,
 )
 from nfl.gangstash import (
     GangstashDataError,
@@ -72,6 +70,8 @@ from nfl.gangstash import (
 )
 from nfl.gangstash_data import (
     fetch_closing_lines,
+    fetch_depth_charts_weekly,
+    fetch_game_lines,
     fetch_props_closing,
     fetch_week_injuries,
     parse_player_stat_row,
@@ -157,6 +157,8 @@ class WeekLoad:
     notes: list[str]
     injury_rows: list[dict] = field(default_factory=list)
     kickoff: datetime | None = None
+    kickoffs: dict = field(default_factory=dict)
+    kickoff_note: str = ""
 
 
 def parse_weeks(raw: str) -> list[int]:
@@ -276,7 +278,7 @@ def load_week(season: int, week: int, *, seed_prior: bool = False) -> WeekLoad:
             notes.append(
                 "seed-prior-season: no prior-season rows; week 1 inputs unchanged"
             )
-    injury_rows, kickoff = _injury_context(int(season), int(week))
+    injury_rows, kickoffs, kickoff, kickoff_note = _injury_context(int(season), int(week))
     return WeekLoad(
         players=players,
         actual_rows=list(actual_rows or []),
@@ -285,38 +287,110 @@ def load_week(season: int, week: int, *, seed_prior: bool = False) -> WeekLoad:
         notes=notes,
         injury_rows=injury_rows,
         kickoff=kickoff,
+        kickoffs=kickoffs,
+        kickoff_note=kickoff_note,
     )
 
 
-def _injury_context(season: int, week: int) -> tuple[list[dict], datetime | None]:
-    """Cached injuries and the earliest kickoff. A missing key leaves both empty."""
-    rows: list[dict] = []
-    kickoff = None
+_GANGSTASH_FETCH_ERRORS = (
+    GangstashDataKeyMissing,
+    GangstashKeyMissing,
+    GangstashTruncated,
+    GangstashDataError,
+    GangstashError,
+)
+_KICKOFF_FIELDS = ("kickoff_at", "commence_time", "kickoff", "gameday", "game_date")
+_KICKOFF_TEAM_FIELDS = (
+    "team_fd",
+    "team",
+    "home_team_fd",
+    "away_team_fd",
+    "home_team",
+    "away_team",
+)
+
+
+def _fetch_rows(fn) -> list[dict]:
     try:
-        fetched, _meta = fetch_week_injuries(season=int(season), week=int(week))
-        rows = [row for row in (fetched or []) if isinstance(row, dict)]
-    except (
-        GangstashDataKeyMissing,
-        GangstashKeyMissing,
-        GangstashTruncated,
-        GangstashDataError,
-        GangstashError,
-    ):
-        rows = []
-    try:
-        closing, _meta = fetch_closing_lines(season=int(season), week=int(week))
-        kickoff = earliest_kickoff(
-            rows_for_season_week(list(closing or []), int(season), int(week))
+        fetched, _meta = fn()
+    except _GANGSTASH_FETCH_ERRORS:
+        return []
+    return [row for row in (fetched or []) if isinstance(row, dict)]
+
+
+def _row_kickoff(row: dict) -> datetime | None:
+    for key in _KICKOFF_FIELDS:
+        stamp = _kickoff_stamp(row.get(key))
+        if stamp is not None:
+            return stamp
+    return None
+
+
+def _kickoffs_from_rows(rows: list[dict]) -> dict[str, datetime]:
+    """Earliest kickoff on each team. A game row stamps both clubs."""
+    out: dict[str, datetime] = {}
+    for row in rows:
+        stamp = _row_kickoff(row)
+        if stamp is None:
+            continue
+        teams: list[str] = []
+        for key in _KICKOFF_TEAM_FIELDS:
+            team = _fd_team(row.get(key))
+            if team and team not in teams:
+                teams.append(team)
+        for team in teams:
+            prev = out.get(team)
+            if prev is None or stamp < prev:
+                out[team] = stamp
+    return out
+
+
+def _injury_context(
+    season: int, week: int
+) -> tuple[list[dict], dict[str, datetime], datetime | None, str]:
+    """Injuries plus a per-team kickoff.
+
+    ``depth_charts_weekly.kickoff_at`` is the game stamp. Closing ``kickoff``
+    is null on the rows we have seen, so it only fills a team that the
+    weekly chart did not. ``game_lines.commence_time`` is the last fill.
+    An empty map is ``kickoff missing``, not a silent guess.
+    """
+    rows = _fetch_rows(
+        lambda: fetch_week_injuries(season=int(season), week=int(week))
+    )
+    kickoffs: dict[str, datetime] = {}
+    sources: list[str] = []
+    depth_rows = _fetch_rows(
+        lambda: fetch_depth_charts_weekly(
+            season=int(season), week=int(week), pos_grp=None
         )
-    except (
-        GangstashDataKeyMissing,
-        GangstashKeyMissing,
-        GangstashTruncated,
-        GangstashDataError,
-        GangstashError,
-    ):
-        kickoff = None
-    return rows, kickoff
+    )
+    from_depth = _kickoffs_from_rows(depth_rows)
+    if from_depth:
+        kickoffs.update(from_depth)
+        sources.append("depth_charts_weekly.kickoff_at")
+    closing_rows = _fetch_rows(
+        lambda: fetch_closing_lines(season=int(season), week=int(week))
+    )
+    for team, stamp in _kickoffs_from_rows(closing_rows).items():
+        if team not in kickoffs:
+            kickoffs[team] = stamp
+            if "closing_lines" not in sources:
+                sources.append("closing_lines")
+    game_rows = _fetch_rows(
+        lambda: fetch_game_lines(season=int(season), week=int(week))
+    )
+    for team, stamp in _kickoffs_from_rows(game_rows).items():
+        if team not in kickoffs:
+            kickoffs[team] = stamp
+            if "game_lines.commence_time" not in sources:
+                sources.append("game_lines.commence_time")
+    earliest = min(kickoffs.values()) if kickoffs else None
+    if not kickoffs:
+        note = "kickoff missing"
+    else:
+        note = "kickoff from " + ", ".join(sources)
+    return rows, kickoffs, earliest, note
 
 
 def draw_percentile(draws: tuple[float, ...] | list[float], actual: float) -> float:
@@ -912,43 +986,86 @@ def _resolve_actual(
 _OUT_CODES = frozenset({"O", "IR"})
 
 
+def _injury_status(row: dict) -> str:
+    """Gangstash sends ``report_status``. ``status`` is the older name."""
+    return str(row.get("report_status") or row.get("status") or "").strip()
+
+
+def _injury_name(row: dict) -> str:
+    """Gangstash sends ``full_name``. ``player_name`` is the older name."""
+    return str(
+        row.get("full_name") or row.get("player_name") or row.get("name") or ""
+    ).strip()
+
+
+def _injury_ids(row: dict) -> set[str]:
+    found = set()
+    for key in ("gsis_id", "player_key", "player_id"):
+        text = str(row.get(key) or "").strip()
+        if text:
+            found.add(text)
+    return found
+
+
 def _injury_hit(player: Player, rows: list[dict]) -> dict | None:
-    """Out/IR row for this player. Id wins over the name."""
+    """Injury row for this player. Id wins over the name."""
     pid = (player.pid or "").strip()
-    name_key = ((player.team or "").upper(), match_key(player.name))
+    name_key = (_fd_team(player.team), match_key(player.name))
     by_name = None
     for row in rows:
         if not isinstance(row, dict):
             continue
-        gsis = str(row.get("gsis_id") or "").strip()
-        player_id = str(row.get("player_id") or "").strip()
-        if pid and pid in {gsis, player_id}:
+        if pid and pid in _injury_ids(row):
             return row
-        team = str(row.get("team_fd") or row.get("team") or "").strip().upper()
-        name = str(row.get("player_name") or row.get("name") or "")
+        team = _fd_team(row.get("team_fd") or row.get("team"))
+        name = _injury_name(row)
         if name and (team, match_key(name)) == name_key and by_name is None:
             by_name = row
     return by_name
 
 
-def _excluded_out(player: Player, rows: list[dict], kickoff: datetime | None) -> bool:
-    """Pre-kickoff Out or IR. A ``date_modified`` must be before kickoff.
+def _kickoff_for(
+    player: Player,
+    kickoffs: dict | None,
+    fallback: datetime | None,
+) -> datetime | None:
+    team = _fd_team(player.team)
+    if kickoffs and team in kickoffs:
+        return kickoffs[team]
+    return fallback
 
-    Rows with no ``date_modified`` are the weekly report (2025) and count
-    as pre-game. A timestamp we cannot place before kickoff does not exclude.
+
+def _missing_starter_fate(
+    player: Player,
+    rows: list[dict],
+    kickoff: datetime | None,
+) -> str:
+    """What to do with a pregame starter who has no box score.
+
+    ``exclude`` is pre-kickoff Out or IR. A row with no ``date_modified``
+    is the weekly report and counts as pre-game. A timestamp needs that
+    player's kickoff; a missing kickoff is ``unresolved_kickoff`` and the
+    player stays. No injury row at all is ``zero_no_injury``.
     """
     row = _injury_hit(player, rows)
     if row is None:
-        return False
-    if injury_code(str(row.get("status") or "")) not in _OUT_CODES:
-        return False
+        return "zero_no_injury"
+    if injury_code(_injury_status(row)) not in _OUT_CODES:
+        return "zero"
     raw = row.get("date_modified")
     if raw in (None, ""):
-        return True
+        return "exclude"
     stamp = parse_stamp(raw)
     if stamp is None or kickoff is None:
-        return False
-    return stamp < kickoff
+        return "unresolved_kickoff"
+    if stamp < kickoff:
+        return "exclude"
+    return "zero"
+
+
+def _excluded_out(player: Player, rows: list[dict], kickoff: datetime | None) -> bool:
+    """True when a missing-stats starter is Out or IR before kickoff."""
+    return _missing_starter_fate(player, rows, kickoff) == "exclude"
 
 
 def _draw_length(sim: GameSim, pid: str) -> int:
@@ -1578,6 +1695,8 @@ def run_holdout(
     scored: list[dict] = []
     join_counts = _empty_join()
     draw_skip_rows: list[dict] = []
+    kickoff_weeks: list[dict] = []
+    headline = {"with": _empty_headline(), "without": _empty_headline()}
     sens_payload = None
     sens_target = None
     week_set = set(weeks)
@@ -1663,23 +1782,55 @@ def run_holdout(
                 )
             sims = sims_by_seed[0]
             data_sim = sims["sim_data"]
-            by_id = index_actual_ids(loaded.actual_rows)
+            # Id match and the duplicate-draw skip are pregame only.
+            # ``played`` stays on the name join so it can match main.
+            by_id = index_actual_ids(loaded.actual_rows) if population == "pregame" else {}
             joined_rows = []
             week_skips: list[dict] = []
             injury_rows = list(getattr(loaded, "injury_rows", None) or [])
             kickoff = getattr(loaded, "kickoff", None)
+            kickoffs = dict(getattr(loaded, "kickoffs", None) or {})
+            kickoff_note = str(getattr(loaded, "kickoff_note", "") or "")
+            if population == "pregame":
+                week_note = kickoff_note or (
+                    "kickoff from caller" if (kickoff is not None or kickoffs) else "kickoff missing"
+                )
+                kickoff_weeks.append(
+                    {
+                        "season": int(season),
+                        "week": int(week),
+                        "note": week_note,
+                        "teams": len(kickoffs),
+                    }
+                )
+                if week_note == "kickoff missing":
+                    print(
+                        f"holdout kickoff missing {season} week {week}; "
+                        "Out/IR rows with date_modified stay in",
+                        file=sys.stderr,
+                    )
             for pl in players:
                 found = _resolve_actual(pl, indexed, by_id, dst_by_team)
                 if found is None:
                     if population != "pregame" or not is_pregame_starter(pl):
                         continue
-                    if _excluded_out(pl, injury_rows, kickoff):
-                        _bump_join(join_counts, "excluded_as_out", _position(pl.position))
+                    fate = _missing_starter_fate(
+                        pl, injury_rows, _kickoff_for(pl, kickoffs, kickoff)
+                    )
+                    pos = _position(pl.position)
+                    if fate == "exclude":
+                        _bump_join(join_counts, "excluded_as_out", pos)
                         continue
-                    actual, row, how = 0.0, {}, "zero"
+                    if fate == "unresolved_kickoff":
+                        _bump_join(join_counts, "out_unresolved_no_kickoff", pos)
+                        actual, row, how = 0.0, {}, "unresolved"
+                    elif fate == "zero_no_injury":
+                        actual, row, how = 0.0, {}, "zero_no_injury"
+                    else:
+                        actual, row, how = 0.0, {}, "zero"
                 else:
                     actual, row, how = found
-                if not _draws_aligned(sims, pl.pid, draws_n):
+                if population == "pregame" and not _draws_aligned(sims, pl.pid, draws_n):
                     week_skips.append(
                         {
                             "season": int(season),
@@ -1712,18 +1863,30 @@ def run_holdout(
                     join_counts["name_matched"] += 1
                 elif how == "zero":
                     _bump_join(join_counts, "kept_as_zero", _position(pl.position))
+                elif how == "zero_no_injury":
+                    _bump_join(join_counts, "kept_zero_no_injury_row", _position(pl.position))
                 pos = _position(pl.position)
                 starter = _in_population(pl, row, population)
+                no_injury = how == "zero_no_injury"
                 item = {
                     "position": pos,
                     "board": board,
                     "actual": actual,
                     "starter": starter,
+                    "no_injury_row": no_injury,
                     "means": means,
                     "pcts": pcts,
                     "covers": covers,
                     "player": pl,
                 }
+                if starter:
+                    headline["with"]["board"].append((board, actual))
+                    headline["with"]["data"].append((means["sim_data"], actual))
+                    headline["with"]["cover"].append(bool(covers["sim_data"]))
+                    if not no_injury:
+                        headline["without"]["board"].append((board, actual))
+                        headline["without"]["data"].append((means["sim_data"], actual))
+                        headline["without"]["cover"].append(bool(covers["sim_data"]))
                 joined_rows.append(item)
                 for pool, keep in (("full", True), ("starters", starter)):
                     if not keep:
@@ -1902,6 +2065,18 @@ def run_holdout(
         "seeds": [int(item) for item in seed_list],
         "population": population,
         "join": join_counts,
+        "kickoff": {
+            "weeks": kickoff_weeks,
+            "missing": [
+                {"season": row["season"], "week": row["week"]}
+                for row in kickoff_weeks
+                if row.get("note") == "kickoff missing"
+            ],
+        },
+        "headline": {
+            "with_kept_zero_no_injury_row": _headline_cut(headline["with"]),
+            "without_kept_zero_no_injury_row": _headline_cut(headline["without"]),
+        },
         "draw_skips": {
             "n": len(draw_skip_rows),
             "n_draws": int(draws_n),
@@ -2162,17 +2337,49 @@ def format_report(report: dict) -> str:
         )
         lines.append(
             "join  id-matched {id_n}  name-matched {name_n}  "
-            "kept-as-zero {zero}  excluded-as-Out {out}".format(
+            "kept-as-zero {zero}  kept-zero-no-injury-row {bare}  "
+            "excluded-as-Out {out}  out-unresolved-no-kickoff {open_kick}".format(
                 id_n=join.get("id_matched", 0),
                 name_n=join.get("name_matched", 0),
                 zero=join.get("kept_as_zero", 0),
+                bare=join.get("kept_zero_no_injury_row", 0),
                 out=join.get("excluded_as_out", 0),
+                open_kick=join.get("out_unresolved_no_kickoff", 0),
             )
         )
         if zero_bits:
             lines.append(f"  kept-as-zero by pos  {zero_bits}")
+        bare_bits = " ".join(
+            f"{pos} {(join.get('kept_zero_no_injury_row_by_pos') or {}).get(pos, 0)}"
+            for pos in _POS_ORDER
+            if (join.get("kept_zero_no_injury_row_by_pos") or {}).get(pos, 0)
+        )
+        if bare_bits:
+            lines.append(f"  kept-zero-no-injury-row by pos  {bare_bits}")
         if out_bits:
             lines.append(f"  excluded-as-Out by pos  {out_bits}")
+    kickoff = report.get("kickoff") or {}
+    missing_kick = kickoff.get("missing") or []
+    if missing_kick:
+        bits = ", ".join(f"{row['season']}w{row['week']}" for row in missing_kick)
+        lines.append(
+            f"kickoff missing {bits}; Out/IR rows with date_modified stay in"
+        )
+    headline = report.get("headline") or {}
+    if headline:
+        for key, label in (
+            ("with_kept_zero_no_injury_row", "starters"),
+            ("without_kept_zero_no_injury_row", "starters without kept-zero-no-injury-row"),
+        ):
+            cut = headline.get(key) or {}
+            if not cut:
+                continue
+            lines.append(
+                f"headline {label}  n {cut.get('n', 0)}  "
+                f"board MAE {_fmt(cut.get('board_mae'), 9, 4)}  "
+                f"data MAE {_fmt(cut.get('data_mae'), 9, 4)}  "
+                f"p10-p90 {_fmt(cut.get('p10_p90'), 9, 4)}"
+            )
     skips = report.get("draw_skips") or {}
     if int(skips.get("n") or 0):
         who = ", ".join(
@@ -2288,9 +2495,30 @@ def _empty_join() -> dict:
         "id_matched": 0,
         "name_matched": 0,
         "kept_as_zero": 0,
+        "kept_zero_no_injury_row": 0,
         "excluded_as_out": 0,
+        "out_unresolved_no_kickoff": 0,
         "kept_as_zero_by_pos": {pos: 0 for pos in _POS_ORDER},
+        "kept_zero_no_injury_row_by_pos": {pos: 0 for pos in _POS_ORDER},
         "excluded_as_out_by_pos": {pos: 0 for pos in _POS_ORDER},
+        "out_unresolved_no_kickoff_by_pos": {pos: 0 for pos in _POS_ORDER},
+    }
+
+
+def _empty_headline() -> dict:
+    return {"board": [], "data": [], "cover": []}
+
+
+def _headline_cut(bag: dict) -> dict:
+    board = _me_mae(bag["board"])
+    data = _me_mae(bag["data"])
+    covers = bag["cover"]
+    n = len(covers)
+    return {
+        "n": n,
+        "board_mae": board["mae"],
+        "data_mae": data["mae"],
+        "p10_p90": (sum(1 for flag in covers if flag) / n) if n else None,
     }
 
 
