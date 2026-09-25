@@ -5,28 +5,39 @@ from __future__ import annotations
 import math
 import unittest
 
-import numpy as np
-from scipy import stats
+try:
+    import numpy as np
+    from scipy import stats
 
-from nfl.calibration import (
-    brier_score,
-    block_bootstrap,
-    crps_ensemble,
-    crps_normal,
-    ensemble_pair_mean,
-    fisher_z,
-    fixed_threshold_scores,
-    interval_hit,
-    log_score,
-    monte_carlo_summary,
-    paired_difference,
-    pit,
-    pit_histogram,
-    salary_multiple_scores,
-)
+    from nfl.calibration import (
+        brier_score,
+        block_bootstrap,
+        crps_ensemble,
+        crps_normal,
+        ensemble_pair_mean,
+        fisher_z,
+        fixed_threshold_scores,
+        interval_hit,
+        log_score,
+        monte_carlo_summary,
+        paired_difference,
+        pit,
+        pit_histogram,
+        salary_multiple_scores,
+    )
+except ImportError:
+    np = None
+    stats = None
+
+
+def _need_scoring(test):
+    if np is None:
+        test.skipTest("numpy and scipy are required; pip3 install -r requirements.txt")
 
 
 class CrpsTest(unittest.TestCase):
+    def setUp(self) -> None:
+        _need_scoring(self)
     def test_normal_at_zero_is_the_closed_form(self) -> None:
         got = float(crps_normal(0.0, 0.0, 1.0))
         target = (math.sqrt(2.0) - 1.0) / math.sqrt(math.pi)
@@ -60,6 +71,8 @@ class CrpsTest(unittest.TestCase):
 
 
 class BrierLogTest(unittest.TestCase):
+    def setUp(self) -> None:
+        _need_scoring(self)
     def test_brier_known_values(self) -> None:
         self.assertAlmostEqual(float(brier_score(0.7, 1)), 0.09)
         self.assertAlmostEqual(float(brier_score(0.7, 0)), 0.49)
@@ -88,6 +101,8 @@ class BrierLogTest(unittest.TestCase):
 
 
 class PitCoverageTest(unittest.TestCase):
+    def setUp(self) -> None:
+        _need_scoring(self)
     def test_calibrated_pit_and_underdispersed_coverage(self) -> None:
         rng = np.random.default_rng(7)
         n_rows, n_draws = 4000, 800
@@ -110,6 +125,8 @@ class PitCoverageTest(unittest.TestCase):
 
 
 class BootstrapTest(unittest.TestCase):
+    def setUp(self) -> None:
+        _need_scoring(self)
     def test_block_bootstrap_matches_cluster_se_and_row_bootstrap_understates_it(self) -> None:
         rng = np.random.default_rng(0)
         n_blocks, width = 40, 25
@@ -144,6 +161,8 @@ class BootstrapTest(unittest.TestCase):
 
 
 class MonteCarloSeTest(unittest.TestCase):
+    def setUp(self) -> None:
+        _need_scoring(self)
     def test_se_of_a_normal_mean(self) -> None:
         rng = np.random.default_rng(0)
         n = 40_000
@@ -165,6 +184,8 @@ class MonteCarloSeTest(unittest.TestCase):
 
 
 class FisherTest(unittest.TestCase):
+    def setUp(self) -> None:
+        _need_scoring(self)
     def test_large_gap_is_flagged_and_clip_is_finite(self) -> None:
         n = 100
         checked = fisher_z(0.9, 0.0, n)

@@ -14,8 +14,13 @@ week 1 sim inputs with the prior season's week 18.
 
 ``--population pregame`` (default) keeps depth-chart starters even when the
 box score is a zero. ``--population played`` restores the legacy starter
-filter. ``--seeds 1,2,3`` adds a Monte Carlo SE across seeds. With
-``--json-out results/holdout-2024.json`` the run also writes
+filter. The report above does not import NumPy or SciPy.
+
+``--metrics``, more than one ``--seeds`` value, or ``--draws-out`` adds
+PIT, CRPS, coverage, Brier and log score, paired tests, residual Fisher z,
+and a Monte Carlo SE. That path imports NumPy and SciPy lazily and exits
+with ``pip3 install -r requirements.txt`` when they are missing. With
+``--json-out results/holdout-2024.json`` and metrics on, the run also writes
 ``results/holdout-2024.draws.npz`` and ``results/holdout-2024.manifest.json``.
 
 The report pools starters and the full pool: mean error and MAE by position
@@ -39,8 +44,6 @@ from collections import defaultdict
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-import numpy as np
-
 from nfl.backtest import (
     DepthPoolError,
     _STARTER_RANKS,
@@ -49,19 +52,6 @@ from nfl.backtest import (
     index_actual_rows,
     index_dst_rows,
     is_starter,
-)
-from nfl.calibration import (
-    N_BOOT,
-    QUANTILES,
-    block_bootstrap,
-    crps_ensemble,
-    fisher_z,
-    interval_hit,
-    monte_carlo_summary,
-    paired_difference,
-    pit,
-    pit_histogram,
-    salary_multiple_scores,
 )
 from nfl.gangstash import (
     GangstashDataError,
@@ -101,6 +91,33 @@ _LINEUP_THRESHOLDS = (125.0, 165.0)
 _SALARY_MULTIPLES = (2.0, 3.0, 4.0)
 _LOSS_MODES = ("board", "sim_placeholder", "sim_data")
 _SIM_MODES = ("sim_placeholder", "sim_data")
+_METRICS_INSTALL = "pip3 install -r requirements.txt"
+
+
+class HoldoutMetricsError(RuntimeError):
+    """Scoring metrics were requested and NumPy or SciPy is not installed."""
+
+
+def require_scoring():
+    """Import NumPy and ``nfl.calibration``. Only the metrics path calls this."""
+    cached = getattr(require_scoring, "_cached", None)
+    if cached is not None:
+        return cached
+    try:
+        import numpy as np
+        from nfl import calibration as calibration
+    except ImportError as exc:
+        raise HoldoutMetricsError(
+            "numpy and scipy are required for holdout scoring metrics. "
+            + _METRICS_INSTALL
+        ) from exc
+    require_scoring._cached = (np, calibration)
+    return require_scoring._cached
+
+
+def metrics_requested(*, metrics: bool, seeds: list[int], draws_out) -> bool:
+    """New scores run only when asked, or when a flag cannot work without them."""
+    return bool(metrics) or len(seeds) > 1 or draws_out is not None
 
 _TD_FIELDS = {
     "rushing touchdowns": "rush_tds",
@@ -833,13 +850,15 @@ def _new_row_sink() -> dict:
     }
 
 
-def _pack_draws(series: np.ndarray) -> tuple[str, np.ndarray]:
+def _pack_draws(series):
+    np, calibration = require_scoring()
     if int(series.size) > _FULL_DRAW_MAX:
-        return "quantiles", np.quantile(series, QUANTILES)
+        return "quantiles", np.quantile(series, calibration.QUANTILES)
     return "draws", np.asarray(series, dtype=np.float64)
 
 
 def _record_pairs(bag: dict, players: list[Player], joined_rows: list[dict], sims: dict) -> None:
+    np, _calibration = require_scoring()
     actual_by_pid = {item["player"].pid: item["actual"] for item in joined_rows}
     mean_by_pid: dict[str, dict[str, float]] = {}
     for item in joined_rows:
@@ -896,6 +915,7 @@ def _absorb_seed(
     seed_i: int,
 ) -> None:
     """One seed's headline pieces. ``row_sink`` is the primary seed only."""
+    np, calibration = require_scoring()
     block = f"{int(season)}-{int(week)}"
     by_pos = {
         mode: {pos: ([], []) for pos in _POS_ORDER} for mode in ("board", *_SIM_MODES)
@@ -973,10 +993,10 @@ def _absorb_seed(
         for mode in _SIM_MODES:
             draws = np.stack([row["series"][mode] for row in shared])
             pred = np.asarray([row["preds"][mode] for row in shared], dtype=float)
-            crps = crps_ensemble(draws, y)
-            hit10 = interval_hit(draws, y, 0.10, 0.90)
-            hit25 = interval_hit(draws, y, 0.25, 0.75)
-            pits = pit(draws, y, rng)
+            crps = calibration.crps_ensemble(draws, y)
+            hit10 = calibration.interval_hit(draws, y, 0.10, 0.90)
+            hit25 = calibration.interval_hit(draws, y, 0.25, 0.75)
+            pits = calibration.pit(draws, y, rng)
             if np.any(starter):
                 bag["cover10"][mode].extend(hit10[starter].astype(float).tolist())
                 bag["cover25"][mode].extend(hit25[starter].astype(float).tolist())
@@ -988,7 +1008,9 @@ def _absorb_seed(
                 row_sink["cover10"][mode].extend(hit10.astype(float).tolist())
                 row_sink["cover25"][mode].extend(hit25.astype(float).tolist())
                 row_sink["pit"][mode].extend(pits.tolist())
-                priced = salary_multiple_scores(draws, y, salary, _SALARY_MULTIPLES)
+                priced = calibration.salary_multiple_scores(
+                    draws, y, salary, _SALARY_MULTIPLES
+                )
                 if priced["n"]:
                     if mode == _SIM_MODES[0]:
                         row_sink["price_block"].extend([block] * priced["n"])
@@ -1022,6 +1044,7 @@ def _absorb_seed(
 
 
 def _finalize_seed(bag: dict) -> dict[str, float]:
+    _np, calibration = require_scoring()
     out: dict[str, float] = {}
     for mode in _LOSS_MODES:
         for pos in (*_POS_ORDER, "ALL"):
@@ -1040,7 +1063,9 @@ def _finalize_seed(bag: dict) -> dict[str, float]:
         if bag["crps"][mode]:
             out[f"crps.{mode}"] = sum(bag["crps"][mode]) / len(bag["crps"][mode])
         if bag["pit"][mode]:
-            out[f"pit_chi2_p.{mode}"] = float(pit_histogram(bag["pit"][mode])["p"])
+            out[f"pit_chi2_p.{mode}"] = float(
+                calibration.pit_histogram(bag["pit"][mode])["p"]
+            )
         if bag["total_sd"][mode]:
             out[f"game_total_sd.{mode}"] = sum(bag["total_sd"][mode]) / len(bag["total_sd"][mode])
         if bag["margin_sd"][mode]:
@@ -1058,13 +1083,14 @@ def _finalize_seed(bag: dict) -> dict[str, float]:
                 out[f"corr_sim.{mode}.{name}"] = _mean(bag["sim_corr"][mode][name])
             if c_act is not None:
                 out[f"resid_actual.{mode}.{name}"] = c_act
-            checked = fisher_z(c_sim, c_act, len(act_pairs))
+            checked = calibration.fisher_z(c_sim, c_act, len(act_pairs))
             if checked["z"] is not None:
                 out[f"fisher_z.{mode}.{name}"] = checked["z"]
     return out
 
 
 def _residual_report(bag: dict) -> dict:
+    _np, calibration = require_scoring()
     out = {}
     for name in _PAIRS:
         out[name] = {}
@@ -1075,7 +1101,7 @@ def _residual_report(bag: dict) -> dict:
                 [pair[1] for pair in act_pairs],
             )
             c_sim = _mean(bag["resid_sim"][mode][name])
-            checked = fisher_z(c_sim, c_act, len(act_pairs))
+            checked = calibration.fisher_z(c_sim, c_act, len(act_pairs))
             out[name][mode] = {
                 "actual": c_act,
                 "n_actual": len(act_pairs),
@@ -1089,13 +1115,14 @@ def _residual_report(bag: dict) -> dict:
 
 
 def _mask_boot(values, starter, blocks, *, starters_only: bool) -> dict:
+    np, calibration = require_scoring()
     vals = np.asarray(values, dtype=float)
     flags = np.asarray(starter, dtype=bool)
     labels = np.asarray(blocks)
     if starters_only:
         vals = vals[flags]
         labels = labels[flags]
-    return block_bootstrap(vals, labels, n_boot=N_BOOT, seed=0)
+    return calibration.block_bootstrap(vals, labels, n_boot=calibration.N_BOOT, seed=0)
 
 
 def _scores_report(row_sink: dict) -> dict:
@@ -1132,13 +1159,14 @@ def _scores_report(row_sink: dict) -> dict:
                 "p10_p90": _mask_boot(row_sink["cover10"][mode], flags, row_sink["block"], starters_only=starters_only),
                 "p25_p75": _mask_boot(row_sink["cover25"][mode], flags, row_sink["block"], starters_only=starters_only),
                 "pit_mean": _mask_boot(row_sink["pit"][mode], flags, row_sink["block"], starters_only=starters_only),
-                "pit_histogram": pit_histogram(hist_values),
+                "pit_histogram": require_scoring()[1].pit_histogram(hist_values),
             }
         out["pools"][pool] = pool_out
     return out
 
 
 def _salary_block(row_sink: dict) -> dict:
+    _np, calibration = require_scoring()
     n = len(row_sink["price_block"])
     if n == 0:
         return {
@@ -1153,16 +1181,16 @@ def _salary_block(row_sink: dict) -> dict:
         for mult in _SALARY_MULTIPLES:
             label = f"{int(mult)}x"
             levels[mode][label] = {
-                "brier": block_bootstrap(
+                "brier": calibration.block_bootstrap(
                     row_sink["brier"][mode][mult],
                     row_sink["price_block"],
-                    n_boot=N_BOOT,
+                    n_boot=calibration.N_BOOT,
                     seed=0,
                 ),
-                "log_score": block_bootstrap(
+                "log_score": calibration.block_bootstrap(
                     row_sink["log_score"][mode][mult],
                     row_sink["price_block"],
-                    n_boot=N_BOOT,
+                    n_boot=calibration.N_BOOT,
                     seed=0,
                 ),
             }
@@ -1188,6 +1216,7 @@ def _lineup_note() -> dict:
 def _paired_report(row_sink: dict) -> dict:
     if not row_sink["block"]:
         return {}
+    np, calibration = require_scoring()
     out = {}
     comparisons = (
         ("board", "sim_placeholder"),
@@ -1206,20 +1235,20 @@ def _paired_report(row_sink: dict) -> dict:
         for left, right in comparisons:
             key = f"{left}_minus_{right}"
             entry = {
-                "abs_error": paired_difference(
+                "abs_error": calibration.paired_difference(
                     np.asarray(row_sink["abs"][left], dtype=float)[keep],
                     np.asarray(row_sink["abs"][right], dtype=float)[keep],
                     kept_blocks,
-                    n_boot=N_BOOT,
+                    n_boot=calibration.N_BOOT,
                     seed=0,
                 )
             }
             if left in _SIM_MODES and right in _SIM_MODES:
-                entry["crps"] = paired_difference(
+                entry["crps"] = calibration.paired_difference(
                     np.asarray(row_sink["crps"][left], dtype=float)[keep],
                     np.asarray(row_sink["crps"][right], dtype=float)[keep],
                     kept_blocks,
-                    n_boot=N_BOOT,
+                    n_boot=calibration.N_BOOT,
                     seed=0,
                 )
             pool_out[key] = entry
@@ -1229,6 +1258,7 @@ def _paired_report(row_sink: dict) -> dict:
 
 def write_draw_archive(path: Path, rows: list[dict]) -> dict:
     """Persist draws, or q01..q99 when each row is longer than ``_FULL_DRAW_MAX``."""
+    np, calibration = require_scoring()
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
         np.savez_compressed(path, kind=np.array(["empty"]))
@@ -1252,7 +1282,7 @@ def write_draw_archive(path: Path, rows: list[dict]) -> dict:
         "block": np.asarray([row["block"] for row in rows]),
     }
     if kind == "quantiles":
-        payload["quantile"] = np.asarray(QUANTILES, dtype=np.float64)
+        payload["quantile"] = np.asarray(calibration.QUANTILES, dtype=np.float64)
     np.savez_compressed(path, **payload)
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     info = {
@@ -1304,19 +1334,29 @@ def build_manifest(*, argv: list[str], report: dict, pulls: list[dict], draws: d
         "population": report.get("population"),
         "argv": list(argv),
         "python": platform.python_version(),
-        "numpy": np.__version__,
-        "scipy": __import__("scipy").__version__,
+        "numpy": _loaded_version("numpy"),
+        "scipy": _loaded_version("scipy"),
         "datasets": list(pulls),
     }
 
 
+def _loaded_version(name: str) -> str | None:
+    """Version of a library already imported by the metrics path. Does not import it."""
+    mod = sys.modules.get(name)
+    if mod is None:
+        return None
+    version = getattr(mod, "__version__", None)
+    return None if version is None else str(version)
+
+
 def _mc_block(per_seed: list[dict]) -> dict:
+    _np, calibration = require_scoring()
     keys = sorted({key for item in per_seed for key in item})
     out = {}
     for key in keys:
         vals = [item[key] for item in per_seed if key in item and item[key] is not None]
         if vals:
-            out[key] = monte_carlo_summary(vals)
+            out[key] = calibration.monte_carlo_summary(vals)
     return out
 
 
@@ -1334,6 +1374,7 @@ def run_holdout(
     load=None,
     prop_fetch=None,
     draws_out: str | Path | None = None,
+    metrics: bool = False,
 ) -> dict:
     """Score every requested week. Network stays inside ``load`` and props."""
     if population not in ("pregame", "played"):
@@ -1344,13 +1385,23 @@ def run_holdout(
     if len(seed_list) > 5:
         raise ValueError("seeds supports at most 5")
     primary = seed_list[0]
+    want_metrics = metrics_requested(
+        metrics=metrics, seeds=seed_list, draws_out=draws_out
+    )
+    if want_metrics:
+        np, _scoring = require_scoring()
+        pit_rng = [np.random.default_rng(10_000 + int(item)) for item in seed_list]
+        seed_bags = [_new_seed_bag() for _ in seed_list]
+        row_sink = _new_row_sink()
+        draw_sink: list[dict] = []
+    else:
+        pit_rng = []
+        seed_bags = []
+        row_sink = None
+        draw_sink = []
     loader = load or load_week
     props_of = prop_fetch or fetch_prop_rows
     draws_n = max(1, int(n))
-    seed_bags = [_new_seed_bag() for _ in seed_list]
-    row_sink = _new_row_sink()
-    draw_sink: list[dict] = []
-    pit_rng = [np.random.default_rng(10_000 + int(item)) for item in seed_list]
     sens_week = pick_sensitivity_week(weeks, sensitivity_week) if run_sensitivity else None
     errors = {
         pool: {mode: defaultdict(list) for mode in ("board", "sim_placeholder", "sim_data")}
@@ -1621,20 +1672,21 @@ def run_holdout(
                     n=draws_n,
                     seed=int(primary),
                 )
-            for offset, seed_i in enumerate(seed_list):
-                _absorb_seed(
-                    seed_bags[offset],
-                    joined_rows,
-                    players,
-                    sims_by_seed[offset],
-                    week_games,
-                    rng=pit_rng[offset],
-                    row_sink=row_sink if offset == 0 else None,
-                    draw_sink=draw_sink,
-                    season=int(season),
-                    week=int(week),
-                    seed_i=int(seed_i),
-                )
+            if want_metrics:
+                for offset, seed_i in enumerate(seed_list):
+                    _absorb_seed(
+                        seed_bags[offset],
+                        joined_rows,
+                        players,
+                        sims_by_seed[offset],
+                        week_games,
+                        rng=pit_rng[offset],
+                        row_sink=row_sink if offset == 0 else None,
+                        draw_sink=draw_sink,
+                        season=int(season),
+                        week=int(week),
+                        seed_i=int(seed_i),
+                    )
 
     prop_by_pos: dict[str, list[tuple[float, float]]] = defaultdict(list)
     sim_on_props: dict[str, list[tuple[float, float]]] = defaultdict(list)
@@ -1741,33 +1793,34 @@ def run_holdout(
             },
         },
     }
-    per_seed = [_finalize_seed(bag) for bag in seed_bags]
-    draws_info = {
-        "kind": draw_sink[0]["kind"] if draw_sink else "empty",
-        "n_rows": len(draw_sink),
-    }
-    if draws_out is not None:
-        archive = write_draw_archive(Path(draws_out), draw_sink)
+    if want_metrics:
+        per_seed = [_finalize_seed(bag) for bag in seed_bags]
         draws_info = {
-            "kind": archive["kind"],
-            "n_rows": archive["n_rows"],
-            "sha256": archive["sha256"],
+            "kind": draw_sink[0]["kind"] if draw_sink else "empty",
+            "n_rows": len(draw_sink),
         }
-        if "n_draws" in archive:
-            draws_info["n_draws"] = archive["n_draws"]
-        if "quantiles" in archive:
-            draws_info["quantiles"] = archive["quantiles"]
-    report["scores"] = _scores_report(row_sink)
-    report["paired"] = _paired_report(row_sink)
-    report["residual_correlations"] = (
-        _residual_report(seed_bags[0]) if seed_bags else {}
-    )
-    report["mc_se"] = {
-        "n_seeds": len(seed_list),
-        "seeds": [int(item) for item in seed_list],
-        "metrics": _mc_block(per_seed),
-    }
-    report["draws"] = draws_info
+        if draws_out is not None:
+            archive = write_draw_archive(Path(draws_out), draw_sink)
+            draws_info = {
+                "kind": archive["kind"],
+                "n_rows": archive["n_rows"],
+                "sha256": archive["sha256"],
+            }
+            if "n_draws" in archive:
+                draws_info["n_draws"] = archive["n_draws"]
+            if "quantiles" in archive:
+                draws_info["quantiles"] = archive["quantiles"]
+        report["scores"] = _scores_report(row_sink)
+        report["paired"] = _paired_report(row_sink)
+        report["residual_correlations"] = (
+            _residual_report(seed_bags[0]) if seed_bags else {}
+        )
+        report["mc_se"] = {
+            "n_seeds": len(seed_list),
+            "seeds": [int(item) for item in seed_list],
+            "metrics": _mc_block(per_seed),
+        }
+        report["draws"] = draws_info
     report["population_note"] = (
         "pregame keeps depth-chart starters (QB/RB/TE rank 1, WR ranks 1-3, DEF) "
         "including zero-point busts. played is the legacy is_starter filter."
@@ -2033,7 +2086,16 @@ def main(argv: list[str] | None = None) -> int:
         "--seeds",
         default=None,
         help="comma-separated sim seeds, e.g. 1,2,3 (at most 5). "
-        "Default is --seed. Headline metrics include a Monte Carlo SE.",
+        "Default is --seed. More than one seed requests scoring metrics "
+        "and a Monte Carlo SE.",
+    )
+    ap.add_argument(
+        "--metrics",
+        action="store_true",
+        help="PIT, CRPS, coverage, Brier/log score, paired tests, residual "
+        "Fisher z, and Monte Carlo SE. Requires numpy and scipy "
+        f"({_METRICS_INSTALL}). Also on when --seeds has more than one "
+        "value or --draws-out is set.",
     )
     ap.add_argument(
         "--population",
@@ -2046,8 +2108,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--draws-out",
         default=None,
-        help="npz of per-player draws, or q01..q99 when n is large "
-        "(default: next to --json-out)",
+        help="npz of per-player draws, or q01..q99 when n is large. "
+        "Requests scoring metrics. Default when metrics are on and "
+        "--json-out is set: next to that JSON.",
     )
     ap.add_argument(
         "--manifest-out",
@@ -2077,9 +2140,12 @@ def main(argv: list[str] | None = None) -> int:
         print("choke HOLDOUT: n must be >= 1", file=sys.stderr)
         return 1
     json_path = Path(args.json_out) if args.json_out else None
+    want_metrics = metrics_requested(
+        metrics=args.metrics, seeds=seeds, draws_out=args.draws_out
+    )
     if args.draws_out:
         draws_path = Path(args.draws_out)
-    elif json_path is not None:
+    elif want_metrics and json_path is not None:
         draws_path = json_path.with_suffix(".draws.npz")
     else:
         draws_path = None
@@ -2090,18 +2156,23 @@ def main(argv: list[str] | None = None) -> int:
     else:
         manifest_path = None
     cli = list(sys.argv[1:] if argv is None else argv)
-    with capture_pulls() as pulls:
-        report = run_holdout(
-            seasons,
-            weeks,
-            n=args.n,
-            seed=seeds[0],
-            seeds=seeds,
-            population=args.population,
-            seed_prior_season=args.seed_prior_season,
-            sensitivity_week=args.sensitivity_week,
-            draws_out=draws_path,
-        )
+    try:
+        with capture_pulls() as pulls:
+            report = run_holdout(
+                seasons,
+                weeks,
+                n=args.n,
+                seed=seeds[0],
+                seeds=seeds,
+                population=args.population,
+                seed_prior_season=args.seed_prior_season,
+                sensitivity_week=args.sensitivity_week,
+                draws_out=draws_path,
+                metrics=want_metrics,
+            )
+    except HoldoutMetricsError as exc:
+        print(f"choke HOLDOUT_METRICS: {exc}", file=sys.stderr)
+        return 1
     text = format_report(report)
     print(text)
     if json_path is not None:

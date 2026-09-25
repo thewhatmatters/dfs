@@ -29,6 +29,7 @@ from nfl.gangstash_data import (
     uniquify_depth_ranks,
 )
 from nfl.holdout import (
+    HoldoutMetricsError,
     WeekLoad,
     _calibration_block,
     _game_actuals,
@@ -44,6 +45,7 @@ from nfl.holdout import (
     _pack_draws,
     load_week,
     main,
+    metrics_requested,
     parse_seasons,
     parse_seeds,
     parse_weeks,
@@ -51,6 +53,7 @@ from nfl.holdout import (
     write_draw_archive,
     perturb,
     pick_sensitivity_week,
+    require_scoring,
     run_holdout,
     spearman,
 )
@@ -60,6 +63,15 @@ from nfl.projections import week1_score
 from nfl.sim import simulate_games
 from nfl.sim_efficiency import OpportunityCount, build_efficiency
 from nfl.sim_inputs import SimInputs, TargetWeek, TeamStat
+
+
+def _has_scoring() -> bool:
+    try:
+        import numpy  # noqa: F401
+        import scipy  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 def _pl(**kw) -> Player:
@@ -483,6 +495,19 @@ class ReportTest(unittest.TestCase):
         self.assertIn("props_closing: skipped", text)
         self.assertIn("calibration", text)
 
+    def test_default_report_does_not_import_scoring(self) -> None:
+        with patch("nfl.holdout.require_scoring", side_effect=AssertionError("scoring")):
+            report = run_holdout(
+                [2025],
+                [2],
+                n=4,
+                seed=1,
+                load=self._load,
+                prop_fetch=lambda season: ([], "props_closing: no rows"),
+            )
+        self.assertNotIn("scores", report)
+        self.assertGreater(report["errors"]["full"]["board"]["QB"]["n"], 0)
+
     def test_props_mae_sits_next_to_the_sim(self) -> None:
         def props(_season):
             return (
@@ -530,6 +555,7 @@ class ReportTest(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("--sensitivity-week", proc.stdout)
+        self.assertIn("--metrics", proc.stdout)
         self.assertIn("±10%", proc.stdout)
 
     def test_main_writes_json_without_network(self) -> None:
@@ -558,6 +584,8 @@ class ReportTest(unittest.TestCase):
         self.assertIn("ranking", payload)
         self.assertIn("sensitivity", payload)
         self.assertIn("props", payload)
+        self.assertNotIn("scores", payload)
+        self.assertFalse(path.with_suffix(".draws.npz").is_file())
 
     def test_main_week1_does_not_seed_unless_asked(self) -> None:
         def boom(*_args, **_kwargs):
@@ -645,6 +673,7 @@ class MeasurementHarnessTest(unittest.TestCase):
         ]
         return WeekLoad(players, actuals, SimInputs(), [], ["pool: depth charts"])
 
+    @unittest.skipUnless(_has_scoring(), "numpy and scipy are required")
     def test_long_ensembles_store_quantiles(self) -> None:
         import numpy as np
 
@@ -720,6 +749,26 @@ class MeasurementHarnessTest(unittest.TestCase):
             played["errors"]["full"]["board"]["WR"]["n"],
         )
         self.assertEqual(pre["correlations"], played["correlations"])
+        self.assertNotIn("scores", pre)
+        self.assertNotIn("paired", pre)
+        self.assertNotIn("mc_se", pre)
+        text = format_report(pre)
+        self.assertIn("population: pregame", text)
+        self.assertIn("correlations (actual Pearson", text)
+
+    @unittest.skipUnless(_has_scoring(), "numpy and scipy are required")
+    def test_metrics_scores_the_primary_seed(self) -> None:
+        pre = run_holdout(
+            [2025],
+            [2],
+            n=4,
+            seed=1,
+            metrics=True,
+            population="pregame",
+            run_sensitivity=False,
+            load=self._load,
+            prop_fetch=lambda season: ([], "props_closing: no rows"),
+        )
         self.assertEqual(
             pre["correlations"]["QB-WR1"]["sim_data"],
             pre["residual_correlations"]["QB-WR1"]["sim_data"]["sim"],
@@ -737,10 +786,9 @@ class MeasurementHarnessTest(unittest.TestCase):
             pre["mc_se"]["metrics"]["starter_mae.board.QB"]["mean"],
         )
         text = format_report(pre)
-        self.assertIn("population: pregame", text)
         self.assertIn("residual correlations", text)
-        self.assertIn("correlations (actual Pearson", text)
 
+    @unittest.skipUnless(_has_scoring(), "numpy and scipy are required")
     def test_seeds_report_monte_carlo_se(self) -> None:
         report = run_holdout(
             [2025],
@@ -763,6 +811,7 @@ class MeasurementHarnessTest(unittest.TestCase):
         self.assertEqual(report["seed"], 1)
         self.assertEqual(report["seeds"], [1, 2])
 
+    @unittest.skipUnless(_has_scoring(), "numpy and scipy are required")
     def test_main_writes_manifest_and_draws(self) -> None:
         def boom(*_args, **_kwargs):
             raise AssertionError("network")
@@ -822,6 +871,89 @@ def np_load(path: Path):
     import numpy as np
 
     return np.load(path, allow_pickle=False)
+
+
+class ScoringImportTest(unittest.TestCase):
+    def test_optimizer_nightly_and_holdout_stay_off_numpy(self) -> None:
+        script = (
+            "import sys\n"
+            "import nfl.optimize\n"
+            "import nfl.publish_projections\n"
+            "import nfl.holdout\n"
+            "bad = [name for name in sys.modules if name == 'numpy' or name.startswith('numpy.')"
+            " or name == 'scipy' or name.startswith('scipy.') or name == 'nfl.calibration']\n"
+            "print('\\n'.join(bad))\n"
+        )
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True,
+            text=True,
+            cwd=str(Path(__file__).resolve().parents[1]),
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
+
+    def test_require_scoring_names_the_requirements_file(self) -> None:
+        import builtins
+
+        saved = {
+            key: sys.modules.pop(key)
+            for key in list(sys.modules)
+            if key == "numpy"
+            or key.startswith("numpy.")
+            or key == "scipy"
+            or key.startswith("scipy.")
+            or key == "nfl.calibration"
+        }
+        if hasattr(require_scoring, "_cached"):
+            delattr(require_scoring, "_cached")
+        real_import = builtins.__import__
+
+        def blocked(name, globals=None, locals=None, fromlist=(), level=0):
+            root = name.split(".", 1)[0]
+            if root in {"numpy", "scipy"}:
+                raise ImportError(name)
+            return real_import(name, globals, locals, fromlist, level)
+
+        try:
+            with patch("builtins.__import__", blocked):
+                with self.assertRaises(HoldoutMetricsError) as caught:
+                    require_scoring()
+            self.assertIn("pip3 install -r requirements.txt", str(caught.exception))
+        finally:
+            for key in list(sys.modules):
+                if (
+                    key == "numpy"
+                    or key.startswith("numpy.")
+                    or key == "scipy"
+                    or key.startswith("scipy.")
+                    or key == "nfl.calibration"
+                ):
+                    sys.modules.pop(key, None)
+            sys.modules.update(saved)
+            if hasattr(require_scoring, "_cached"):
+                delattr(require_scoring, "_cached")
+
+    def test_metrics_flag_errors_when_scoring_libs_are_missing(self) -> None:
+        err = io.StringIO()
+        with patch(
+            "nfl.holdout.require_scoring",
+            side_effect=HoldoutMetricsError(
+                "numpy and scipy are required for holdout scoring metrics. "
+                "pip3 install -r requirements.txt"
+            ),
+        ), redirect_stderr(err), redirect_stdout(io.StringIO()):
+            code = main(["--season", "2025", "--weeks", "2", "--metrics"])
+        self.assertEqual(code, 1)
+        self.assertIn("pip3 install -r requirements.txt", err.getvalue())
+        self.assertIn("choke HOLDOUT_METRICS:", err.getvalue())
+
+    def test_multiple_seeds_count_as_a_metrics_request(self) -> None:
+        self.assertFalse(metrics_requested(metrics=False, seeds=[1], draws_out=None))
+        self.assertTrue(metrics_requested(metrics=True, seeds=[1], draws_out=None))
+        self.assertTrue(metrics_requested(metrics=False, seeds=[1, 2], draws_out=None))
+        self.assertTrue(metrics_requested(metrics=False, seeds=[1], draws_out="draws.npz"))
 
 
 class PullManifestTest(unittest.TestCase):
