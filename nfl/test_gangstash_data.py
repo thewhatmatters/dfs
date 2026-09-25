@@ -386,12 +386,14 @@ class TargetWindowTest(unittest.TestCase):
         walker = by_name["Devontez Walker"]
         self.assertAlmostEqual(brown.target_share or 0, 12 / 50)
         self.assertEqual(brown.targets_status, "joined")
+        self.assertEqual(brown.targets_source, "gangstash")
         self.assertAlmostEqual(
             brown.objective,
             week1_score(30.0, 1, "WR", target_share=12 / 50),
         )
         self.assertIsNone(walker.target_share)
         self.assertEqual(walker.targets_status, "unmatched")
+        self.assertIsNone(walker.targets_source)
         self.assertAlmostEqual(
             walker.objective,
             week1_score(30.0, 1, "WR", target_share=None),
@@ -675,6 +677,7 @@ class SnapWindowTest(unittest.TestCase):
         self.assertAlmostEqual(by_name["Jonathan Taylor"].snap_share or 0, 0.94)
         self.assertEqual(by_name["Jonathan Taylor"].snaps, 61)
         self.assertEqual(by_name["Jonathan Taylor"].snaps_status, "joined")
+        self.assertEqual(by_name["Jonathan Taylor"].snaps_source, "gangstash")
         self.assertAlmostEqual(
             by_name["Jonathan Taylor"].objective or 0,
             week1_score(30.0, 1, "RB", snap_share=0.94),

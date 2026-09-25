@@ -350,6 +350,7 @@ def attach_targets(
                 targets=hit.targets,
                 targets_week=chosen,
                 targets_status="joined",
+                targets_source=hit.source or "lineups",
                 objective=obj,
             )
         )

@@ -354,6 +354,7 @@ def attach_snaps(
                 snaps=hit.snaps,
                 snaps_week=chosen,
                 snaps_status="joined",
+                snaps_source=hit.source or "lineups",
                 objective=obj,
             )
         )

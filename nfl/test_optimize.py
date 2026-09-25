@@ -133,7 +133,7 @@ class Week1ScoreTest(unittest.TestCase):
         )
         info = explain_player(pl)
         self.assertEqual(info["prop_status"], "props")
-        self.assertEqual(info["sources"], "ourlads/gangstash")
+        self.assertEqual(info["sources"], "ourlads/gs-props")
         self.assertIn("Gangstash", info["note"])
         self.assertIn("±20% tilt on implied", info["note"])
         self.assertIn("250.5 pass yds", info["note"])
@@ -148,6 +148,33 @@ class Week1ScoreTest(unittest.TestCase):
         )
         info = explain_player(pl)
         self.assertEqual(info["sources"], "ourlads/lineups-tgt")
+
+    def test_gangstash_sources_name_each_input(self):
+        kelce = _pl(
+            name="Travis Kelce",
+            position="TE",
+            depth_rank=1,
+            depth_source="gangstash",
+            target_share=0.22,
+            targets_source="gangstash",
+            snap_share=0.81,
+            snaps_source="gangstash",
+            prop_fd=12.4,
+            prop_book="gangstash",
+        )
+        mahomes = _pl(
+            name="Patrick Mahomes",
+            position="QB",
+            depth_rank=1,
+            depth_source="gangstash",
+            prop_fd=22.1,
+            prop_book="gangstash",
+        )
+        self.assertEqual(
+            explain_player(kelce)["sources"],
+            "gs-depth/gs-tgt/gs-snap/gs-props",
+        )
+        self.assertEqual(explain_player(mahomes)["sources"], "gs-depth/gs-props")
 
     def test_def_uses_pa_plus_prior(self):
         self.assertAlmostEqual(week1_score(0.0, None, "D", implied_opp=24.5), 3.0)

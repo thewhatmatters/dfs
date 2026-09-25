@@ -158,6 +158,22 @@ class PickerTableTest(unittest.TestCase):
             "odds-props",
         )
         self.assertEqual(
+            format_picker_sources(
+                {
+                    "position": "TE",
+                    "depth_rank": 1,
+                    "depth_source": "gangstash",
+                    "target_share": 0.22,
+                    "targets_source": "gangstash",
+                    "snap_share": 0.81,
+                    "snaps_source": "gangstash",
+                    "prop_fd": 12.4,
+                    "prop_book": "gangstash",
+                }
+            ),
+            "gs-depth/gs-tgt/gs-snap/gs-props",
+        )
+        self.assertEqual(
             format_picker_sources({"position": "D", "implied_opp": 22.5}),
             "vegas-dst",
         )

@@ -78,8 +78,9 @@ NFL path is flags-only.
   Wednesday refresh: targets then snaps. Props pages inventoried only
   (`https://www.lineups.com/nfl/player-prop-bets/`).
 - 2026-09-17: **Picker Sources + slate status.** Last picker column is
-  compact join tags (`ourlads`/`espn`, `lineups-tgt`, `lineups-snap`,
-  `odds-props`, `vegas-dst`) from fields already on the player — not a
+  compact join tags (`gs-depth`/`ourlads`/`espn`, `gs-tgt`/`lineups-tgt`,
+  `gs-snap`/`lineups-snap`, `gs-props`/`odds-props`, `vegas-dst`) from
+  fields already on the player — not a
   new scrape and not ILP. `--slate-status` (default only) prints pool +
   per-source coverage and exits 0; `=with-solve` prints then solves.
   `python3 -m nfl.status` is the status-only entry. JSON `slate_status`
@@ -99,7 +100,7 @@ NFL path is flags-only.
   `nfl/data/gangstash-props/`. Game lines default to `ODDS_API_KEY`
   (`--lines-source=gangstash` optional; see `nfl/docs/data/gangstash.md`).
   Unmapped `prop` strings print and are not scored. Picker tag is
-  `gangstash` when `prop_book` is gangstash. See
+  `gs-props` when `prop_book` is gangstash. See
   `nfl/docs/data/player-props.md`.
 
 ## 4. Known limitations / environment caveats
