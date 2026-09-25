@@ -13,7 +13,9 @@ from unittest.mock import patch
 
 from nfl.backtest import (
     apply_week_context,
+    hindsight_qb_pids,
     index_actuals,
+    is_hindsight_starter,
     is_starter,
     main,
     prior_weeks,
@@ -710,13 +712,90 @@ class WeekScopeTest(unittest.TestCase):
             seed=1,
         )
         self.assertEqual(by_name["Kyler Murray"].objective, before)
-        self.assertIn("questionable DNP: 1 (projection kept)", report.to_text())
-        self.assertTrue(
-            is_starter(
-                by_name["Drew Lock"],
-                _actual("Drew Lock", "SEA", 21.4, pass_attempts=30),
-            )
+        self.assertEqual(by_name["Kyler Murray"].depth_rank, 1)
+        text = report.to_text()
+        self.assertIn("questionable DNP: 1 (projection kept)", text)
+        self.assertIn("pool: hindsight (actual QB1 by snaps)", text)
+        starters = {row.position: row for row in report.starters}
+        hindsight = {row.position: row for row in report.hindsight}
+        self.assertEqual(starters["QB"].n, 1)
+        self.assertEqual(hindsight["QB"].n, 2)
+        lock_row = _actual("Drew Lock", "SEA", 21.4, pass_attempts=30)
+        wentz_row = _actual("Carson Wentz", "ARI", 6.3, pass_attempts=12)
+        murray_row = _actual("Kyler Murray", "ARI", 0.0, pass_attempts=0)
+        self.assertTrue(is_starter(by_name["Drew Lock"], lock_row))
+        self.assertFalse(is_starter(by_name["Carson Wentz"], wentz_row))
+        self.assertFalse(is_starter(by_name["Kyler Murray"], murray_row))
+        qb_pids = hindsight_qb_pids(players, {
+            ("SEA", "sam darnold"): {"row": _actual("Sam Darnold", "SEA", 0.0, pass_attempts=0)},
+            ("SEA", "drew lock"): {"row": lock_row},
+            ("ARI", "kyler murray"): {"row": murray_row},
+            ("ARI", "carson wentz"): {"row": wentz_row},
+        })
+        self.assertIn(by_name["Carson Wentz"].pid, qb_pids)
+        self.assertNotIn(by_name["Kyler Murray"].pid, qb_pids)
+        self.assertTrue(is_hindsight_starter(by_name["Carson Wentz"], wentz_row, qb_pids))
+        self.assertFalse(is_hindsight_starter(by_name["Kyler Murray"], murray_row, qb_pids))
+
+    def test_questionable_without_a_row_or_snaps_is_a_dnp(self) -> None:
+        murray = _pl(
+            pid="murray",
+            name="Kyler Murray",
+            position="QB",
+            team="ARI",
+            opponent="LAR",
+            game="LAR@ARI",
+            injury="Q",
+            depth_rank=1,
+            implied_total=22.0,
         )
+        penix = _pl(
+            pid="penix",
+            name="Michael Penix",
+            position="QB",
+            team="ARI",
+            opponent="LAR",
+            game="LAR@ARI",
+            injury="Q",
+            depth_rank=2,
+            implied_total=22.0,
+        )
+        flowers = _pl(
+            pid="flowers",
+            name="Zay Flowers",
+            position="WR",
+            team="ARI",
+            opponent="LAR",
+            game="LAR@ARI",
+            injury="Q",
+            depth_rank=1,
+            implied_total=22.0,
+        )
+        played = _pl(
+            pid="played",
+            name="Played WR",
+            position="WR",
+            team="ARI",
+            opponent="LAR",
+            game="LAR@ARI",
+            injury="Q",
+            depth_rank=2,
+            implied_total=22.0,
+        )
+        report = run_backtest(
+            [murray, penix, flowers, played],
+            [
+                _actual("Kyler Murray", "ARI", 0.0, pass_attempts=0, offense_snaps=0),
+                _actual("Zay Flowers", "ARI", 4.2, targets=3, offense_snaps=0),
+                _actual("Played WR", "ARI", 8.0, targets=5, offense_snaps=40),
+            ],
+            season=2026,
+            week=2,
+            n=8,
+            seed=1,
+        )
+        self.assertIn("questionable DNP: 3 (projection kept)", report.to_text())
+        self.assertEqual(murray.depth_rank, 1)
 
     def test_nflverse_lines_file_filters_week_and_maps_teams(self) -> None:
         from nfl.lines import load_lines_csv
@@ -725,8 +804,8 @@ class WeekScopeTest(unittest.TestCase):
             path = Path(tmp) / "lines.csv"
             path.write_text(
                 "home_team,away_team,spread_line,total_line,home_implied_tt,away_implied_tt,season,week\n"
-                "MIA,NE,6.5,41.5,17.5,24.0,2026,2\n"
-                "LA,JAX,-3,47,25,22,2026,3\n",
+                "MIA,NE,-6.5,41.5,17.5,24.0,2026,2\n"
+                "LA,JAX,3,47,25,22,2026,3\n",
                 encoding="utf-8",
             )
             by_team = load_lines_csv(
@@ -740,7 +819,7 @@ class WeekScopeTest(unittest.TestCase):
             path = Path(tmp) / "rams.csv"
             path.write_text(
                 "home_team,away_team,spread_line,total_line,season,week\n"
-                "LA,JAX,-3,47,2026,2\n",
+                "LA,JAX,3,47,2026,2\n",
                 encoding="utf-8",
             )
             rams = load_lines_csv(
@@ -751,6 +830,73 @@ class WeekScopeTest(unittest.TestCase):
             )
         self.assertIn("LAR", rams)
         self.assertIn("JAC", rams)
+        self.assertAlmostEqual(rams["LAR"].home_spread, -3.0, places=2)
+        self.assertGreater(rams["LAR"].implied_home, rams["LAR"].implied_away)
+
+    def test_nflverse_favorite_gets_the_higher_implied_total(self) -> None:
+        from nfl.lines import LinesError, load_lines_csv
+
+        header = (
+            "game_id,gameday,gametime,home_team,away_team,spread_line,total_line,"
+            "home_line,away_line,home_spread_odds,away_spread_odds,under_odds,over_odds,"
+            "home_moneyline,away_moneyline,total,season,week"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "schedule.csv"
+            path.write_text(
+                header
+                + "\n"
+                + "2026_02_MIA_SF,2026-09-20,13:00,SF,MIA,12.5,44.5,"
+                + "-12.5,12.5,-110,-110,-110,-110,-900,650,41,2026,2\n",
+                encoding="utf-8",
+            )
+            by_team = load_lines_csv(
+                path,
+                [("MIA@SF", "MIA", "SF")],
+                season=2026,
+                week=2,
+            )
+        sf = by_team["SF"]
+        self.assertAlmostEqual(sf.home_spread, -12.5, places=2)
+        self.assertAlmostEqual(sf.total, 44.5, places=2)
+        self.assertAlmostEqual(sf.implied_home, 28.5, places=2)
+        self.assertAlmostEqual(sf.implied_away, 16.0, places=2)
+        self.assertGreater(sf.implied_home, sf.implied_away)
+        self.assertAlmostEqual(sf.home_moneyline or 0, -900)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "implied.csv"
+            path.write_text(
+                "home_team,away_team,spread_line,total_line,home_implied_tt,away_implied_tt,season,week\n"
+                "SF,MIA,12.5,44.5,20.0,24.5,2026,2\n",
+                encoding="utf-8",
+            )
+            implied = load_lines_csv(
+                path,
+                [("MIA@SF", "MIA", "SF")],
+                season=2026,
+                week=2,
+            )
+        self.assertAlmostEqual(implied["SF"].implied_home, 20.0, places=2)
+        self.assertAlmostEqual(implied["SF"].implied_away, 24.5, places=2)
+        self.assertGreater(implied["SF"].implied_away, implied["SF"].implied_home)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "partial.csv"
+            path.write_text(
+                "game_id,home_team,away_team,spread_line,season,week\n"
+                "2026_02_MIA_SF,SF,MIA,12.5,2026,2\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(LinesError) as raised:
+                load_lines_csv(
+                    path,
+                    [("MIA@SF", "MIA", "SF")],
+                    season=2026,
+                    week=2,
+                )
+        self.assertIn("missing required columns", str(raised.exception))
+        self.assertIn("total_line", str(raised.exception))
 
     def test_unrecognized_line_column_is_a_hard_error(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -763,8 +909,8 @@ class WeekScopeTest(unittest.TestCase):
                 encoding="utf-8",
             )
             lines_path.write_text(
-                "home_team,away_team,spread_line,total_line,extra_book,season,week\n"
-                "MIA,NE,-6.5,41.5,pinnacle,2026,2\n",
+                "home,away,spread,total,extra_book\n"
+                "MIA,NE,-6.5,41.5,pinnacle\n",
                 encoding="utf-8",
             )
             with patch(

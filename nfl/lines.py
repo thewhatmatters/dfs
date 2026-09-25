@@ -13,7 +13,12 @@ prefers `dataset=closing_lines`, then `game_lines`. A lines file accepts
 FanDuel columns and the nflverse schedule columns (`home_team`,
 `away_team`, `spread_line`, `total_line`, `home_implied_tt`,
 `away_implied_tt`, `season`, `week`). `JAX`→`JAC` and `LA`→`LAR`.
-An unrecognized column, or a file that matches no slate game, is an error.
+A file with ``season``, ``week``, ``home_team``, ``away_team``,
+``spread_line``, and ``total_line`` is an nflverse schedule: other columns
+are ignored. ``spread_line`` is positive when the home team is favored, so
+the home spread is ``-spread_line``. ``home_implied_tt`` and
+``away_implied_tt`` win when both are present. A simple file still errors
+on an unrecognized column. Zero matched games is an error either way.
 
 implied_home = (total - home_spread) / 2
 implied_away = (total + home_spread) / 2
@@ -373,8 +378,36 @@ def parse_odds_games(
     return {fd: out[fd] for fd in {h for _, _, h in slate} | {a for _, a, _ in slate}}
 
 
-# Simple files (CSV or JSON without bookmakers). nflverse schedule names
-# are included. Anything else is an error — do not ignore extra columns.
+# Simple files (CSV or JSON without bookmakers). An nflverse schedule is
+# recognized by its required columns and may carry the rest of the schedule
+# (game_id, moneylines, home_line, *_spread_odds, …). Those are ignored.
+_NFLVERSE_REQUIRED = (
+    "season",
+    "week",
+    "home_team",
+    "away_team",
+    "spread_line",
+    "total_line",
+)
+# Columns that identify an nflverse schedule. ``season`` and ``week`` alone
+# do not: a simple file may carry those next to ``home`` / ``spread``.
+_NFLVERSE_MARKERS = frozenset(
+    {
+        "home_team",
+        "away_team",
+        "spread_line",
+        "total_line",
+        "home_implied_tt",
+        "away_implied_tt",
+        "game_id",
+        "gameday",
+        "gametime",
+        "home_line",
+        "away_line",
+        "home_spread_odds",
+        "away_spread_odds",
+    }
+)
 _LINE_COLUMNS = frozenset(
     {
         "home",
@@ -410,16 +443,37 @@ _LINE_COLUMNS = frozenset(
 )
 
 
-def _reject_unknown_columns(rows: list[dict]) -> None:
-    unknown: set[str] = set()
+def _header_names(rows: list[dict]) -> list[str]:
+    names: list[str] = []
+    seen: set[str] = set()
     for row in rows:
         for key in row:
             name = "" if key is None else str(key).strip()
             if not name:
-                unknown.add("(blank)")
+                name = "(blank)"
+            if name in seen:
                 continue
-            if name not in _LINE_COLUMNS:
-                unknown.add(name)
+            seen.add(name)
+            names.append(name)
+    return names
+
+
+def _check_line_columns(rows: list[dict]) -> None:
+    """nflverse schedules must have the key columns. Other columns are kept.
+
+    A file that is not an nflverse schedule still errors on a column this
+    reader does not know.
+    """
+    headers = _header_names(rows)
+    header_set = set(headers)
+    if header_set & _NFLVERSE_MARKERS:
+        missing = [name for name in _NFLVERSE_REQUIRED if name not in header_set]
+        if missing:
+            raise LinesError(
+                "lines file missing required columns: " + ", ".join(missing)
+            )
+        return
+    unknown = [name for name in headers if name not in _LINE_COLUMNS]
     if unknown:
         raise LinesError(
             "unrecognized line columns: " + ", ".join(sorted(unknown))
@@ -489,10 +543,8 @@ def _normalize_line_row(row: dict) -> dict:
         out["home"] = out["home_team"]
     if not (out.get("away") or out.get("away_team_fd")) and out.get("away_team"):
         out["away"] = out["away_team"]
-    if out.get("spread") in (None, "") and out.get("spread_line") not in (None, ""):
-        out["spread"] = out["spread_line"]
-    if out.get("total") in (None, "") and out.get("total_line") not in (None, ""):
-        out["total"] = out["total_line"]
+    # nflverse ``total`` is the final score. The closing number is ``total_line``.
+    # ``spread_line`` is flipped in ``_file_spread_total`` (positive = home favored).
     if out.get("home_implied_tt") not in (None, "") and not any(
         out.get(key) not in (None, "")
         for key in (
@@ -524,7 +576,7 @@ def _prepare_simple_rows(
 ) -> list[dict]:
     if not rows:
         raise LinesError("lines file has no line rows")
-    _reject_unknown_columns(rows)
+    _check_line_columns(rows)
     return [
         _normalize_line_row(row)
         for row in _filter_line_rows(rows, season=season, week=week)
@@ -541,26 +593,45 @@ def _fd_cell(raw: object) -> str:
         return text.upper()
 
 
-def _file_spread_total(row: dict) -> tuple[float | None, float | None]:
-    spread = _num(row.get("spread"))
-    total = _num(row.get("total") if "total" in row else row.get("overUnder"))
-    if spread is not None and total is not None:
-        return spread, total
+def _implied_pair(row: dict) -> tuple[float | None, float | None]:
     home_impl = _num(
         row.get("home_implied")
         or row.get("home_implied_total")
+        or row.get("home_implied_tt")
         or row.get("implied_home")
         or row.get("home_team_total")
     )
     away_impl = _num(
         row.get("away_implied")
         or row.get("away_implied_total")
+        or row.get("away_implied_tt")
         or row.get("implied_away")
         or row.get("away_team_total")
     )
-    if home_impl is None or away_impl is None:
+    return home_impl, away_impl
+
+
+def _file_spread_total(row: dict) -> tuple[float | None, float | None]:
+    """Home spread is negative when home is favored.
+
+    Implied team totals win when both are present. nflverse ``spread_line``
+    is the opposite sign (positive means the home team is favored), so the
+    home spread is ``-spread_line`` and the total is ``total_line`` (not the
+    final-score ``total`` column). A simple ``spread`` column is already the
+    home spread.
+    """
+    home_impl, away_impl = _implied_pair(row)
+    if home_impl is not None and away_impl is not None:
+        return away_impl - home_impl, home_impl + away_impl
+    spread_line = _num(row.get("spread_line"))
+    total_line = _num(row.get("total_line"))
+    if spread_line is not None and total_line is not None:
+        return -spread_line, total_line
+    spread = _num(row.get("spread"))
+    total = _num(row.get("total") if "total" in row else row.get("overUnder"))
+    if spread is not None and total is not None:
         return spread, total
-    return away_impl - home_impl, home_impl + away_impl
+    return spread, total
 
 
 def parse_simple_games(
@@ -641,7 +712,12 @@ def load_lines_csv(
     season: int | None = None,
     week: int | None = None,
 ) -> dict[str, TeamLine]:
-    """CSV with FanDuel or nflverse line columns. Extra columns are an error."""
+    """CSV with FanDuel or nflverse line columns.
+
+    An nflverse schedule (``home_team``, ``spread_line``, ``total_line``, …)
+    may carry the rest of the schedule file. A simple file errors on a
+    column this reader does not know.
+    """
     with Path(path).open(newline="", encoding="utf-8") as fh:
         rows = [dict(row) for row in csv.DictReader(fh)]
     if not rows:

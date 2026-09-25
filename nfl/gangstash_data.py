@@ -491,36 +491,68 @@ class GangstashGameLine:
 
 
 def parse_game_line(row: dict) -> GangstashGameLine | None:
-    """Live fields: game_id, season, week, commence_time, home_team_fd,
-    away_team_fd, spread (home line, negative = home favored), total,
-    home_moneyline, away_moneyline, updated_at.
+    """Live ``game_lines`` or nflverse-shaped ``closing_lines``.
+
+    ``spread`` is the home line (negative = home favored), the same sign as
+    the Odds API. ``closing_lines`` is nflverse-sourced: ``spread_line`` is
+    positive when the home team is favored, so the stored home spread is
+    ``-spread_line``. Home and away implied totals, including
+    ``home_implied_tt`` / ``away_implied_tt``, win when both are present.
+    Teams may be ``home_team_fd`` or nflverse ``home_team``.
     """
     if not isinstance(row, dict):
         return None
-    home_raw = _str(row.get("home_team_fd"))
-    away_raw = _str(row.get("away_team_fd"))
+    home_raw = _str(row.get("home_team_fd") or row.get("home_team") or row.get("home"))
+    away_raw = _str(row.get("away_team_fd") or row.get("away_team") or row.get("away"))
     spread = _float(row.get("spread"))
     total = _float(row.get("total"))
+    spread_line = _float(row.get("spread_line"))
+    total_line = _float(row.get("total_line"))
     home_impl = _first_float(
         row,
-        ("home_implied_total", "home_implied", "implied_home", "home_team_total"),
+        (
+            "home_implied_total",
+            "home_implied",
+            "home_implied_tt",
+            "implied_home",
+            "home_team_total",
+        ),
     )
     away_impl = _first_float(
         row,
-        ("away_implied_total", "away_implied", "implied_away", "away_team_total"),
+        (
+            "away_implied_total",
+            "away_implied",
+            "away_implied_tt",
+            "implied_away",
+            "away_team_total",
+        ),
     )
-    if not home_raw and not away_raw and spread is None and total is None:
-        if home_impl is None and away_impl is None:
-            return None
+    if (
+        not home_raw
+        and not away_raw
+        and spread is None
+        and total is None
+        and spread_line is None
+        and total_line is None
+        and home_impl is None
+        and away_impl is None
+    ):
+        return None
     if not home_raw or not away_raw:
         raise GangstashDataError(
             "gangstash game_lines row missing home_team_fd/away_team_fd "
             f"(keys {sorted(row)})"
         )
-    if (spread is None or total is None) and home_impl is not None and away_impl is not None:
+    if home_impl is not None and away_impl is not None:
         total = home_impl + away_impl
         # Home spread is negative when home is favored.
         spread = away_impl - home_impl
+    elif spread_line is not None and (total_line is not None or total is not None):
+        # nflverse spread_line is positive when the home team is favored.
+        spread = -spread_line
+        if total_line is not None:
+            total = total_line
     if spread is None or total is None:
         raise GangstashDataError(
             f"gangstash game_lines row {away_raw}@{home_raw} missing spread/total "
@@ -557,9 +589,10 @@ def fetch_closing_lines(
 ) -> tuple[list[dict], dict]:
     """`dataset=closing_lines`. Past weeks prefer this over ``game_lines``.
 
-    Rows may carry ``spread`` and ``total``, or home and away implied team
-    totals. ``parse_game_line`` derives the home spread and total from the
-    implied pair when the spread and total are absent.
+    Rows may carry ``spread`` and ``total``, nflverse ``spread_line`` (positive
+    when home is favored) and ``total_line``, or home and away implied team
+    totals. Implied totals win. ``parse_game_line`` stores the home spread
+    with the Odds sign (negative when home is favored).
     """
     if int(season) < 1 or int(week) < 1:
         raise GangstashDataError("gangstash closing_lines needs season and week")

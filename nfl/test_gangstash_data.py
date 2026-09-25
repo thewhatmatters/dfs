@@ -746,6 +746,44 @@ class GameLinesTest(unittest.TestCase):
         self.assertAlmostEqual(row.total, 41.5, places=4)
         self.assertAlmostEqual(row.spread, 6.5, places=4)
 
+    def test_nflverse_spread_line_favorite_gets_the_higher_total(self) -> None:
+        row = parse_game_line(
+            {
+                "home_team": "SF",
+                "away_team": "MIA",
+                "spread_line": 12.5,
+                "total_line": 44.5,
+                "total": 41,
+                "home_moneyline": -900,
+                "away_moneyline": 650,
+            }
+        )
+        self.assertIsNotNone(row)
+        assert row is not None
+        self.assertEqual(row.home_fd, "SF")
+        self.assertEqual(row.away_fd, "MIA")
+        self.assertAlmostEqual(row.spread, -12.5, places=4)
+        self.assertAlmostEqual(row.total, 44.5, places=4)
+        implied_home = (row.total - row.spread) / 2
+        implied_away = (row.total + row.spread) / 2
+        self.assertAlmostEqual(implied_home, 28.5, places=4)
+        self.assertAlmostEqual(implied_away, 16.0, places=4)
+        self.assertGreater(implied_home, implied_away)
+
+        implied = parse_game_line(
+            {
+                "home_team": "SF",
+                "away_team": "MIA",
+                "spread_line": 12.5,
+                "total_line": 44.5,
+                "home_implied_tt": 20.0,
+                "away_implied_tt": 24.5,
+            }
+        )
+        assert implied is not None
+        self.assertAlmostEqual(implied.total, 44.5, places=4)
+        self.assertAlmostEqual(implied.spread, 4.5, places=4)
+
     def test_gangstash_source_builds_implied_totals_and_skips_odds(self) -> None:
         raw = [
             {

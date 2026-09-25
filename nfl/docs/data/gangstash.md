@@ -127,18 +127,27 @@ dropped when `commence_time` is present. A missing slate game is
 (stop — no silent FPPG).
 
 **`closing_lines`:** same join as `game_lines`. A past week
-(`nfl.optimize --week`, `nfl.backtest`) tries this dataset first. Rows may
-send `home_implied_total` and `away_implied_total` instead of `spread` and
-`total`. Total is the sum. Home spread is away implied minus home implied
-(negative when home is favored). An empty close falls through to
-`game_lines`. The live API currently returns Unknown dataset. The backtest
-prints `closing_lines: not available (Unknown dataset)` and does not treat
-that as a quiet skip. If `game_lines` also fails and no `--lines-file` was
-given, the backtest stops unless `--allow-missing-lines`. `--lines-file`
-(CSV or JSON) still wins over both. It accepts FanDuel columns and nflverse
-`home_team`, `away_team`, `spread_line`, `total_line`, `home_implied_tt`,
-`away_implied_tt`, `season`, `week` (`JAX`→`JAC`, `LA`→`LAR`). An
-unrecognized column, or zero games after the season/week filter, is an error.
+(`nfl.optimize --week`, `nfl.backtest`) tries this dataset first. The
+dataset is nflverse-sourced. Rows may send `home_implied_total` /
+`home_implied_tt` and `away_implied_total` / `away_implied_tt` instead of
+`spread` and `total`. When both implied totals are present they win: total
+is the sum, and home spread is away implied minus home implied (negative
+when home is favored). Otherwise nflverse `spread_line` is positive when
+the home team is favored, so the stored home spread is `-spread_line` and
+the total is `total_line` (not the final-score `total` column). A plain
+`spread` column is already the Odds sign and is not flipped. An empty close
+falls through to `game_lines`. The live API currently returns Unknown
+dataset. The backtest prints `closing_lines: not available (Unknown dataset)`
+and does not treat that as a quiet skip. If `game_lines` also fails and no
+`--lines-file` was given, the backtest stops unless `--allow-missing-lines`.
+`--lines-file` (CSV or JSON) still wins over both. A file with `season`,
+`week`, `home_team`, `away_team`, `spread_line`, and `total_line` is an
+nflverse schedule: `game_id`, `gameday`, `gametime`, `home_line`,
+`away_line`, moneylines, `*_spread_odds`, `under_odds`, `over_odds`, and
+`home_implied_tt` / `away_implied_tt` are ignored. `JAX`→`JAC`, `LA`→`LAR`.
+A missing required column, or zero games after the season/week filter, is
+an error. A simple file (no nflverse schedule columns) still errors on a
+column the reader does not know.
 
 **`injuries`:** not deployed (Unknown dataset). The backtest does not list
 that as missing and does not stop. It reads the FanDuel CSV Injury Indicator

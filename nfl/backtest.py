@@ -12,9 +12,14 @@ are not optional: no lines is a hard stop unless ``--allow-missing-lines``.
 Targets and snaps are prior weeks only. Props from another week are dropped.
 
 ``--lines-file`` is a CSV or JSON of historical lines (FanDuel or nflverse
-columns). ``--starters-only`` prints the effective depth chart who played:
-QB/RB/TE depth 1, WR depth 1–3, plus DEF. The default prints both the full
-pool and that starters slice.
+columns). An nflverse schedule is recognized by ``season``, ``week``,
+``home_team``, ``away_team``, ``spread_line``, and ``total_line``; the rest
+of that file is ignored. ``spread_line`` is positive when home is favored.
+``--starters-only`` prints the effective depth chart who played:
+QB/RB/TE depth 1, WR depth 1–3, plus DEF. The default prints the full pool,
+that starters slice, and a hindsight slice (the QB who actually took the
+snaps). A questionable player is not handed off. A Q with no stat row, or
+0 offensive snaps, is counted as a DNP and the projection stays.
 
 ``--projection-source`` stays ``board`` on the optimizer. This command
 only compares the two.
@@ -110,8 +115,11 @@ class BacktestReport:
     n: int
     starters: tuple[PosError, ...] = ()
     starters_n: int = 0
+    hindsight: tuple[PosError, ...] = ()
+    hindsight_n: int = 0
     pool: str = "full"
     notes: tuple[str, ...] = ()
+    show_hindsight: bool = False
 
     def to_text(self) -> str:
         lines = [
@@ -131,6 +139,9 @@ class BacktestReport:
             lines.extend(_format_rows(self.rows))
             lines.append("pool: starters")
             lines.extend(_format_rows(self.starters))
+        if self.show_hindsight:
+            lines.append("pool: hindsight (actual QB1 by snaps)")
+            lines.extend(_format_rows(self.hindsight))
         return "\n".join(lines)
 
 
@@ -275,6 +286,70 @@ _STARTER_RANKS = {
     "TE": frozenset({1}),
     "WR": frozenset({1, 2, 3}),
 }
+
+
+def _offense_snaps(row: dict) -> float | None:
+    """Offensive snaps when the column exists. None when it does not."""
+    for key in ("offense_snaps", "offensive_snaps", "snaps"):
+        if key not in row or row[key] in (None, ""):
+            continue
+        try:
+            return float(row[key])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _qb_play_volume(row: dict) -> float:
+    """Snaps when the weekly row has them, otherwise pass attempts."""
+    snaps = _offense_snaps(row)
+    if snaps is not None:
+        return snaps
+    raw = row.get("pass_attempts")
+    if raw in (None, ""):
+        return 0.0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def hindsight_qb_pids(
+    players: list[Player],
+    indexed: dict[tuple[str, str], dict],
+) -> set[str]:
+    """The QB with the most offensive snaps on each team. Ties break on pid."""
+    by_team: dict[str, list[tuple[float, str]]] = {}
+    for pl in players:
+        if (pl.position or "").upper() != "QB":
+            continue
+        info = indexed.get(((pl.team or "").upper(), match_key(pl.name)))
+        if info is None:
+            continue
+        volume = _qb_play_volume(info["row"])
+        if volume <= 0:
+            continue
+        by_team.setdefault((pl.team or "").upper(), []).append((volume, pl.pid))
+    out: set[str] = set()
+    for rows in by_team.values():
+        rows.sort(key=lambda item: (-item[0], item[1]))
+        out.add(rows[0][1])
+    return out
+
+
+def is_hindsight_starter(player: Player, row: dict, qb_pids: set[str]) -> bool:
+    """Who played, with the actual QB1 by snaps.
+
+    Pre-game depth still picks RB, TE, and the top three WRs. The QB is the
+    teammate who took the snaps, including a backup behind a questionable
+    starter who sat. Questionable players are not handed off before the fact.
+    """
+    pos = (player.position or "").upper()
+    if pos in {"D", "DEF"}:
+        return True
+    if pos == "QB":
+        return player.pid in qb_pids
+    return is_starter(player, row)
 
 
 def is_starter(player: Player, row: dict) -> bool:
@@ -591,6 +666,7 @@ def run_backtest(
     dnp = _questionable_dnps(players, indexed)
     notes = list(notes or ())
     notes.append(f"questionable DNP: {dnp} (projection kept)")
+    qb_pids = hindsight_qb_pids(players, indexed)
     if not indexed and "player_stats_weekly" not in noted:
         noted = _order_missing(noted + ["player_stats_weekly"])
     game_sim = simulate_games(
@@ -601,6 +677,7 @@ def run_backtest(
     )
     full: list[tuple[str, float, float, float]] = []
     starters: list[tuple[str, float, float, float]] = []
+    hindsight: list[tuple[str, float, float, float]] = []
     for pl in players:
         key = ((pl.team or "").upper(), match_key(pl.name))
         info = indexed.get(key)
@@ -618,8 +695,11 @@ def run_backtest(
         full.append(row)
         if is_starter(pl, info["row"]):
             starters.append(row)
+        if is_hindsight_starter(pl, info["row"], qb_pids):
+            hindsight.append(row)
     full_report = summarize_errors(full, season=season, week=week, missing=noted)
     starter_report = summarize_errors(starters, season=season, week=week, missing=noted)
+    hindsight_report = summarize_errors(hindsight, season=season, week=week, missing=noted)
     if starters_only:
         return BacktestReport(
             season=full_report.season,
@@ -629,8 +709,11 @@ def run_backtest(
             n=starter_report.n,
             starters=starter_report.rows,
             starters_n=starter_report.n,
+            hindsight=hindsight_report.rows,
+            hindsight_n=hindsight_report.n,
             pool="starters",
             notes=tuple(notes or ()),
+            show_hindsight=True,
         )
     return BacktestReport(
         season=full_report.season,
@@ -640,8 +723,11 @@ def run_backtest(
         n=full_report.n,
         starters=starter_report.rows,
         starters_n=starter_report.n,
+        hindsight=hindsight_report.rows,
+        hindsight_n=hindsight_report.n,
         pool="full",
         notes=tuple(notes or ()),
+        show_hindsight=True,
     )
 
 
@@ -649,13 +735,23 @@ def _questionable_dnps(
     players: list[Player],
     indexed: dict[tuple[str, str], dict],
 ) -> int:
-    """Q on the CSV who recorded no counting stat. The projection stays."""
+    """Q who has no stat row, or 0 offensive snaps. The projection stays.
+
+    A missing row is a DNP. When the row has no snap column, a row with no
+    positive counting stat is a DNP too.
+    """
     n = 0
     for pl in players:
         if (pl.injury or "").strip().upper() != "Q":
             continue
         info = indexed.get(((pl.team or "").upper(), match_key(pl.name)))
         if info is None:
+            n += 1
+            continue
+        snaps = _offense_snaps(info["row"])
+        if snaps is not None:
+            if snaps <= 0:
+                n += 1
             continue
         if not _played(info["row"]):
             n += 1
