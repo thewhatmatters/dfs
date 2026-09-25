@@ -646,6 +646,8 @@ class GangstashDepthSlot:
     position: str
     rank: int
     player_name: str
+    gsis_id: str | None = None
+    player_id: str | None = None
 
 
 def parse_depth_slot(row: dict) -> GangstashDepthSlot | None:
@@ -678,6 +680,8 @@ def parse_depth_slot(row: dict) -> GangstashDepthSlot | None:
         position=pos,
         rank=rank,
         player_name=name,
+        gsis_id=_str(row.get("gsis_id")) or None,
+        player_id=_str(row.get("player_id")) or None,
     )
 
 
@@ -758,6 +762,45 @@ def fetch_depth_charts(
         params["week"] = str(int(week))
     return fetch_dataset(
         dataset_id("depth_charts"),
+        params,
+        refresh=refresh,
+        cache_day=cache_day,
+    )
+
+
+def fetch_depth_charts_weekly(
+    *,
+    season: int,
+    week: int | None = None,
+    weeks: list[int] | None = None,
+    team: str | None = None,
+    position: str | None = None,
+    pos_grp: str | None = BASE_OFFENSE_POS_GRP,
+    refresh: bool = False,
+    cache_day: date | None = None,
+) -> tuple[list[dict], dict]:
+    """`dataset=depth_charts_weekly`. `season` is required.
+
+    Optional: `week` (one week or a comma list), `team`, `position`
+    (`pos_abb`), `pos_grp`. Each row is that team's last chart strictly
+    before kickoff, so a game that has not kicked off is absent. Rows
+    stay raw and match `depth_charts`, plus `season`, `week`, `game_type`,
+    `game_id`, `opponent`, `kickoff_at`, and `team_fd`.
+    """
+    if int(season) < 1:
+        raise GangstashDataError("gangstash depth_charts_weekly requires season")
+    week_list = list(weeks) if weeks else ([int(week)] if week is not None else [])
+    params: dict[str, str] = {"season": str(int(season))}
+    if week_list:
+        params["week"] = ",".join(str(int(w)) for w in week_list)
+    if team:
+        params["team"] = team.strip().upper()
+    if position:
+        params["position"] = position.strip().upper()
+    if pos_grp:
+        params["pos_grp"] = pos_grp.strip()
+    return fetch_dataset(
+        dataset_id("depth_charts_weekly"),
         params,
         refresh=refresh,
         cache_day=cache_day,

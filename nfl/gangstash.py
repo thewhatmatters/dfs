@@ -42,6 +42,7 @@ DATASET_ENV = {
     "targets": "GANGSTASH_TARGETS_DATASET",
     "game_lines": "GANGSTASH_GAME_LINES_DATASET",
     "depth_charts": "GANGSTASH_DEPTH_DATASET",
+    "depth_charts_weekly": "GANGSTASH_DEPTH_CHARTS_WEEKLY_DATASET",
     "team_stats": "GANGSTASH_TEAM_STATS_DATASET",
     "team_stats_weekly": "GANGSTASH_TEAM_STATS_WEEKLY_DATASET",
     "snaps": "GANGSTASH_SNAPS_DATASET",

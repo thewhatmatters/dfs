@@ -90,6 +90,8 @@ class DepthRow:
     name: str
     source_url: str
     fetched_at: str
+    gsis_id: str | None = None
+    player_id: str | None = None
 
 
 def contact_email() -> str:

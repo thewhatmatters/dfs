@@ -132,7 +132,8 @@ class TeamStat:
     early_down_rush_n: int | None = None
     early_down_rush_success_rate: float | None = None
     # Optional. None leaves the sim on the columns above.
-    # Seconds per play are stored and not read (the feed runs about 17% low).
+    # Seconds per play are play_seconds / timed_plays. Neutral is the
+    # no-script pair. Both move team play volume when present.
     plays_per_game: float | None = None
     seconds_per_play: float | None = None
     neutral_plays_per_game: float | None = None
@@ -147,6 +148,8 @@ class TeamStat:
     play_seconds: float | None = None
     pace_neutral_plays: float | None = None
     neutral_play_seconds: float | None = None
+    timed_plays: float | None = None
+    neutral_timed_plays: float | None = None
     rush_yards: float | None = None
     net_pass_yards: float | None = None
     air_yards: float | None = None
@@ -309,6 +312,18 @@ def _same_rate(row: dict, *keys: str) -> float | None:
     return _float(_pick(row, *keys))
 
 
+def _seconds_rate(row: dict, rate_key: str, num_key: str, den_key: str) -> float | None:
+    """Named rate, or numerator / denominator when the rate column is absent."""
+    direct = _float(_pick(row, rate_key))
+    if direct is not None:
+        return direct
+    num = _float(_pick(row, num_key))
+    den = _float(_pick(row, den_key))
+    if num is None or den is None or den <= 0:
+        return None
+    return num / den
+
+
 def _plays_per_game(row: dict) -> float | None:
     direct = _float(_pick(row, "plays_per_game"))
     if direct is not None:
@@ -371,9 +386,13 @@ def team_stat_from_row(row: dict) -> TeamStat | None:
             _float(_pick(row, "early_down_rush_success_rate"))
         ),
         plays_per_game=_plays_per_game(row),
-        seconds_per_play=_float(_pick(row, "seconds_per_play")),
+        seconds_per_play=_seconds_rate(
+            row, "seconds_per_play", "play_seconds", "timed_plays"
+        ),
         neutral_plays_per_game=_float(_pick(row, "neutral_plays_per_game")),
-        neutral_seconds_per_play=_float(_pick(row, "neutral_seconds_per_play")),
+        neutral_seconds_per_play=_seconds_rate(
+            row, "neutral_seconds_per_play", "neutral_play_seconds", "neutral_timed_plays"
+        ),
         yards_per_carry_allowed=_same_rate(row, "yards_per_carry", "yards_per_carry_allowed"),
         yards_per_dropback_allowed=_same_rate(
             row, "yards_per_dropback", "yards_per_dropback_allowed"
@@ -393,6 +412,8 @@ def team_stat_from_row(row: dict) -> TeamStat | None:
         play_seconds=_float(_pick(row, "play_seconds")),
         pace_neutral_plays=_float(_pick(row, "pace_neutral_plays")),
         neutral_play_seconds=_float(_pick(row, "neutral_play_seconds")),
+        timed_plays=_float(_pick(row, "timed_plays")),
+        neutral_timed_plays=_float(_pick(row, "neutral_timed_plays")),
         rush_yards=_float(_pick(row, "rush_yards")),
         net_pass_yards=_float(_pick(row, "net_pass_yards")),
         air_yards=_float(_pick(row, "air_yards")),

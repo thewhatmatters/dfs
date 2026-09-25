@@ -7,7 +7,14 @@ import unittest
 
 from nfl.players import Player
 from nfl.projections import week1_score
-from nfl.sim import LEAGUE_PLAYS, offense_plays_mu, simulate_games
+from nfl.sim import (
+    LEAGUE_PLAYS,
+    LEAGUE_NEUTRAL_SECONDS_PER_PLAY,
+    LEAGUE_SECONDS_PER_PLAY,
+    PACE_CLAMP,
+    offense_plays_mu,
+    simulate_games,
+)
 from nfl.sim_efficiency import (
     COMBINED_CLAMP,
     OPP_CLAMP,
@@ -618,35 +625,65 @@ class UsageHookTest(unittest.TestCase):
         self.assertAlmostEqual(scale, 1.0 + COMBINED_CLAMP, places=4)
         self.assertLess(scale, 1.242)
 
-    def test_plays_per_game_blends_and_seconds_do_not(self) -> None:
-        offense = TeamStat(
+    def test_plays_and_pace_blend_and_pace_is_clamped(self) -> None:
+        plays_only = TeamStat(
+            team_fd="DET",
+            side="offense",
+            plays_per_game=70,
+            pace_games=1,
+        )
+        defense_plays = TeamStat(
+            team_fd="NO",
+            side="defense",
+            plays_per_game=56,
+            pace_games=1,
+        )
+        off_plays = (70 + 63 * 4) / 5
+        def_plays = (56 + 63 * 4) / 5
+        self.assertAlmostEqual(offense_plays_mu(plays_only), off_plays)
+        self.assertAlmostEqual(
+            offense_plays_mu(plays_only, defense_plays),
+            (off_plays + def_plays) / 2,
+        )
+        league = TeamStat(
+            team_fd="DET",
+            side="offense",
+            pass_n=35,
+            rush_n=25,
+            seconds_per_play=LEAGUE_SECONDS_PER_PLAY,
+            neutral_seconds_per_play=LEAGUE_NEUTRAL_SECONDS_PER_PLAY,
+        )
+        self.assertAlmostEqual(offense_plays_mu(league), LEAGUE_PLAYS)
+        fast = TeamStat(
             team_fd="DET",
             side="offense",
             plays_per_game=70,
             pace_games=1,
             seconds_per_play=10,
         )
-        defense = TeamStat(
-            team_fd="NO",
-            side="defense",
-            plays_per_game=56,
-            pace_games=1,
-            seconds_per_play=40,
-        )
-        self.assertAlmostEqual(offense_plays_mu(offense), (70 + 63 * 4) / 5)
-        self.assertAlmostEqual(
-            offense_plays_mu(offense, defense),
-            (((70 + 63 * 4) / 5) + ((56 + 63 * 4) / 5)) / 2,
-        )
-        counted = TeamStat(
-            team_fd="DET",
-            side="offense",
-            pass_n=35,
-            rush_n=25,
-            seconds_per_play=12,
-        )
+        pace_cap = LEAGUE_PLAYS * (1.0 + PACE_CLAMP)
+        self.assertAlmostEqual(offense_plays_mu(fast), (off_plays + pace_cap) / 2)
+        slow = TeamStat(team_fd="DET", side="offense", seconds_per_play=100, pace_games=1)
+        self.assertAlmostEqual(offense_plays_mu(slow), LEAGUE_PLAYS * (1.0 - PACE_CLAMP))
+        counted = TeamStat(team_fd="DET", side="offense", pass_n=35, rush_n=25)
         self.assertAlmostEqual(offense_plays_mu(counted), 60)
-        self.assertAlmostEqual(
-            offense_plays_mu(TeamStat(team_fd="DET", seconds_per_play=100)),
-            LEAGUE_PLAYS,
+        named = team_stat_from_row(
+            {
+                "timed_plays": 50,
+                "team_fd": "DET",
+                "side": "offense",
+                "play_seconds": 1490,
+            }
         )
+        assert named is not None
+        self.assertAlmostEqual(named.seconds_per_play or 0, 1490 / 50)
+        explicit = team_stat_from_row(
+            {
+                "team_fd": "DET",
+                "seconds_per_play": 29.8,
+                "play_seconds": 1,
+                "timed_plays": 1,
+            }
+        )
+        assert explicit is not None
+        self.assertAlmostEqual(explicit.seconds_per_play or 0, 29.8)

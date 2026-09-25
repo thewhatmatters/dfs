@@ -6,7 +6,8 @@ python3 -m nfl.backtest --season 2026 --week 1
 ```
 
 Builds the board and the sim the way ``nfl.optimize`` does for that week:
-closing lines (then game lines), the FanDuel injury column, depth, prior-week
+closing lines (then game lines), the FanDuel injury column, ``depth_charts_weekly``
+for that week (today's ``depth_charts`` only if the weekly chart is missing), prior-week
 targets and snaps, and the latest pre-kickoff prop snapshot. An empty
 optional source is named on ``missing:`` and the week still scores. Lines
 are not optional: no lines is a hard stop unless ``--allow-missing-lines``.
@@ -57,6 +58,7 @@ from nfl.gangstash import (
 from nfl.gangstash_data import (
     fetch_closing_lines,
     fetch_depth_charts,
+    fetch_depth_charts_weekly,
     fetch_dst_weekly,
     fetch_game_lines,
     fetch_player_stats_weekly,
@@ -99,6 +101,7 @@ _MISSING_ORDER = (
     "closing_lines",
     "game_lines",
     "depth",
+    "depth_charts_weekly",
     "injuries",
     "targets",
     "snaps",
@@ -650,6 +653,8 @@ def _depth_table(rows: list[dict], *, season: int, week: int) -> tuple[list[Dept
                 name=slot.player_name,
                 source_url="gangstash",
                 fetched_at="",
+                gsis_id=slot.gsis_id,
+                player_id=slot.player_id,
             )
         )
     return out, note
@@ -962,6 +967,39 @@ def players_from_depth_chart(depth_rows: list[dict], by_team: dict) -> list[Play
     return skill + defense
 
 
+def select_backtest_depth(
+    *,
+    season: int,
+    week: int,
+    kickoff: datetime | None,
+    missing: list[str],
+) -> tuple[list[dict], str]:
+    """Pre-kickoff weekly chart, else today's ``depth_charts``.
+
+    ``depth_charts_weekly`` is the last chart before kickoff for games that
+    have already started. A missing payload is named on ``missing`` and the
+    current chart (or a cached snapshot) is used instead. The listed QB1 is
+    kept; the hindsight pool still picks the QB who actually played.
+    """
+    weekly, err = _fetch_rows(
+        lambda: fetch_depth_charts_weekly(season=season, week=week)
+    )
+    scoped, _note = scope_depth_rows(weekly, season=season, week=week)
+    if scoped and not err:
+        return scoped, f"depth: depth_charts_weekly week {int(week)}"
+    if "depth_charts_weekly" not in missing:
+        missing.append("depth_charts_weekly")
+    fetched, _chart_err = _fetch_rows(
+        lambda: fetch_depth_charts(season=season, week=week)
+    )
+    return depth_rows_for_backtest(
+        fetched,
+        season=season,
+        week=week,
+        kickoff=kickoff,
+    )
+
+
 def _fetch_rows(fn) -> tuple[list[dict], str]:
     """``(rows, error)``. An empty payload is rows ``[]`` and error ``""``."""
     try:
@@ -1121,14 +1159,11 @@ def _load_live(
         # nowhere else to read O/D/IR/NA, so a failed fetch is visible.
         if players is None:
             missing.append("injuries")
-    depth_fetched, _depth_err = _fetch_rows(
-        lambda: fetch_depth_charts(season=season, week=week)
-    )
-    depth_raw, depth_note = depth_rows_for_backtest(
-        depth_fetched,
+    depth_raw, depth_note = select_backtest_depth(
         season=season,
         week=week,
         kickoff=kickoff,
+        missing=missing,
     )
     if players is None:
         if not pool_lines:

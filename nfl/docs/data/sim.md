@@ -161,9 +161,9 @@ Every new column is optional. `None` leaves that piece on the path above, so an 
 | `gl_carries / carries` versus 0.08, else `rz_carries / carries` versus 0.15 | Rush TD rate, same shrink and clamp. Goal line wins when both columns are present. The team rush TD total stays on the prior budget |
 | Defense `yards_per_dropback` (allowed) versus 6.0, else yards per attempt versus 7.1, then `sack_rate` versus 6.5% | Pass multiplier, after EPA, inside ±15% |
 | Defense `yards_per_carry` (allowed) versus 4.3 | Rush multiplier, after EPA, inside ±15%. The rush-yard budget scale clamps the product with the pass tilt again |
-| Offense `plays_per_game`, blended with opponent defense plays faced | Team play volume. Each side shrinks toward 63 with a 4-game prior |
+| Offense `plays_per_game`, opponent defense plays faced, and seconds per play | Team play volume. Plays shrink toward 63 with a 4-game prior. Pace uses `seconds_per_play` versus 29.80 and `neutral_seconds_per_play` versus 32.34, clamped to ±15% of 63, then averaged with the plays legs |
 
-`seconds_per_play` and `neutral_seconds_per_play` are stored and off. Data Aggregator reads them about 17% low while a denominator bug is fixed. `rz_receiving_tds` and `rz_rushing_tds` are stored and do not set the TD rate. A backtest uses weeks before the target only. Week 1 fetches none of these.
+`rz_receiving_tds` and `rz_rushing_tds` are stored and do not set the TD rate. A backtest uses weeks before the target only. Week 1 fetches none of these.
 
 ## Gangstash feed
 
@@ -179,7 +179,7 @@ When `--sim` runs and `--sim-inputs` is omitted, `nfl/sim_feed.py` builds `SimIn
 | RB rush shares | `snaps`, same window, `position=RB` | `offense_pct` |
 | RB carry shares | `player_stats_weekly`, same window | `carries` or `rushing_attempts` (skipped when the dataset is missing) |
 | Target-share and red-zone usage | `player_usage`, same window | `target_share`, `air_yards_share`, `wopr`, `rz_targets`, `rz_carries`, `gl_carries`, `receiving_air_yards`. One row per player-week. Week 1 does not fetch it |
-| Layer 4 rates | `player_stats_weekly`, `player_usage`, and `team_stats_weekly`, same window | counting stats, EPA, success, red-zone TD rate, yards allowed, sack rate, plays per game. Seconds per play are stored and unused |
+| Layer 4 rates | `player_stats_weekly`, `player_usage`, and `team_stats_weekly`, same window | counting stats, EPA, success, red-zone TD rate, yards allowed, sack rate, plays per game, seconds per play |
 
 No key and no cache for every dataset prints one line and keeps role shares:
 

@@ -72,6 +72,7 @@ python3 -m nfl.gangstash_data team-stats-weekly --season 2026 --week 1,2
 | `GANGSTASH_TARGETS_DATASET` | `targets` | `dataset=` value |
 | `GANGSTASH_GAME_LINES_DATASET` | `game_lines` | `dataset=` value |
 | `GANGSTASH_DEPTH_DATASET` | `depth_charts` | `dataset=` value |
+| `GANGSTASH_DEPTH_CHARTS_WEEKLY_DATASET` | `depth_charts_weekly` | `dataset=` value |
 | `GANGSTASH_TEAM_STATS_DATASET` | `team_stats` | `dataset=` value |
 | `GANGSTASH_TEAM_STATS_WEEKLY_DATASET` | `team_stats_weekly` | `dataset=` value |
 | `GANGSTASH_SNAPS_DATASET` | `snaps` | `dataset=` value |
@@ -88,7 +89,8 @@ python3 -m nfl.gangstash_data team-stats-weekly --season 2026 --week 1,2
 | `targets` | `season` (required), `week` (single or `1,2`), optional `position` (`WR`/`TE`/`RB`), `team` | season is the FanDuel CSV year. 2026 weeks 1–2 are loaded (640 rows) |
 | `game_lines` | `date=YYYY-MM-DD` (ET kickoff) **or** `season` + one `week` | optimizer sends the slate **date** only, unless `--week` is set |
 | `closing_lines` | `season` + one `week` | preferred for a past `--week` and for `nfl.backtest`. Live rows use `home_line` (negative = home favored), `total`, `implied_home_total`, `implied_away_total`. `kickoff` may be null. A row that still will not parse is skipped and the week falls through to `game_lines` |
-| `depth_charts` | optional `team`, `position` (that is `pos_abb`), `pos_grp`, `season`, `week` | optimizer requests `pos_grp=3WR 1TE`. A chart with no `week` column is the current chart |
+| `depth_charts` | optional `team`, `position` (that is `pos_abb`), `pos_grp`, `season`, `week` | optimizer requests `pos_grp=3WR 1TE`. A chart with no `week` column is the current chart. Live and nightly projections use this dataset |
+| `depth_charts_weekly` | `season` required; `week` (one week or a comma list), `team`, `position`, `pos_grp` optional | last chart strictly before kickoff. Only games that have already kicked off. The backtest uses this for the target week and falls back to `depth_charts` when it is missing |
 | `injuries` | `season` required; `week`, `team`, `gsis_id`, and `status` optional. Rows carry `player_id` | live. Backtest stamps the week. No-CSV mode uses this feed. A CSV pool still prefers to stay quiet when the fetch fails |
 | `team_stats` | `season` (required), `season_type` (default `REG`), optional `side` (`offense`/`defense`), `team` | not scored |
 | `team_stats_weekly` | `season` + `week` (single or comma list), optional `team` | backtest pools weeks before the target into team EPA variance. The optimizer still overlays rates on the season board |
@@ -185,6 +187,17 @@ a payload missing those columns, is `DEPTH_GANGSTASH` (stop). A slate team
 with no skill rows is the same choke. `--skip-depth` still leaves the
 unlisted prior.
 
+**`depth_charts_weekly`** is the same chart plus `season`, `week`,
+`game_type`, `game_id`, `opponent`, `kickoff_at`, and `team_fd`. Each row
+is the last chart strictly before that game's kickoff, so it exists only
+after kickoff. `nfl.backtest` uses it for the target week. A missing
+weekly payload is `missing: depth_charts_weekly` and the backtest falls
+back to `depth_charts`. Live and nightly projections stay on
+`depth_charts`. The chart is ESPN via nflverse from game-day morning and
+does not list inactives. A few rows have no `player_id`; those match on
+name and team. The listed QB1 is the main-pool starter. The hindsight
+pool still uses the QB who actually took the snaps.
+
 **`snaps`** (one player-week). `offense_pct` is a 0–1 fraction. The client
 does not divide it by 100. Window `snap_share` is
 `sum(offense_snaps) / sum(offense_snaps / offense_pct)`, which equals
@@ -211,9 +224,11 @@ read by `week1_score`. Season rows include `team`, `team_fd`, `side`,
 `plays_per_game`, `seconds_per_play`, `neutral_seconds_per_play`,
 `yards_per_carry`, `yards_per_dropback`, `yards_per_pass_attempt`,
 `sack_rate`, `air_yards_per_attempt`. A defense row is what that defense
-allowed, and its `sack_rate` is sacks generated. `seconds_per_play` and
-`neutral_seconds_per_play` are about 17% low until a denominator fix;
-the sim stores them and does not use them.
+allowed, and its `sack_rate` is sacks generated. `seconds_per_play` is
+`play_seconds / timed_plays` and `neutral_seconds_per_play` is
+`neutral_play_seconds / neutral_timed_plays`. League offense averages are
+29.80 overall and 32.34 neutral. The sim blends those with plays per game
+for team play volume and clamps the pace leg to ±15%.
 
 **`player_usage`** (one player-week): `season`, `week`, `season_type`,
 `gsis_id`, `player_id`, `team`, `team_fd`, `position`, `targets`,

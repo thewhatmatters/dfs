@@ -352,6 +352,8 @@ def _as_row(stat: TeamStat) -> dict:
         "play_seconds": stat.play_seconds,
         "pace_neutral_plays": stat.pace_neutral_plays,
         "neutral_play_seconds": stat.neutral_play_seconds,
+        "timed_plays": stat.timed_plays,
+        "neutral_timed_plays": stat.neutral_timed_plays,
         "rush_yards": stat.rush_yards,
         "net_pass_yards": stat.net_pass_yards,
         "air_yards": stat.air_yards,
@@ -440,9 +442,17 @@ def _pool_team_side(team: str, side: str, rows: list[TeamStat]) -> TeamStat:
             rows, "early_down_rush_success_rate", "early_down_rush_n"
         ),
         plays_per_game=_plays_per_game_pool(rows),
-        seconds_per_play=_weighted_mean(rows, "seconds_per_play", "n"),
+        seconds_per_play=_ratio_pool(
+            rows, "seconds_per_play", "play_seconds", "timed_plays", "n"
+        ),
         neutral_plays_per_game=_weighted_mean(rows, "neutral_plays_per_game", "n"),
-        neutral_seconds_per_play=_weighted_mean(rows, "neutral_seconds_per_play", "n"),
+        neutral_seconds_per_play=_ratio_pool(
+            rows,
+            "neutral_seconds_per_play",
+            "neutral_play_seconds",
+            "neutral_timed_plays",
+            "n",
+        ),
         yards_per_carry_allowed=_paired_rate(
             rows, "yards_per_carry_allowed", "yards_per_carry", "rush_n"
         ),
@@ -461,6 +471,8 @@ def _pool_team_side(team: str, side: str, rows: list[TeamStat]) -> TeamStat:
         play_seconds=_sum_optional(rows, "play_seconds"),
         pace_neutral_plays=_sum_optional(rows, "pace_neutral_plays"),
         neutral_play_seconds=_sum_optional(rows, "neutral_play_seconds"),
+        timed_plays=_sum_optional(rows, "timed_plays"),
+        neutral_timed_plays=_sum_optional(rows, "neutral_timed_plays"),
         rush_yards=_sum_optional(rows, "rush_yards"),
         net_pass_yards=_sum_optional(rows, "net_pass_yards"),
         air_yards=_sum_optional(rows, "air_yards"),
@@ -839,6 +851,24 @@ def _plays_per_game_pool(rows: list[TeamStat]) -> float | None:
     if den <= 0:
         return None
     return num / den
+
+
+def _ratio_pool(
+    rows: list[TeamStat],
+    rate_attr: str,
+    num_attr: str,
+    den_attr: str,
+    fallback_n: str,
+) -> float | None:
+    """Sum(numerator) / sum(denominator), else a weighted mean of the rate."""
+    num = _sum_optional(rows, num_attr)
+    den = _sum_optional(rows, den_attr)
+    if num is not None and den is not None and den > 0:
+        return num / den
+    weighted = _weighted_mean(rows, rate_attr, den_attr)
+    if weighted is not None:
+        return weighted
+    return _weighted_mean(rows, rate_attr, fallback_n)
 
 
 def _paired_rate(

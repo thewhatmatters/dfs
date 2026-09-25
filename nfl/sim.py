@@ -7,8 +7,9 @@ share that world:
    when team stats are present; otherwise the fixed constants below.
 2. Volume + script — team plays and a pass/rush split. Plays per game,
    when that column is present, is shrunk toward 63 and blended with the
-   opponent's defensive plays faced. Seconds per play are stored and not
-   read. Neutral pass rate (or pass rate minus PROE) shifts with the drawn
+   opponent's defensive plays faced and with seconds per play (league
+   29.80, neutral 32.34). The pace leg is clamped to ±15%. Neutral pass
+   rate (or pass rate minus PROE) shifts with the drawn
    margin: trailing teams pass more, leading teams run more. Passing yards and TDs are anchored
    to the Vegas implied total times that pass rate (a passing prop replaces
    the matching anchor). Team rush attempts come from team_stats plus the
@@ -89,6 +90,7 @@ from nfl.sim_efficiency import (
     PlaceholderEfficiency,
     ReceivingLine,
     expected_receiving_line,
+    clamp,
     sample_yards,
     shrink,
 )
@@ -125,6 +127,10 @@ PLAYS_SIGMA = 4.0
 PLAYS_FLOOR = 40.0
 # Plays per game shrink toward 63. One game of 70 becomes (70 + 252) / 5.
 PLAYS_PRIOR_GAMES = 4.0
+# League offense pace. Seconds per play are play_seconds / timed_plays.
+LEAGUE_SECONDS_PER_PLAY = 29.80
+LEAGUE_NEUTRAL_SECONDS_PER_PLAY = 32.34
+PACE_CLAMP = 0.15
 LEAGUE_NEUTRAL_PASS_RATE = 0.57
 # +1.2 percentage points of pass rate per point of deficit.
 SCRIPT_PASS_PER_POINT = 0.012
@@ -838,15 +844,56 @@ def _shrunk_plays(stat: TeamStat | None) -> float | None:
     return shrink(float(stat.plays_per_game), games, LEAGUE_PLAYS, PLAYS_PRIOR_GAMES)
 
 
+def _pace_plays(seconds: float | None, games: float, league_seconds: float) -> float | None:
+    """Plays implied by pace. Faster than the league means more plays.
+
+    The seconds rate is shrunk toward the league, then the play ratio is
+    clamped to ±``PACE_CLAMP``.
+    """
+    if seconds is None or float(seconds) <= 0 or league_seconds <= 0:
+        return None
+    shrunk = shrink(float(seconds), games, league_seconds, PLAYS_PRIOR_GAMES)
+    if shrunk <= 0:
+        return None
+    ratio = clamp(league_seconds / shrunk, 1.0 - PACE_CLAMP, 1.0 + PACE_CLAMP)
+    if ratio == 1.0:
+        return LEAGUE_PLAYS
+    return LEAGUE_PLAYS * ratio
+
+
+def _side_volume(stat: TeamStat | None) -> list[float]:
+    """Shrunk plays per game, plus one pace leg from the seconds columns."""
+    if stat is None:
+        return []
+    games = float(stat.pace_games) if stat.pace_games else 1.0
+    parts: list[float] = []
+    plays = _shrunk_plays(stat)
+    if plays is not None:
+        parts.append(plays)
+    pace: list[float] = []
+    neutral = _pace_plays(
+        stat.neutral_seconds_per_play, games, LEAGUE_NEUTRAL_SECONDS_PER_PLAY
+    )
+    overall = _pace_plays(stat.seconds_per_play, games, LEAGUE_SECONDS_PER_PLAY)
+    if neutral is not None:
+        pace.append(neutral)
+    if overall is not None:
+        pace.append(overall)
+    if pace:
+        parts.append(sum(pace) / len(pace))
+    return parts
+
+
 def offense_plays_mu(stat: TeamStat | None, defense: TeamStat | None = None) -> float:
     """Plays per game.
 
     ``plays_per_game`` on the offense, blended with the opponent's defensive
-    plays faced, each shrunk toward 63 with a 4-game prior. Seconds per play
-    are not read. With no plays-per-game column, a pass+rush count in the
-    one-game range wins; otherwise 63.
+    plays faced and with seconds per play on both sides. Each plays figure
+    shrinks toward 63 with a 4-game prior. Pace is clamped to ±15% of 63.
+    With none of those columns, a pass+rush count in the one-game range
+    wins; otherwise 63.
     """
-    parts = [val for val in (_shrunk_plays(stat), _shrunk_plays(defense)) if val is not None]
+    parts = _side_volume(stat) + _side_volume(defense)
     if parts:
         return sum(parts) / len(parts)
     if stat is None or not stat.pass_n or not stat.rush_n:

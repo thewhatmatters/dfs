@@ -20,13 +20,20 @@ from nfl.backtest import (
     main,
     prior_weeks,
     run_backtest,
+    select_backtest_depth,
     summarize_errors,
+    _depth_table,
 )
 from nfl.injuries import injury_rows_from_records
 from nfl.props import props_for_week
 from nfl.sim import simulate_games
 from nfl.gangstash import GangstashDataError, GangstashDataKeyMissing, dataset_cache_file
-from nfl.gangstash_data import fetch_player_stats_weekly, fetch_player_usage
+from nfl.depth import attach_depth_ranks
+from nfl.gangstash_data import (
+    fetch_depth_charts_weekly,
+    fetch_player_stats_weekly,
+    fetch_player_usage,
+)
 from nfl.players import Player
 from nfl.projections import week1_score
 from nfl.sim_inputs import sim_inputs_from_records
@@ -91,6 +98,19 @@ class PlayerStatsReaderTest(unittest.TestCase):
         self.assertEqual(params["team"], "DET")
         self.assertEqual(params["gsis_id"], "00-ARSB")
         self.assertEqual(params["position"], "WR")
+
+    def test_depth_charts_weekly_query(self) -> None:
+        with patch(
+            "nfl.gangstash_data.fetch_dataset",
+            return_value=([], {"cache": "x"}),
+        ) as fetch:
+            fetch_depth_charts_weekly(season=2026, weeks=[1, 2], team="ATL")
+        self.assertEqual(fetch.call_args.args[0], "depth_charts_weekly")
+        params = fetch.call_args.args[1]
+        self.assertEqual(params["season"], "2026")
+        self.assertEqual(params["week"], "1,2")
+        self.assertEqual(params["team"], "ATL")
+        self.assertEqual(params["pos_grp"], "3WR 1TE")
 
     def test_same_day_cache_skips_the_network(self) -> None:
         day = date(2026, 9, 20)
@@ -201,6 +221,9 @@ class BacktestReportTest(unittest.TestCase):
                 return_value=([], {"live": False}),
             ), patch(
                 "nfl.backtest.fetch_week_injuries",
+                return_value=([], {"live": False}),
+            ), patch(
+                "nfl.backtest.fetch_depth_charts_weekly",
                 return_value=([], {"live": False}),
             ), patch(
                 "nfl.backtest.fetch_depth_charts",
@@ -404,6 +427,9 @@ class WeekScopeTest(unittest.TestCase):
                 "nfl.backtest.fetch_week_injuries",
                 return_value=([], {"live": False}),
             ), patch(
+                "nfl.backtest.fetch_depth_charts_weekly",
+                return_value=([], {"live": False}),
+            ), patch(
                 "nfl.backtest.fetch_depth_charts",
                 return_value=([], {"live": False}),
             ), patch(
@@ -466,6 +492,9 @@ class WeekScopeTest(unittest.TestCase):
                 side_effect=AssertionError("network"),
             ), patch(
                 "nfl.backtest.fetch_week_injuries",
+                return_value=([], {"live": False}),
+            ), patch(
+                "nfl.backtest.fetch_depth_charts_weekly",
                 return_value=([], {"live": False}),
             ), patch(
                 "nfl.backtest.fetch_depth_charts",
@@ -1117,6 +1146,9 @@ class WeekScopeTest(unittest.TestCase):
                 "nfl.backtest.fetch_week_injuries",
                 side_effect=GangstashDataError("gangstash injuries Unknown dataset"),
             ), patch(
+                "nfl.backtest.fetch_depth_charts_weekly",
+                return_value=([], {}),
+            ), patch(
                 "nfl.backtest.fetch_depth_charts",
                 return_value=([], {}),
             ), patch(
@@ -1205,6 +1237,49 @@ class WeekScopeTest(unittest.TestCase):
         self.assertEqual(empty, [])
         self.assertIn("current chart", current)
         self.assertNotIn("no week column", current)
+
+    def test_depth_source_uses_weekly_then_falls_back(self) -> None:
+        weekly = [_depth("Cooper Rush", "ATL", "QB", 1)]
+        weekly[0]["player_id"] = ""
+        current = [_depth("Michael Penix Jr.", "ATL", "QB", 1)]
+        missing: list[str] = []
+        with patch(
+            "nfl.backtest.fetch_depth_charts_weekly",
+            return_value=(weekly, {}),
+        ) as weekly_fetch, patch(
+            "nfl.backtest.fetch_depth_charts",
+            side_effect=AssertionError("current chart"),
+        ):
+            rows, note = select_backtest_depth(
+                season=2026, week=2, kickoff=None, missing=missing
+            )
+        weekly_fetch.assert_called_once()
+        self.assertEqual(weekly_fetch.call_args.kwargs["season"], 2026)
+        self.assertEqual(weekly_fetch.call_args.kwargs["week"], 2)
+        self.assertEqual(rows[0]["player_name"], "Cooper Rush")
+        self.assertIn("depth_charts_weekly", note)
+        self.assertEqual(missing, [])
+        chart, _chart_note = _depth_table(rows, season=2026, week=2)
+        attached, _stats = attach_depth_ranks(
+            [_pl(pid="fd-rush", name="Cooper Rush", team="ATL", position="QB")],
+            chart,
+        )
+        self.assertEqual(attached[0].depth_rank, 1)
+        fallback_missing: list[str] = []
+        with patch(
+            "nfl.backtest.fetch_depth_charts_weekly",
+            return_value=([], {}),
+        ), patch(
+            "nfl.backtest.fetch_depth_charts",
+            return_value=(current, {}),
+        ) as charts:
+            fallback, fallback_note = select_backtest_depth(
+                season=2026, week=2, kickoff=None, missing=fallback_missing
+            )
+        charts.assert_called_once()
+        self.assertEqual(fallback[0]["player_name"], "Michael Penix Jr.")
+        self.assertIn("depth_charts_weekly", fallback_missing)
+        self.assertIn("current chart", fallback_note)
 
 
 def week2_fixture_report() -> str:
@@ -1483,6 +1558,9 @@ class LiveBacktestFixesTest(unittest.TestCase):
                 "nfl.backtest.fetch_week_injuries",
                 return_value=([], {}),
             ), patch(
+                "nfl.backtest.fetch_depth_charts_weekly",
+                return_value=([], {}),
+            ), patch(
                 "nfl.backtest.fetch_depth_charts",
                 return_value=([_depth("Jared Goff", "DET", "QB", 1)], {}),
             ), patch(
@@ -1564,6 +1642,9 @@ class LiveBacktestFixesTest(unittest.TestCase):
             "nfl.backtest.fetch_week_injuries",
             return_value=([], {}),
         ), patch(
+            "nfl.backtest.fetch_depth_charts_weekly",
+            return_value=([], {}),
+        ), patch(
             "nfl.backtest.fetch_depth_charts",
             return_value=(depth, {}),
         ), patch(
@@ -1627,6 +1708,9 @@ class LiveBacktestFixesTest(unittest.TestCase):
         ), patch(
             "nfl.backtest.fetch_week_injuries",
             side_effect=GangstashDataError("gangstash injuries down"),
+        ), patch(
+            "nfl.backtest.fetch_depth_charts_weekly",
+            return_value=([], {}),
         ), patch(
             "nfl.backtest.fetch_depth_charts",
             return_value=(depth, {}),

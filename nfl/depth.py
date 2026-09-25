@@ -454,13 +454,23 @@ def attach_depth_ranks(
     source: str | None = None,
 ) -> tuple[list[Player], dict]:
     idx = depth_index(rows)
+    by_id: dict[str, tuple[int, DepthRow]] = {}
+    for row in rows:
+        for ident in (row.gsis_id, row.player_id):
+            if not ident:
+                continue
+            prev = by_id.get(ident)
+            if prev is None or row.rank < prev[0]:
+                by_id[ident] = (row.rank, row)
     out: list[Player] = []
     matched = 0
     for pl in players:
         if pl.position == "D":
             out.append(pl)
             continue
-        hit = idx.get((pl.team, match_key(pl.name)))
+        hit = by_id.get(pl.pid) if pl.pid else None
+        if hit is None:
+            hit = idx.get((pl.team, match_key(pl.name)))
         rank = hit[0] if hit else None
         if rank is not None:
             matched += 1
