@@ -1727,5 +1727,215 @@ class LiveShapeTest(unittest.TestCase):
         self.assertIn("starters: depth-1 QB, WR depth 1–3, TE depth 1", text)
 
 
+def _skill_rows(name: str, pos: str, share: float, team: str) -> list[dict]:
+    rows = []
+    for week in (1, 2, 3):
+        rows.append(
+            {
+                "season": 2026,
+                "week": week,
+                "position": pos,
+                "player_name": name,
+                "team_fd": team,
+                "targets": round(30.0 * share, 2),
+                "target_share": share,
+                "team_targets": 30,
+                "team_pass_attempts": 34,
+            }
+        )
+    return rows
+
+
+def _snap_rows(name: str, pct: float, team: str) -> list[dict]:
+    return [
+        {
+            "season": 2026,
+            "week": week,
+            "position": "RB",
+            "player_name": name,
+            "team_fd": team,
+            "offense_pct": pct,
+        }
+        for week in (1, 2, 3)
+    ]
+
+
+def _carry_rows(name: str, carries: float, team: str) -> list[dict]:
+    return [
+        {
+            "season": 2026,
+            "week": week,
+            "position": "RB",
+            "player_name": name,
+            "team_fd": team,
+            "carries": carries,
+        }
+        for week in (1, 2, 3)
+    ]
+
+
+class LevelAnchorTest(unittest.TestCase):
+    def _offense(self, team: str, neutral: float = 0.57) -> dict:
+        return {
+            "team_fd": team,
+            "side": "offense",
+            "neutral_pass_rate": neutral,
+            "pass_n": 34,
+            "rush_n": 26,
+            "n": 60,
+            "epa_sum": 4,
+            "epa_sq_sum": 80,
+        }
+
+    def test_sim_qb_means_correlate_with_implied_totals(self):
+        """Neutral and scripted slates: starter sim means rise with the total."""
+        specs = [
+            ("LOW", "OPP", 18.0, 18.0, "OPP@LOW"),
+            ("MID", "OPP2", 24.0, 24.0, "OPP2@MID"),
+            ("HIGH", "OPP3", 30.0, 30.0, "OPP3@HIGH"),
+            ("FAV", "DOG", 29.0, 17.0, "DOG@FAV"),
+            ("DOG", "FAV", 17.0, 29.0, "DOG@FAV"),
+        ]
+        pool = []
+        targets: list[dict] = []
+        stats = []
+        for team, opp, impl, opp_impl, game in specs:
+            if any(row["team_fd"] == team for row in stats):
+                continue
+            stats.append(self._offense(team))
+            targets.extend(_skill_rows(f"WR {team}", "WR", 0.32, team))
+            total = impl + opp_impl
+            home_spread = opp_impl - impl
+            pool.append(
+                _pl(
+                    pid=f"qb-{team}",
+                    name=f"QB {team}",
+                    position="QB",
+                    team=team,
+                    opponent=opp,
+                    game=game,
+                    implied_total=impl,
+                    implied_opp=opp_impl,
+                    total=total,
+                    spread=home_spread,
+                    depth_rank=1,
+                    salary=8000,
+                )
+            )
+            pool.append(
+                _pl(
+                    pid=f"wr-{team}",
+                    name=f"WR {team}",
+                    position="WR",
+                    team=team,
+                    opponent=opp,
+                    game=game,
+                    implied_total=impl,
+                    implied_opp=opp_impl,
+                    total=total,
+                    spread=home_spread,
+                    depth_rank=1,
+                )
+            )
+        inputs = sim_inputs_from_records(team_stats=stats, targets=targets)
+        gs = simulate_games(pool, n=500, seed=1, inputs=inputs)
+        means = [gs.by_pid[f"qb-{team}"].mean for team, *_rest in specs]
+        implied = [impl for _team, _opp, impl, _oi, _game in specs]
+        self.assertGreater(pearson(means, implied), 0.3)
+        self.assertGreater(gs.by_pid["qb-HIGH"].mean, gs.by_pid["qb-LOW"].mean)
+        self.assertGreater(gs.by_pid["qb-MID"].mean, gs.by_pid["qb-LOW"].mean)
+
+    def test_pass_prop_sets_the_yard_anchor(self):
+        from nfl.sim import pass_td_anchor, pass_yard_anchor
+
+        self.assertAlmostEqual(pass_yard_anchor(22.0, 0.57), 22.0 * 0.57 * 17.5, places=4)
+        self.assertEqual(pass_yard_anchor(18.0, 0.65, 280.0), 280.0)
+        self.assertEqual(pass_td_anchor(24.0, 0.50, 1.7), 1.7)
+        targets = _skill_rows("Only WR", "WR", 1.0, "DET")
+        inputs = sim_inputs_from_records(
+            team_stats=[self._offense("DET")],
+            targets=targets,
+        )
+        common = dict(
+            team="DET",
+            opponent="NO",
+            game="NO@DET",
+            total=44.0,
+            spread=0.0,
+            implied_total=22.0,
+            implied_opp=22.0,
+            depth_rank=1,
+        )
+        bare = _pl(pid="qb", name="Bare", position="QB", salary=7000, **common)
+        propped = _pl(
+            pid="qb",
+            name="Propped",
+            position="QB",
+            salary=7000,
+            prop_pass_yds=310.0,
+            prop_pass_tds=2.4,
+            **common,
+        )
+        wr = _pl(pid="wr", name="Only WR", position="WR", **common)
+        bare_gs = simulate_games([bare, wr], n=200, seed=1, inputs=inputs)
+        prop_gs = simulate_games([propped, wr], n=200, seed=1, inputs=inputs)
+        self.assertGreater(prop_gs.by_pid["qb"].mean, bare_gs.by_pid["qb"].mean + 2.0)
+
+    def test_rb_volume_follows_snaps_carries_and_rush_props(self):
+        targets = (
+            _skill_rows("Bellcow", "RB", 0.16, "ATL")
+            + _skill_rows("Committee", "RB", 0.06, "ATL")
+            + _skill_rows("Wideout", "WR", 0.28, "ATL")
+        )
+        snaps = _snap_rows("Bellcow", 0.68, "ATL") + _snap_rows("Committee", 0.28, "ATL")
+        carries = _carry_rows("Bellcow", 14, "ATL") + _carry_rows("Committee", 10, "ATL")
+        inputs = sim_inputs_from_records(
+            team_stats=[self._offense("ATL", neutral=0.55)],
+            targets=targets,
+            snaps=snaps,
+            carries=carries,
+        )
+        common = dict(
+            team="ATL",
+            opponent="CAR",
+            game="CAR@ATL",
+            total=46.0,
+            spread=-4.0,
+            implied_total=25.0,
+            implied_opp=21.0,
+        )
+        lead = _pl(pid="rb1", name="Bellcow", position="RB", depth_rank=1, **common)
+        change = _pl(pid="rb2", name="Committee", position="RB", depth_rank=2, **common)
+        wr = _pl(pid="wr", name="Wideout", position="WR", depth_rank=1, **common)
+        qb = _pl(pid="qb", name="QB", position="QB", depth_rank=1, salary=7500, **common)
+        gs = simulate_games([qb, lead, change, wr], n=400, seed=1, inputs=inputs)
+        self.assertGreater(gs.by_pid["rb1"].mean, gs.by_pid["rb2"].mean)
+        self.assertLess(gs.by_pid["rb1"].mean, 18.0)
+        self.assertGreater(gs.by_pid["rb1"].mean, 4.0)
+
+        solo_inputs = sim_inputs_from_records(
+            team_stats=[self._offense("ATL", neutral=0.55)],
+            targets=_skill_rows("Bellcow", "RB", 0.16, "ATL")
+            + _skill_rows("Wideout", "WR", 0.28, "ATL"),
+            snaps=_snap_rows("Bellcow", 0.80, "ATL"),
+        )
+        solo = simulate_games([qb, lead, wr], n=400, seed=1, inputs=solo_inputs)
+        self.assertLess(gs.by_pid["rb1"].mean, solo.by_pid["rb1"].mean)
+
+        propped = _pl(
+            pid="rb1",
+            name="Bellcow",
+            position="RB",
+            depth_rank=1,
+            prop_rush_yds=70.0,
+            **common,
+        )
+        prop_gs = simulate_games(
+            [qb, propped, change, wr], n=400, seed=1, inputs=inputs
+        )
+        self.assertLess(prop_gs.by_pid["rb1"].mean, 16.0)
+        self.assertLess(prop_gs.by_pid["rb1"].mean, solo.by_pid["rb1"].mean)
+
+
 if __name__ == "__main__":
     unittest.main()

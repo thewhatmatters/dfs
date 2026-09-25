@@ -116,6 +116,9 @@ class SimFeedTest(unittest.TestCase):
         ), patch(
             "nfl.sim_feed.fetch_snaps",
             return_value=(snaps, {"live": False, "cache_stale": False}),
+        ), patch(
+            "nfl.sim_feed.fetch_player_stats_weekly",
+            return_value=([], {"cache_stale": False}),
         ), patch("nfl.gangstash.http_json", side_effect=AssertionError("network")):
             inputs, note = resolve_sim_inputs(
                 path=None,
@@ -162,6 +165,8 @@ class SimFeedTest(unittest.TestCase):
             "nfl.sim_feed.fetch_team_stats_weekly", side_effect=missing
         ), patch("nfl.sim_feed.fetch_targets", side_effect=missing), patch(
             "nfl.sim_feed.fetch_snaps", side_effect=missing
+        ), patch(
+            "nfl.sim_feed.fetch_player_stats_weekly", side_effect=missing
         ), patch("nfl.gangstash.http_json", side_effect=AssertionError("network")):
             inputs, note = resolve_sim_inputs(path=None, season=2026, weeks=[1, 2])
         self.assertIsNone(inputs)
@@ -178,6 +183,9 @@ class SimFeedTest(unittest.TestCase):
             return_value=(payload["targets"], {"cache_stale": False}),
         ), patch(
             "nfl.sim_feed.fetch_snaps",
+            return_value=([], {"cache_stale": False}),
+        ), patch(
+            "nfl.sim_feed.fetch_player_stats_weekly",
             return_value=([], {"cache_stale": False}),
         ):
             inputs, _note = resolve_sim_inputs(path=None, season=2025, weeks=None)
@@ -202,6 +210,9 @@ class SimFeedTest(unittest.TestCase):
             return_value=([], {"cache_stale": False}),
         ), patch(
             "nfl.sim_feed.fetch_snaps",
+            return_value=([], {"cache_stale": False}),
+        ), patch(
+            "nfl.sim_feed.fetch_player_stats_weekly",
             return_value=([], {"cache_stale": False}),
         ):
             inputs, _note = resolve_sim_inputs(path=None, season=2026, weeks=None)

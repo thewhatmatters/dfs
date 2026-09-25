@@ -16,7 +16,7 @@ This is not a play-by-play model and not a sportsbook scrape. The sim never call
 
 `--projection-source sim` runs the Monte Carlo even when `--sim` is omitted (same as `floor` / `ceiling`). `--sim 0` does not turn that off. A player with no sim row keeps `week1_score`.
 
-The board point estimate stays `week1_score`. `--board` still prints it in the proj column (built before the objective swap). `lineup_proj` is still the sum of `week1_score`. The diagnostic lists the largest `|sim mean − board|` gaps and says which source the ILP mean is using.
+The board point estimate stays `week1_score`. `--board` still prints it in the proj column (built before the objective swap). With `--projection-source board`, `lineup_proj` is the sum of `week1_score`. With `--projection-source sim`, the lineup total row sums the same sim means the Proj column shows, and `lineup_board` keeps the week-1 sum. The diagnostic lists the largest `|sim mean − board|` gaps and says which source the ILP mean is using.
 
 Leave the default at `board` until layer 4 (prop-calibrated efficiency and TDs) and a backtest against gangstash `player_stats_weekly` `fd_points` show the sim is at least as accurate as the board. Why a board-optimal lineup sums near 70 while cash scores 120–130: [`projection-scale.md`](projection-scale.md). Shares and the ±20% prop cap are unchanged.
 
@@ -62,13 +62,18 @@ when that row exists. `epa_variance` is, in order:
 Used only for teams that have at least one WR/TE/RB with weekly target history. Other teams do not spend RNG here.
 
 ```
-plays ~ Normal(63, 4), floored at 40
+plays ~ Normal(plays_mu, 4), floored at 40
 pass_rate = clamp(neutral + 0.012 × (−margin), 0.38, 0.78)
+rush_rate = team_stats rush share, shifted by that same script, else 1 − pass_rate
 pass_attempts = plays × pass_rate
-rush_attempts = plays × (1 − pass_rate)
+rush_attempts = min(plays × rush_rate, implied × rush_rate × 9.5 / 4.4)
+pass_yards = prop_pass_yds, or implied × pass_rate × 17.5
+pass_tds = prop_pass_tds, or (implied / 7) × clamp(pass_rate × 1.08, 0.40, 0.82)
 ```
 
-`margin` is this team's drawn points minus the opponent's. A trailing team passes more. A leading team runs more.
+`plays_mu` is `pass_n + rush_n` when that sum is one game (40–95). Otherwise it is 63. `margin` is this team's drawn points minus the opponent's. A trailing team passes more. A leading team runs more.
+
+Passing yards and passing TDs are **not** target volume times a league rate. The level is the Vegas implied total times the scripted pass rate. `prop_pass_yds` replaces the yard anchor. `prop_pass_tds` replaces the TD anchor. A 22-point team at a 0.57 pass rate is about 220 passing yards. The receiving lines are still one shared draw; they are rescaled so they sum to a sample around that anchor. A high implied total raises the starter QB even when the script trims his pass rate.
 
 **Neutral pass rate** (offense row only):
 
@@ -103,14 +108,18 @@ Same-team pass catchers therefore compete (negative share correlation).
 
 **One QB gets the passing volume.** That is the depth-1 QB. If several players are depth 1, the one with `prop_pass_yds` or `prop_pass_tds` wins, then higher salary, then pid. If nobody is depth 1, the QB with a passing prop wins, else the lowest depth rank. Every other QB on that team is scored at 0 on this path (they are not given the role-share team-points formula).
 
-The starter's passing yards and passing TDs are the **sum of the receiving lines** realized for his catchers and for the other bucket in that same world. A catcher's points use his own line. Those are one draw, not a separate yards-per-attempt roll for the QB. Rush yards and interceptions stay on the QB's own attempt and rush counts. A leading script still pushes rush points up and pass points down, so an RB can move against his QB.
+The starter's passing yards and passing TDs are the **sum of the receiving lines** realized for his catchers and for the other bucket in that same world, after those lines are scaled to the pass anchor above. A catcher's points use his own scaled line. Rush yards and interceptions stay on the QB's own attempt and rush counts. A leading script still pushes rush points up and pass points down, but the yard level moves with the implied total, so a higher team total does not produce a lower QB.
 
 **RB rush share**
 
-- If any RB on that path has `offense_pct` weeks, rush shares are a Dirichlet around those means (RBs without snaps keep a depth weight).
-- If no snaps are present, rush shares are fixed depth weights: `depth_prior × expected snap share`, normalized across the RBs. No extra random draw.
+Team rush attempts are the scripted count above (team_stats rush rate plus the margin, capped by the implied-total yard budget). Every roster RB splits that pool, not only the backs who have target weeks.
 
-The starter QB keeps 8% of team rushes. RBs split the rest. Snaps are optional; an empty `snaps` list is valid.
+- Snap share and carry share are each normalized, then combined with a geometric mean when a back has both. Carry counts come from `carries` / `rushing_attempts` on a target row or from `player_stats_weekly`.
+- A back with only snaps (or only carries) keeps that one signal.
+- If neither is present, rush shares are fixed depth weights: `depth_prior × expected snap share`, normalized across the RBs. No extra random draw.
+- `prop_rush_yds` sets that back's rush attempts to `prop / 4.4` yards per carry. Props that sum past the team pool are scaled down. The other backs split what remains.
+
+The starter QB keeps 8% of team rushes. Snaps and carries are optional; an empty list is valid.
 
 Players with no target weeks stay on the deterministic role share, including an RB who only has snaps. Snaps change rush mix only for RBs who already have target weeks.
 
@@ -118,7 +127,7 @@ Players with no target weeks stay on the deterministic role share, including an 
 
 ### Efficiency (placeholder, layer 4 later)
 
-`PlaceholderEfficiency` in `nfl/sim_efficiency.py` turns opportunities into expected FanDuel points: yards per target / rush and TD rates, plus the 100- and 300-yard bonuses when that expectation crosses the line. It does **not** consume the RNG and it does **not** calibrate medians to prop lines.
+`PlaceholderEfficiency` in `nfl/sim_efficiency.py` turns opportunities into FanDuel points: yards per target / rush and TD rates, plus the 100- and 300-yard bonuses when that game's sampled yards cross the line. Passing props are applied as the team anchor before this class scores the line. A rush-yard prop is that RB's rush attempts (`prop / 4.4`).
 
 `receiving_line(rng, position, targets)` realizes one allocation and samples receiving yards around that conditional mean (`sigma = max(12, 0.22 × mean)`). Catcher points use that sampled line. QB passing yards and TDs sum the same lines, including the other bucket. A 300-yard passing bonus or a 100-yard rush/rec bonus is +3 only in games whose sampled yards clear the line. It is not `3 × P(clear)` added to every draw, and it is not a cliff on the mean yards. A standalone `points` call with no `team_receiving` samples passing yards around `7.1` yards per attempt.
 
@@ -146,6 +155,7 @@ When `--sim` runs and `--sim-inputs` is omitted, `nfl/sim_feed.py` builds `SimIn
 | Recent script | `team_stats_weekly` for `--targets-weeks`, or `--targets-week` | averages those three rates onto the matching team/side. EPA sums stay seasonal. Skipped when no week is set (the weekly query requires `week`) |
 | Target shares | `targets`, that same week list, or every week the season query returns | one player-week each, not the single-share usage aggregate |
 | RB rush shares | `snaps`, same window, `position=RB` | `offense_pct` |
+| RB carry shares | `player_stats_weekly`, same window | `carries` or `rushing_attempts` (skipped when the dataset is missing) |
 
 No key and no cache for every dataset prints one line and keeps role shares:
 
@@ -191,4 +201,14 @@ Fixture: `nfl/testdata/sim_layers.json` (DET offense/defense EPA sums, four week
 
 ## Seeds
 
-One `random.Random(seed)` for the slate. Games run in game-id order, players in pid order. Inside an opportunity team the order is: plays gaussian, target-share gammas (pid order, then the other bucket), rush-share gammas only when snaps exist, then one yards gaussian per receiving line (catchers, then the other bucket). Scoring then draws rush yards when that player has rushes. Share draws stay on the gamma sequence. Empty inputs add no draws beyond the total and the spread.
+One `random.Random(seed)` for the slate. Games run in game-id order, players in pid order. Inside an opportunity team the order is: plays gaussian, target-share gammas (pid order, then the other bucket), rush-share gammas when snaps or carries exist, then one yards gaussian per receiving line (catchers, then the other bucket), then one team pass-yard gaussian around the anchor (skipped when the anchor is 0). Scoring then draws rush yards when that player has rushes. Share draws stay on the gamma sequence. Empty inputs add no draws beyond the total and the spread.
+
+## Backtest
+
+`python3 -m nfl.backtest` joins a FanDuel players list to gangstash `player_stats_weekly` `fd_points` for one season and week. It prints mean error (projection minus actual) and MAE by position for the board (`week1_score`) and for the sim mean.
+
+```bash
+python3 -m nfl.backtest --csv "nfl/data/<players-list>.csv" --season 2026 --week 2
+```
+
+The reader is `fetch_player_stats_weekly` (`dataset=player_stats_weekly&season=&week=`, header `x-api-key`, same-day cache as the other `/data` datasets). Game lines, props, and the sim feed are optional. An empty result is named in a `missing:` line (`game_lines`, `props`, `sim_inputs`) and the week still scores. Week 2 currently has no props and no game lines; that is a missing-input report, not a crash. The optimizer default stays `--projection-source board`.

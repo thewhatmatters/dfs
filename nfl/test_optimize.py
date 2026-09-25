@@ -663,6 +663,40 @@ class LineupTotalsTest(unittest.TestCase):
         self.assertLess(lu["lineup_ceiling"], 150.0)
         self.assertNotAlmostEqual(lu["lineup_proj"], lu["projection"])
 
+    def test_sim_lineup_total_sums_the_proj_column(self):
+        """`--projection-source sim` totals the sim means, not week1_score."""
+        from cli_table import format_picker_table
+
+        slots = {}
+        keys = ["QB", "RB1", "RB2", "WR1", "WR2", "WR3", "TE", "FLEX", "DEF"]
+        pos = ["QB", "RB", "RB", "WR", "WR", "WR", "TE", "RB", "D"]
+        for i, (k, p) in enumerate(zip(keys, pos)):
+            slots[k] = _pl(
+                pid=f"s{i}",
+                name=f"S{i}",
+                position=p,
+                team="DET" if i < 4 else "PHI",
+                opponent="NO" if i < 4 else "WAS",
+                salary=6000,
+                implied_total=12.0,
+                objective=17.0,
+            )
+        lu_obj = Lineup(slots=slots, method="test", salary_floor=0)
+        lu = lu_obj.to_dict()
+        _attach_totals(
+            lu, lu_obj, {}, cash_line=150.0, projection_source="sim"
+        )
+        shown = sum(float(p.projection) for p in slots.values())
+        board = sum(score_player(p) for p in slots.values())
+        self.assertAlmostEqual(shown, 153.0, places=4)
+        self.assertAlmostEqual(lu["lineup_proj"], shown, places=4)
+        self.assertAlmostEqual(lu["lineup_board"], board, places=4)
+        self.assertNotAlmostEqual(lu["lineup_proj"], board, places=1)
+        table = format_picker_table(lu, color=False)
+        lineup_row = next(line for line in table.splitlines() if "Lineup" in line and "153.0" in line)
+        self.assertIn("153.0 (2.8x)", lineup_row)
+        self.assertNotIn(f"{board:.1f} (", lineup_row)
+
 
 class NLineupsTest(unittest.TestCase):
     def test_unique_sets_min_unique_and_legal(self):

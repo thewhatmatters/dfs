@@ -1027,7 +1027,14 @@ def main(argv: list[str] | None = None) -> int:
         lu = lineup.to_dict()
         if sim_by_pid:
             _attach_sim(lu, sim_by_pid)
-        _attach_totals(lu, lineup, sim_by_pid, args.cash_line, game_sim=game_sim)
+        _attach_totals(
+            lu,
+            lineup,
+            sim_by_pid,
+            args.cash_line,
+            game_sim=game_sim,
+            projection_source=args.projection_source,
+        )
         lu_dicts.append(lu)
     if len(lu_dicts) > 1:
         paired = sorted(
@@ -1085,14 +1092,23 @@ def _attach_totals(
     cash_line: float,
     *,
     game_sim=None,
+    projection_source: str = "board",
 ) -> None:
-    """lineup_proj = sum week1_score (not ILP obj).
+    """Displayed lineup Proj.
 
-    Floor/ceiling = joint-9 p10/p90 when `game_sim` is set; else sum of
-    player p10/p90 (tests that pass only a by_pid dict).
+    ``board`` (default): ``lineup_proj`` is the sum of ``week1_score``.
+    ``sim``: ``lineup_proj`` is the sum of the per-player Proj column
+    (sim mean after the objective swap). ``lineup_board`` keeps the
+    week-1 sum. Floor/ceiling = joint-9 p10/p90 when `game_sim` is set;
+    else the sum of player p10/p90.
     """
     players = list(lineup.slots.values())
-    lu["lineup_proj"] = round(sum(score_player(p) for p in players), 4)
+    board = round(sum(score_player(p) for p in players), 4)
+    if (projection_source or "board").lower() == "sim":
+        lu["lineup_board"] = board
+        lu["lineup_proj"] = round(sum(float(p.projection) for p in players), 4)
+    else:
+        lu["lineup_proj"] = board
     if not sim_by_pid and game_sim is None:
         return
     pids = [p.pid for p in players]

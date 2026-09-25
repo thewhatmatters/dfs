@@ -14,10 +14,12 @@ from dataclasses import replace
 
 from nfl.gangstash import GangstashDataError, GangstashDataKeyMissing, GangstashTruncated
 from nfl.gangstash_data import (
+    fetch_player_stats_weekly,
     fetch_snaps,
     fetch_targets,
     fetch_team_stats,
     fetch_team_stats_weekly,
+    parse_player_stat_row,
     parse_snap_row,
     parse_target_row,
 )
@@ -97,19 +99,28 @@ def load_gangstash_sim_inputs(
             refresh=refresh_snaps,
         )
     )
+    stat_rows, stat_meta, stat_err = _pull(
+        lambda: fetch_player_stats_weekly(
+            season=season,
+            weeks=weeks,
+            refresh=False,
+        )
+    )
     team_stats = _team_stats(stats_rows, weekly_rows)
     targets = _targets(target_rows)
     snaps = _snaps(snap_rows)
+    carries = _carries(stat_rows)
     inputs = sim_inputs_from_records(
         team_stats=team_stats,
         targets=targets,
         snaps=snaps,
+        carries=carries,
     )
     if inputs.empty:
         return None, UNAVAILABLE_NOTE
     stale = any(
         bool(meta.get("cache_stale"))
-        for meta in (stats_meta, weekly_meta, target_meta, snap_meta)
+        for meta in (stats_meta, weekly_meta, target_meta, snap_meta, stat_meta)
     )
     skipped = [
         name
@@ -118,12 +129,14 @@ def load_gangstash_sim_inputs(
             ("team_stats_weekly", weekly_err),
             ("targets", target_err),
             ("snaps", snap_err),
+            ("player_stats_weekly", stat_err),
         )
         if err
     ]
     note = (
         f"sim inputs: gangstash team_stats {len(inputs.team_stats)}  "
-        f"targets {len(inputs.targets)}  snaps {len(inputs.snaps)}"
+        f"targets {len(inputs.targets)}  snaps {len(inputs.snaps)}  "
+        f"carries {len(inputs.carries)}"
     )
     if stale:
         note += "  stale cache"
@@ -252,6 +265,19 @@ def _targets(rows: list[dict]) -> list[dict]:
             continue
         if item is not None:
             out.append(item)
+    return out
+
+
+def _carries(rows: list[dict]) -> list[dict]:
+    """RB carry counts from player_stats_weekly. Other positions are dropped."""
+    out: list[dict] = []
+    for row in rows:
+        item = parse_player_stat_row(row)
+        if item is None or item.get("carries") is None:
+            continue
+        if item.get("position") not in {"", "RB"}:
+            continue
+        out.append(item)
     return out
 
 

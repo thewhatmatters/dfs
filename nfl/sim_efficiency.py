@@ -1,12 +1,13 @@
 """Placeholder efficiency: expected FanDuel points given opportunities.
 
 Layer 4 replaces ``PlaceholderEfficiency``. That replacement should draw
-residual yards and lumpy TD counts, and may shift medians onto prop
-lines (``player.prop_pass_yds`` and the other ``prop_*`` fields). This
-placeholder is the conditional expectation and does not consume ``rng``.
+residual yards and lumpy TD counts. Passing-yard and passing-TD props are
+already the team anchor in ``nfl.sim`` (the lines are scaled to them).
+A rush-yard prop is that RB's attempt count (``prop / yards per carry``).
 
 ``receiving_line`` realizes a target allocation once, including a yards
-draw. ``points`` scores that realized game with FanDuel rates. A 300/100
+draw. The sim then rescales those lines so the team sums to the pass
+anchor. ``points`` scores that realized game with FanDuel rates. A 300/100
 bonus is +3 only when that draw's yards clear the line. The QB's passing
 yards are the sum of the same receiving lines.
 """

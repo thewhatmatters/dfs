@@ -7,12 +7,17 @@ share that world:
    when team stats are present; otherwise the fixed constants below.
 2. Volume + script — team plays and a pass/rush split. Neutral pass rate
    (or pass rate minus PROE) shifts with the drawn margin: trailing teams
-   pass more, leading teams run more.
+   pass more, leading teams run more. Passing yards and TDs are anchored
+   to the Vegas implied total times that pass rate (a passing prop replaces
+   the matching anchor). Team rush attempts come from team_stats plus the
+   same script, then a yard budget tied to the implied total.
 3. Opportunity — target shares (WR/TE/RB) and RB rush shares drawn jointly
-   (Dirichlet) from games played so same-team catchers compete. The
-   starter QB's passing yards and TDs are the sum of those same receiving
-   lines. Backups get no team passing volume. Missing history keeps the
-   deterministic role share (team points × depth × position share × usage).
+   (Dirichlet) from games played so same-team catchers compete. Rush shares
+   blend snap rate and carry share across every roster RB. The starter QB's
+   passing yards and TDs are the sum of those same receiving lines after
+   they are scaled to the pass anchor. Backups get no team passing volume.
+   A rush-yard prop sets that RB's rush-yard mean. Missing history keeps
+   the deterministic role share (team points × depth × position share × usage).
 
 Efficiency (yards per opportunity, TD rates) is ``PlaceholderEfficiency``
 in ``nfl/sim_efficiency.py``. Layer 4 replaces that class; it is not a
@@ -51,13 +56,15 @@ from nfl.projections import (
 )
 from nfl.rules import DST_SACK_TO_PRIOR, FANDUEL_NFL, dst_pa_points, dst_projection
 from nfl.sim_efficiency import (
+    YARDS_PER_RUSH,
     EfficiencyModel,
     OpportunityCount,
     PlaceholderEfficiency,
     ReceivingLine,
     expected_receiving_line,
+    sample_yards,
 )
-from nfl.sim_inputs import SimInputs, SnapWeek, TargetWeek, TeamStat
+from nfl.sim_inputs import CarryWeek, SimInputs, SnapWeek, TargetWeek, TeamStat
 
 DEFAULT_DRAWS = 10_000
 DEFAULT_SEED = 1
@@ -100,6 +107,16 @@ KAPPA_MIN = 2.0
 KAPPA_MAX = 80.0
 # QB keeps this fraction of team rushes; RBs split the rest.
 QB_RUSH_SHARE = 0.08
+# Passing yards ≈ implied total × scripted pass rate × this.
+# 22-pt team at a 0.57 pass rate → about 220 yards.
+PASS_YARDS_PER_POINT = 17.5
+# Team rush yards ≈ implied total × scripted rush rate × this.
+# 22-pt team at a 0.43 rush rate → about 90 rush yards, then split.
+RUSH_YARDS_PER_POINT = 9.5
+# Passing TDs ≈ (implied / 7) × clamp(pass_rate × slope).
+PASS_TD_SHARE_SLOPE = 1.08
+PASS_TD_SHARE_MIN = 0.40
+PASS_TD_SHARE_MAX = 0.82
 
 YARD_FIELDS: tuple[tuple[str, str], ...] = (
     ("prop_pass_yds", "pass_yd"),
@@ -656,6 +673,72 @@ def scripted_pass_rate(neutral: float, margin: float) -> float:
     return _clamp_rate(neutral + SCRIPT_PASS_PER_POINT * (-float(margin)))
 
 
+def scripted_rush_rate(stat: TeamStat | None, margin: float) -> float:
+    """Team rush rate from the neutral split, shifted by the game script.
+
+    ``rush_n / (pass_n + rush_n)`` is the team_stats base when both counts
+    exist. The script then adds the same pass-rate move ``scripted_pass_rate``
+    applies (a lead raises the rush rate). Otherwise the rate is
+    ``1 - scripted pass rate``.
+    """
+    neutral = neutral_pass_rate_of(stat)
+    pass_rate = scripted_pass_rate(neutral, margin)
+    rush_rate = 1.0 - pass_rate
+    if stat is not None and stat.pass_n and stat.rush_n:
+        total = int(stat.pass_n) + int(stat.rush_n)
+        if total > 0:
+            base = int(stat.rush_n) / total
+            shifted = base + (neutral - pass_rate)
+            rush_rate = min(1.0 - PASS_RATE_MIN, max(1.0 - PASS_RATE_MAX, shifted))
+    return rush_rate
+
+
+def offense_plays_mu(stat: TeamStat | None) -> float:
+    """Plays per game. A team_stats count in one-game range wins; else 63."""
+    if stat is None or not stat.pass_n or not stat.rush_n:
+        return LEAGUE_PLAYS
+    total = int(stat.pass_n) + int(stat.rush_n)
+    if 40 <= total <= 95:
+        return float(total)
+    return LEAGUE_PLAYS
+
+
+def pass_yard_anchor(
+    implied: float,
+    pass_rate: float,
+    prop: float | None = None,
+) -> float:
+    """Expected team passing yards. A passing-yard prop replaces the anchor."""
+    if prop is not None:
+        return max(0.0, float(prop))
+    return max(0.0, float(implied)) * max(0.0, float(pass_rate)) * PASS_YARDS_PER_POINT
+
+
+def pass_td_anchor(
+    implied: float,
+    pass_rate: float,
+    prop: float | None = None,
+) -> float:
+    """Expected team passing TDs. A passing-TD prop replaces the anchor."""
+    if prop is not None:
+        return max(0.0, float(prop))
+    share = min(
+        PASS_TD_SHARE_MAX,
+        max(PASS_TD_SHARE_MIN, float(pass_rate) * PASS_TD_SHARE_SLOPE),
+    )
+    return max(0.0, float(implied)) / 7.0 * share
+
+
+def team_rush_attempts(plays: float, rush_rate: float, implied: float) -> float:
+    """Rush attempts from the script, capped by the implied-total yard budget."""
+    scripted = max(0.0, float(plays)) * max(0.0, float(rush_rate))
+    ypc = YARDS_PER_RUSH.get("RB", 4.4)
+    if float(implied) <= 0 or ypc <= 0:
+        return scripted
+    budget = float(implied) * max(0.0, float(rush_rate)) * RUSH_YARDS_PER_POINT / ypc
+    return min(scripted, max(0.0, budget))
+
+
 def mean_target_share(
     weeks: list[TargetWeek],
     snaps: list[SnapWeek] | None = None,
@@ -745,6 +828,45 @@ def rush_share_means(
         even = 1.0 / len(rbs)
         return {pl.pid: even for pl in rbs}, any_snaps
     return {pid: val / total for pid, val in raw.items()}, any_snaps
+
+
+def blended_rush_shares(
+    players: list[Player],
+    snap_means: dict[str, float | None],
+    carry_means: dict[str, float | None],
+) -> tuple[dict[str, float], bool]:
+    """RB rush shares from snap rate and carry rate. Sum to 1.
+
+    Snaps and carries are normalized on their own, then combined with a
+    geometric mean when a back has both. A back with only one signal keeps
+    that signal. No snaps and no carries → the depth role weights, and the
+    second value is False (no Dirichlet draw).
+    """
+    rbs = [p for p in players if (p.position or "").upper() == "RB"]
+    snap_shares, any_snaps = rush_share_means(rbs, snap_means)
+    carry_raw = {pl.pid: float(carry_means.get(pl.pid) or 0.0) for pl in rbs}
+    any_carries = any(val > 0 for val in carry_raw.values())
+    if not any_carries:
+        return snap_shares, any_snaps
+    carry_total = sum(carry_raw.values())
+    carry_shares = {
+        pid: (val / carry_total if carry_total > 0 else 0.0)
+        for pid, val in carry_raw.items()
+    }
+    blended: dict[str, float] = {}
+    for pl in rbs:
+        snap = snap_shares.get(pl.pid, 0.0)
+        carry = carry_shares.get(pl.pid, 0.0)
+        if snap > 0 and carry > 0:
+            blended[pl.pid] = math.sqrt(snap * carry)
+        elif carry > 0:
+            blended[pl.pid] = carry
+        else:
+            blended[pl.pid] = snap
+    total = sum(blended.values())
+    if total <= 0:
+        return snap_shares, any_snaps or any_carries
+    return {pid: val / total for pid, val in blended.items()}, True
 
 
 def pearson(xs: list[float], ys: list[float]) -> float:
@@ -997,7 +1119,7 @@ def _layered_pids(
             pids.update(
                 p.pid
                 for p in members
-                if (p.position or "").upper() == "QB"
+                if (p.position or "").upper() in {"QB", "RB"}
             )
     return pids
 
@@ -1122,6 +1244,85 @@ def _realize_receiving(
     return fn(rng, position, targets)
 
 
+def _scale_receiving(
+    lines: list[ReceivingLine],
+    yards: float,
+    tds: float,
+) -> tuple[ReceivingLine, ...]:
+    """Rescale realized lines so they sum to the team pass anchors."""
+    if not lines:
+        return ()
+    raw_yd = sum(line.rec_yd for line in lines)
+    raw_td = sum(line.rec_td for line in lines)
+    raw_tgt = sum(max(0.0, line.targets) for line in lines)
+    n = len(lines)
+    scaled: list[ReceivingLine] = []
+    for line in lines:
+        if raw_yd > 1e-6:
+            rec_yd = line.rec_yd / raw_yd * yards
+        elif raw_tgt > 1e-6:
+            rec_yd = line.targets / raw_tgt * yards
+        else:
+            rec_yd = yards / n
+        if raw_td > 1e-6:
+            rec_td = line.rec_td / raw_td * tds
+        elif raw_tgt > 1e-6:
+            rec_td = line.targets / raw_tgt * tds
+        else:
+            rec_td = tds / n
+        scaled.append(
+            ReceivingLine(
+                targets=line.targets,
+                receptions=line.receptions,
+                rec_yd=rec_yd,
+                rec_td=rec_td,
+            )
+        )
+    return tuple(scaled)
+
+
+def _rb_rush_attempts(
+    rbs: list[Player],
+    shares: dict[str, float],
+    pool: float,
+) -> dict[str, float]:
+    """Split team RB rushes. A rush-yard prop takes ``prop / YPC`` first.
+
+    Props that sum past the pool are scaled down so the team total holds.
+    Everyone else splits what remains by rush share.
+    """
+    ypc = YARDS_PER_RUSH.get("RB", 4.4) or 4.4
+    claimed: dict[str, float] = {}
+    free: list[str] = []
+    for pl in rbs:
+        if pl.prop_rush_yds is not None:
+            claimed[pl.pid] = max(0.0, float(pl.prop_rush_yds) / ypc)
+        else:
+            free.append(pl.pid)
+    claim = sum(claimed.values())
+    if claim >= pool and claim > 0:
+        scale = pool / claim if pool > 0 else 0.0
+        return {pid: val * scale for pid, val in claimed.items()}
+    left = max(0.0, pool - claim)
+    weight = sum(shares.get(pid, 0.0) for pid in free)
+    out = dict(claimed)
+    for pid in free:
+        if weight > 0:
+            out[pid] = left * shares.get(pid, 0.0) / weight
+        elif free:
+            out[pid] = left / len(free)
+        else:
+            out[pid] = 0.0
+    return out
+
+
+def _team_implied(players: list[Player]) -> float:
+    for pl in players:
+        if pl.implied_total is not None and float(pl.implied_total) > 0:
+            return float(pl.implied_total)
+    return 0.0
+
+
 def _draw_team_opportunities(
     rng: random.Random,
     team_players: list[Player],
@@ -1129,14 +1330,16 @@ def _draw_team_opportunities(
     index: _HistoryIndex,
     eff: EfficiencyModel,
 ) -> dict[str, OpportunityCount]:
-    """Plays, scripted pass rate, joint shares. Empty if no target history.
+    """Plays, script, anchors, joint shares. Empty if no target history.
 
     RNG order (stable): one plays gaussian, then target-share gammas in
     pid order (plus an "other" bucket), then rush-share gammas in pid
-    order only when some RB has snaps, then receiving lines (catchers in
-    that same order, then the other bucket). ``PlaceholderEfficiency``
-    does not consume the RNG. Only ``passing_qb`` gets pass attempts and
-    QB rushes; other QBs are explicit zeros.
+    order when some RB has snaps or carries, then receiving-line yards
+    (catchers, then the other bucket), then one team pass-yard gaussian
+    around the implied-total anchor (skipped when that anchor is 0).
+    Only ``passing_qb`` gets pass attempts and QB rushes; other QBs are
+    explicit zeros. Every roster RB gets a rush count so a bellcow does
+    not absorb the backup's carries.
     """
     if not team_players:
         return {}
@@ -1144,11 +1347,18 @@ def _draw_team_opportunities(
     catchers = _catchers(team, team_players, index)
     if not catchers:
         return {}
-    plays = _gauss_floor(rng, LEAGUE_PLAYS, PLAYS_SIGMA, PLAYS_FLOOR)
-    neutral = neutral_pass_rate_of(index.offense(team))
-    pass_rate = scripted_pass_rate(neutral, margin)
+    offense = index.offense(team)
+    plays = _gauss_floor(rng, offense_plays_mu(offense), PLAYS_SIGMA, PLAYS_FLOOR)
+    rush_rate = scripted_rush_rate(offense, margin)
+    pass_rate = 1.0 - rush_rate
+    implied = _team_implied(team_players)
+    starter = passing_qb(team_players)
+    yard_prop = starter.prop_pass_yds if starter is not None else None
+    td_prop = starter.prop_pass_tds if starter is not None else None
+    yard_anchor = pass_yard_anchor(implied, pass_rate, yard_prop)
+    td_anchor = pass_td_anchor(implied, pass_rate, td_prop)
     pass_attempts = plays * pass_rate
-    rush_attempts = plays * (1.0 - pass_rate)
+    rush_attempts = team_rush_attempts(plays, rush_rate, implied)
     team_targets = pass_attempts * index.targets_per_attempt(team)
 
     means = [
@@ -1173,14 +1383,15 @@ def _draw_team_opportunities(
     target_share = {pl.pid: drawn[i] for i, pl in enumerate(catchers)}
     other_share = drawn[-1] if other > 1e-6 else 0.0
 
-    rbs = [pl for pl in catchers if (pl.position or "").upper() == "RB"]
+    rbs = [pl for pl in team_players if (pl.position or "").upper() == "RB"]
     snap_means = {pl.pid: index.snap_mean(pl) for pl in rbs}
-    rush_means, any_snaps = rush_share_means(rbs, snap_means)
-    if any_snaps and rbs:
+    carry_means = {pl.pid: index.mean_carries(pl) for pl in rbs}
+    rush_means, any_rush_signal = blended_rush_shares(rbs, snap_means, carry_means)
+    if any_rush_signal and rbs:
         ordered = [pl.pid for pl in rbs]
         rush_drawn = draw_simplex(
             rng,
-            [rush_means[pid] for pid in ordered],
+            [rush_means.get(pid, 0.0) for pid in ordered],
             kappa,
         )
         rush_share = {pid: rush_drawn[i] for i, pid in enumerate(ordered)}
@@ -1189,25 +1400,36 @@ def _draw_team_opportunities(
 
     qb_rushes = rush_attempts * QB_RUSH_SHARE
     rb_pool = rush_attempts * (1.0 - QB_RUSH_SHARE)
+    rb_rushes = _rb_rush_attempts(rbs, rush_share, rb_pool)
     out: dict[str, OpportunityCount] = {}
     lines: list[ReceivingLine] = []
+    raw_by_pid: dict[str, tuple[float, float, ReceivingLine]] = {}
     for pl in catchers:
-        rushes = 0.0
-        if pl.pid in rush_share:
-            rushes = rb_pool * rush_share[pl.pid]
         targets = team_targets * target_share[pl.pid]
         line = _realize_receiving(eff, rng, pl.position or "WR", targets)
         lines.append(line)
-        out[pl.pid] = OpportunityCount(
-            targets=targets,
-            rushes=rushes,
-            receiving=line,
-        )
+        raw_by_pid[pl.pid] = (targets, rb_rushes.get(pl.pid, 0.0), line)
     other_targets = team_targets * other_share
     if other_targets > 0.0:
         lines.append(_realize_receiving(eff, rng, "WR", other_targets))
-    team_lines = tuple(lines)
-    starter = passing_qb(team_players)
+    if yard_anchor > 0:
+        drawn_yards = sample_yards(rng, yard_anchor)
+    else:
+        drawn_yards = 0.0
+    team_lines = _scale_receiving(lines, drawn_yards, td_anchor)
+    cursor = 0
+    for pl in catchers:
+        targets, rushes, _raw = raw_by_pid[pl.pid]
+        out[pl.pid] = OpportunityCount(
+            targets=targets,
+            rushes=rushes,
+            receiving=team_lines[cursor],
+        )
+        cursor += 1
+    for pl in rbs:
+        if pl.pid in out:
+            continue
+        out[pl.pid] = OpportunityCount(rushes=rb_rushes.get(pl.pid, 0.0))
     for pl in team_players:
         if (pl.position or "").upper() != "QB":
             continue
@@ -1232,6 +1454,8 @@ class _HistoryIndex:
         self._tgt_name: dict[tuple[str, str], list[TargetWeek]] = {}
         self._snap_pid: dict[str, list[SnapWeek]] = {}
         self._snap_name: dict[tuple[str, str], list[SnapWeek]] = {}
+        self._carry_pid: dict[str, list[CarryWeek]] = {}
+        self._carry_name: dict[tuple[str, str], list[CarryWeek]] = {}
         for row in inputs.targets:
             self._tgt_name.setdefault(
                 (row.team_fd, match_key(row.player_name)), []
@@ -1248,6 +1472,14 @@ class _HistoryIndex:
                 self._snap_pid.setdefault(row.player_id, []).append(row)
             if row.gsis_id:
                 self._snap_pid.setdefault(row.gsis_id, []).append(row)
+        for row in inputs.carries:
+            self._carry_name.setdefault(
+                (row.team_fd, match_key(row.player_name)), []
+            ).append(row)
+            if row.player_id:
+                self._carry_pid.setdefault(row.player_id, []).append(row)
+            if row.gsis_id:
+                self._carry_pid.setdefault(row.gsis_id, []).append(row)
 
     def target_weeks(self, player: Player) -> list[TargetWeek]:
         hit = self._tgt_pid.get(player.pid)
@@ -1270,6 +1502,23 @@ class _HistoryIndex:
                 [],
             )
         )
+
+    def carry_weeks(self, player: Player) -> list[CarryWeek]:
+        hit = self._carry_pid.get(player.pid)
+        if hit:
+            return hit
+        return list(
+            self._carry_name.get(
+                ((player.team or "").upper(), match_key(player.name)),
+                [],
+            )
+        )
+
+    def mean_carries(self, player: Player) -> float | None:
+        weeks = self.carry_weeks(player)
+        if not weeks:
+            return None
+        return sum(float(w.carries) for w in weeks) / len(weeks)
 
     def snap_mean(self, player: Player) -> float | None:
         vals = [

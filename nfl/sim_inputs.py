@@ -15,6 +15,8 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from nfl.names import match_key
+
 
 class SimInputError(ValueError):
     """Local sim-input JSON is missing or not the expected shape."""
@@ -164,6 +166,8 @@ class TargetWeek:
     target_share: float | None = None
     team_targets: float | None = None
     team_pass_attempts: float | None = None
+    carries: float | None = None
+    team_carries: float | None = None
     gsis_id: str | None = None
     player_id: str | None = None
 
@@ -187,12 +191,27 @@ class SnapWeek:
 
 
 @dataclass(frozen=True)
+class CarryWeek:
+    """One player-week of rush attempts. Used only to split the team rush pie."""
+
+    season: int
+    week: int
+    player_name: str
+    team_fd: str
+    carries: float
+    position: str = "RB"
+    gsis_id: str | None = None
+    player_id: str | None = None
+
+
+@dataclass(frozen=True)
 class SimInputs:
     """Bundle passed into ``simulate_games``. Empty means today's fallback."""
 
     team_stats: tuple[TeamStat, ...] = ()
     targets: tuple[TargetWeek, ...] = ()
     snaps: tuple[SnapWeek, ...] = ()
+    carries: tuple[CarryWeek, ...] = ()
 
     @property
     def empty(self) -> bool:
@@ -252,6 +271,33 @@ def target_week_from_row(row: dict) -> TargetWeek | None:
         target_share=_unit_rate(_float(_pick(row, "target_share"))),
         team_targets=_float(_pick(row, "team_targets")),
         team_pass_attempts=_float(_pick(row, "team_pass_attempts")),
+        carries=_float(_pick(row, "carries", "rushing_attempts", "rush_attempts", "rush_att")),
+        team_carries=_float(_pick(row, "team_carries", "team_rush_attempts")),
+        gsis_id=_str(_pick(row, "gsis_id")) or None,
+        player_id=_str(_pick(row, "player_id")) or None,
+    )
+
+
+def carry_week_from_row(row: dict) -> CarryWeek | None:
+    """Map a player-week that has a carry count. None when carries are absent."""
+    if not isinstance(row, dict):
+        return None
+    name = _str(_pick(row, "player_name", "name", "player"))
+    team = _str(_pick(row, "team_fd", "team", "recent_team")).upper()
+    if not name or not team:
+        return None
+    week = _int(_pick(row, "week"))
+    carries = _float(_pick(row, "carries", "rushing_attempts", "rush_attempts", "rush_att"))
+    if week is None or carries is None:
+        return None
+    pos = _str(_pick(row, "position", "pos")).upper() or "RB"
+    return CarryWeek(
+        season=_int(_pick(row, "season")) or 0,
+        week=week,
+        player_name=name,
+        team_fd=team,
+        carries=carries,
+        position=pos,
         gsis_id=_str(_pick(row, "gsis_id")) or None,
         player_id=_str(_pick(row, "player_id")) or None,
     )
@@ -284,6 +330,7 @@ def sim_inputs_from_records(
     team_stats: list[dict] | None = None,
     targets: list[dict] | None = None,
     snaps: list[dict] | None = None,
+    carries: list[dict] | None = None,
 ) -> SimInputs:
     """Build inputs from gangstash-shaped row dicts. Skips blank rows."""
     stats = tuple(
@@ -301,7 +348,40 @@ def sim_inputs_from_records(
         for row in (snap_week_from_row(r) for r in (snaps or []))
         if row is not None
     )
-    return SimInputs(team_stats=stats, targets=weeks, snaps=snap_rows)
+    carry_rows = tuple(
+        row
+        for row in (carry_week_from_row(r) for r in (carries or []))
+        if row is not None
+    )
+    # Target rows may also carry a rush count. Keep those when the
+    # dedicated list did not already name that player-week.
+    seen = {(row.team_fd, match_key(row.player_name), row.week) for row in carry_rows}
+    extra: list[CarryWeek] = []
+    for week in weeks:
+        if week.carries is None:
+            continue
+        key = (week.team_fd, match_key(week.player_name), week.week)
+        if key in seen:
+            continue
+        seen.add(key)
+        extra.append(
+            CarryWeek(
+                season=week.season,
+                week=week.week,
+                player_name=week.player_name,
+                team_fd=week.team_fd,
+                carries=float(week.carries),
+                position=week.position,
+                gsis_id=week.gsis_id,
+                player_id=week.player_id,
+            )
+        )
+    return SimInputs(
+        team_stats=stats,
+        targets=weeks,
+        snaps=snap_rows,
+        carries=carry_rows + tuple(extra),
+    )
 
 
 def load_sim_inputs(path: str | Path) -> SimInputs:
@@ -313,11 +393,12 @@ def load_sim_inputs(path: str | Path) -> SimInputs:
         raise SimInputError(f"sim inputs {file}: {e}") from e
     if not isinstance(payload, dict):
         raise SimInputError(f"sim inputs {file} is not an object")
-    for key in ("team_stats", "targets", "snaps"):
+    for key in ("team_stats", "targets", "snaps", "carries"):
         if key in payload and not isinstance(payload[key], list):
             raise SimInputError(f"sim inputs {file} field {key} is not a list")
     return sim_inputs_from_records(
         payload.get("team_stats") or [],
         payload.get("targets") or [],
         payload.get("snaps") or [],
+        payload.get("carries") or [],
     )
