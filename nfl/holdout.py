@@ -1268,7 +1268,7 @@ def main(argv: list[str] | None = None) -> int:
         "--sensitivity-week",
         type=int,
         default=None,
-        help="week to perturb ±10% (default: last requested week other than week 1)",
+        help="week to perturb ±10%% (default: last requested week other than week 1)",
     )
     args = ap.parse_args(argv)
     try:

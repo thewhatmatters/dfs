@@ -5,6 +5,8 @@ from __future__ import annotations
 import io
 import json
 import random
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -507,6 +509,17 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(wr["props"]["n"], 1)
         self.assertEqual(wr["sim_data"]["n"], 1)
         self.assertIsNotNone(wr["props"]["mae"])
+
+    def test_help_runs(self) -> None:
+        proc = subprocess.run(
+            [sys.executable, "-m", "nfl.holdout", "--help"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("--sensitivity-week", proc.stdout)
+        self.assertIn("±10%", proc.stdout)
 
     def test_main_writes_json_without_network(self) -> None:
         def boom(*_args, **_kwargs):
