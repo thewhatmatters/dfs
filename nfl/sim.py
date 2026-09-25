@@ -710,12 +710,25 @@ def _score_fallback(
     return starter_qb_points(player, team_pts, index)
 
 
-_ROLE_COEF: dict[int, float] = {}
+# pid plus every input of the product below. ``id(player)`` is reused after
+# a slate is collected, so an id key leaks the previous player's coefficient.
+_RoleCoefKey = tuple[str, str, int | None, float | None, float | None]
+_ROLE_COEF: dict[_RoleCoefKey, float] = {}
+
+
+def _role_cache_key(player: Player) -> _RoleCoefKey:
+    return (
+        player.pid,
+        player.position,
+        player.depth_rank,
+        player.target_share,
+        player.snap_share,
+    )
 
 
 def _role_coef(player: Player) -> float:
     """Depth × position share × usage. Constant for a player across draws."""
-    key = id(player)
+    key = _role_cache_key(player)
     if key in _ROLE_COEF:
         return _ROLE_COEF[key]
     share = POS_FD_SHARE.get((player.position or "WR").upper(), 0.18)
