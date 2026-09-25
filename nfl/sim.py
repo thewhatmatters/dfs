@@ -61,6 +61,7 @@ import inspect
 import math
 import random
 from dataclasses import dataclass, field, replace
+from typing import Optional, Tuple
 
 from nfl.injuries import is_inactive
 from nfl.names import match_key
@@ -710,12 +711,26 @@ def _score_fallback(
     return starter_qb_points(player, team_pts, index)
 
 
-_ROLE_COEF: dict[int, float] = {}
+# pid plus every input of the product below. ``id(player)`` is reused after
+# a slate is collected, so an id key leaks the previous player's coefficient.
+# Assigned at import: Tuple/Optional, not ``X | None`` (CPython 3.9).
+_RoleCoefKey = Tuple[str, str, Optional[int], Optional[float], Optional[float]]
+_ROLE_COEF: dict[_RoleCoefKey, float] = {}
+
+
+def _role_cache_key(player: Player) -> _RoleCoefKey:
+    return (
+        player.pid,
+        player.position,
+        player.depth_rank,
+        player.target_share,
+        player.snap_share,
+    )
 
 
 def _role_coef(player: Player) -> float:
     """Depth × position share × usage. Constant for a player across draws."""
-    key = id(player)
+    key = _role_cache_key(player)
     if key in _ROLE_COEF:
         return _ROLE_COEF[key]
     share = POS_FD_SHARE.get((player.position or "WR").upper(), 0.18)

@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import builtins
+import gc
 import io
 import random
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
+from unittest.mock import patch
 
 from nfl.optimize import _sim_n, parse_args
 from nfl.players import Player
@@ -38,7 +41,9 @@ from nfl.sim import (
     simulate_pool,
     volume_point,
     yardage_bonuses,
+    _ROLE_COEF,
     _props_draw,
+    _role_coef,
     _score_world,
 )
 from nfl.sim_efficiency import (
@@ -787,6 +792,61 @@ class GameBonusTest(unittest.TestCase):
             if yds >= 100.0 - 1e-9 and abs(team_if_bonus * share + bonus - pts) < 1e-6:
                 fired += 1
         self.assertGreater(fired, 0)
+
+
+class RoleCoefCacheTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._saved = dict(_ROLE_COEF)
+        _ROLE_COEF.clear()
+
+    def tearDown(self) -> None:
+        _ROLE_COEF.clear()
+        _ROLE_COEF.update(self._saved)
+
+    def test_reused_id_cannot_leak_a_previous_slates_coefficient(self) -> None:
+        """A later slate must not inherit a coefficient cached under a recycled id.
+
+        Build slate 1, cache its coefficient, drop it, and collect. CPython
+        may then allocate slate 2 at that same id. The allocator does not
+        promise reuse, so ``id()`` is forced to return slate 1's id — the
+        collision the module cache used to trust.
+        """
+        slate1 = _pl(
+            pid="slate1-wr",
+            position="WR",
+            depth_rank=1,
+            target_share=0.28,
+            snap_share=0.95,
+        )
+        coef1 = _role_coef(slate1)
+        recycled = id(slate1)
+        del slate1
+        gc.collect()
+
+        slate2 = _pl(
+            pid="slate2-rb",
+            position="RB",
+            depth_rank=3,
+            target_share=0.04,
+            snap_share=0.12,
+        )
+        saved = dict(_ROLE_COEF)
+        _ROLE_COEF.clear()
+        fresh = _role_coef(slate2)
+        _ROLE_COEF.clear()
+        _ROLE_COEF.update(saved)
+        self.assertNotEqual(fresh, coef1)
+
+        real_id = builtins.id
+
+        def colliding_id(obj: object) -> int:
+            if obj is slate2:
+                return recycled
+            return real_id(obj)
+
+        with patch("builtins.id", colliding_id):
+            got = _role_coef(slate2)
+        self.assertEqual(got, fresh)
 
 
 FIXTURE = Path(__file__).resolve().parent / "testdata" / "sim_layers.json"
