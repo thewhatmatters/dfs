@@ -81,6 +81,7 @@ python3 -m nfl.gangstash_data team-stats-weekly --season 2026 --week 1,2
 | `GANGSTASH_INJURIES_DATASET` | `injuries` | `dataset=` value |
 | `GANGSTASH_DST_WEEKLY_DATASET` | `dst_weekly` | `dataset=` value |
 | `GANGSTASH_PLAYER_USAGE_DATASET` | `player_usage` | `dataset=` value |
+| `GANGSTASH_PROPS_CLOSING_DATASET` | `props_closing` | `dataset=` value |
 
 ## Queries this client sends
 
@@ -90,12 +91,13 @@ python3 -m nfl.gangstash_data team-stats-weekly --season 2026 --week 1,2
 | `game_lines` | `date=YYYY-MM-DD` (ET kickoff) **or** `season` + one `week` | optimizer sends the slate **date** only, unless `--week` is set |
 | `closing_lines` | `season` + one `week` | preferred for a past `--week` and for `nfl.backtest`. Live rows use `home_line` (negative = home favored), `total`, `implied_home_total`, `implied_away_total`. `kickoff` may be null. A row that still will not parse is skipped and the week falls through to `game_lines` |
 | `depth_charts` | optional `team`, `position` (that is `pos_abb`), `pos_grp`, `season`, `week` | optimizer requests `pos_grp=3WR 1TE`. A chart with no `week` column is the current chart. Live and nightly projections use this dataset |
-| `depth_charts_weekly` | `season` required; `week` (one week or a comma list), `team`, `position`, `pos_grp` optional | last chart strictly before kickoff. Only games that have already kicked off. The backtest uses this for the target week and falls back to `depth_charts` when it is missing |
+| `depth_charts_weekly` | `season` required; `week` (one week or a comma list), `team`, `position`, `pos_grp` optional | last chart strictly before kickoff. Only games that have already kicked off. The backtest uses this for the target week and falls back to `depth_charts` when it is missing. 2024 rows are `chart_format=nflverse_weekly` (`pos_rank` can repeat, `pos_slot` null); tied ranks are rewritten 1..n. 2025 and 2026 ESPN charts keep unique ranks |
 | `injuries` | `season` required; `week`, `team`, `gsis_id`, and `status` optional. Rows carry `player_id` | live. Backtest stamps the week. No-CSV mode uses this feed. A CSV pool still prefers to stay quiet when the fetch fails |
 | `team_stats` | `season` (required), `season_type` (default `REG`), optional `side` (`offense`/`defense`), `team` | not scored |
 | `team_stats_weekly` | `season` + `week` (single or comma list), optional `team` | backtest pools weeks before the target into team EPA variance. The optimizer still overlays rates on the season board |
 | `dst_weekly` | `season` (required), optional `week`, optional `team` | DEF actuals for the backtest. Join is `(season, week, team)`. `fd_points` is the FanDuel score |
 | `player_usage` | `season` required; `week`, `team`, `gsis_id`, `position` optional | one row per player-week. The sim feed sends season and the prior-week list only |
+| `props_closing` | `season` required; `week`, `player`, `team`, `prop` optional | last pre-kickoff BettingPros line per player and prop. Starts 2026 week 3. The holdout turns pass/rush/rec yards, receptions, and TD lines into FanDuel points. An empty or unknown dataset is skipped |
 | `snaps` | `season` (required), `week` (single or `1,2`), optional `position` (`WR`/`TE`/`RB`), `team` (FD or nflverse; `JAC` and `JAX` both work) | 2026 weeks 1–2 are 2,994 rows (185 RB, 335 WR, 220 TE). `offense_pct` is a 0–1 fraction |
 
 ## Response fields

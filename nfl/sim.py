@@ -215,6 +215,9 @@ class GameSim:
     draws: dict[str, tuple[float, ...]]
     # Teams whose catchers had weekly target history (Dirichlet shares).
     opportunity_teams: frozenset[str] = field(default_factory=frozenset)
+    # One row per parsed game per world: (game, away, home, away_pts, home_pts).
+    # Recorded after the total and spread draws. No extra RNG.
+    game_draws: tuple[tuple[str, str, str, float, float], ...] = ()
 
     def lineup_stats(self, pids: list[str]) -> SimStats | None:
         cols = [self.draws[p] for p in pids if p in self.draws]
@@ -355,13 +358,18 @@ def simulate_games(
             for team in sorted(_teams_in(group))
             if preps[(key, team)].catchers
         ]
-        slate.append((group, team_preps))
+        slate.append((key, group, team_preps))
     rng = random.Random(int(seed))
     raw: dict[str, list[float]] = {p.pid: [] for p in players}
     score_points = eff.points
+    game_rows: list[tuple[str, str, str, float, float]] = []
     for _ in range(n):
-        for group, team_preps in slate:
+        for key, group, team_preps in slate:
             home_pts, away_pts, away, home = _draw_game(rng, group, index)
+            if away is not None and home is not None:
+                game_rows.append(
+                    (key, away, home, float(away_pts), float(home_pts))
+                )
             if away is None or home is None:
                 for pl in group:
                     team_pts, opp_pts = _solo_world(rng, pl)
@@ -405,7 +413,12 @@ def simulate_games(
         else:
             src = "model"
         by_pid[pl.pid] = _stats(xs, n=n, source=src)
-    return GameSim(by_pid=by_pid, draws=draws, opportunity_teams=opportunity)
+    return GameSim(
+        by_pid=by_pid,
+        draws=draws,
+        opportunity_teams=opportunity,
+        game_draws=tuple(game_rows),
+    )
 
 
 def apply_ilp_objective(

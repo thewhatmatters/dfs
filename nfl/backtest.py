@@ -67,6 +67,7 @@ from nfl.gangstash_data import (
     map_game_lines,
     parse_dst_row,
     parse_player_stat_row,
+    uniquify_depth_ranks,
 )
 from nfl.injuries import handoff_chart, injury_rows_from_records, stamp_injuries
 from nfl.lines import (
@@ -639,7 +640,7 @@ def _depth_table(rows: list[dict], *, season: int, week: int) -> tuple[list[Dept
     if not scoped:
         return [], note
     try:
-        slots = map_depth_slots(scoped)
+        slots = uniquify_depth_ranks(map_depth_slots(scoped))
     except GangstashDataError:
         return [], note
     out: list[DepthRow] = []
