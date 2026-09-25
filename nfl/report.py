@@ -40,6 +40,7 @@ POSITIONS = (
 )
 VEGAS_LABEL = "Vegas implied totals (not sim)"
 DASH = "—"
+OFF_SLATE = "off slate"
 
 
 def graph_table(
@@ -390,6 +391,15 @@ def fmt_salary(value: object) -> str:
     return f"{int(number):,}"
 
 
+def salary_cell(row: dict | None) -> str:
+    """Salary, ``—`` when unknown, or ``off slate`` when ``--csv`` missed the game."""
+    if not row:
+        return ""
+    if row.get("off_slate") and _num(row.get("salary")) is None:
+        return OFF_SLATE
+    return fmt_salary(row.get("salary"))
+
+
 def fmt_points(value: object) -> str:
     number = _num(value)
     if number is None:
@@ -438,8 +448,8 @@ def _scorers(rows: list[dict], away: str, home: str) -> list[dict]:
 
 
 def _games_table(games: list[dict], rows: list[dict]) -> str:
-    headers = ["Game", "Team", "Median", "p10–p90", "#", "Player", "Pos", "Mean", "Salary"]
-    aligns = ["left", "left", "right", "right", "right", "left", "left", "right", "right"]
+    headers = ["Game", "Team", "Median", "p10–p90", "#", "Player", "Tm", "Pos", "Mean", "Salary"]
+    aligns = ["left", "left", "right", "right", "right", "left", "left", "left", "right", "right"]
     body: list[list[object]] = []
     for game in games:
         away = str(game.get("away") or "")
@@ -464,9 +474,10 @@ def _games_table(games: list[dict], rows: list[dict]) -> str:
                     fmt_band(low, high) if team else "",
                     str(index + 1) if scorer else "",
                     _name(scorer) if scorer else "",
+                    _team(scorer) if scorer else "",
                     _pos(scorer) if scorer else "",
                     fmt_points(scorer.get("mean")) if scorer else "",
-                    fmt_salary(scorer.get("salary")) if scorer else "",
+                    salary_cell(scorer) if scorer else "",
                 ]
             )
     return graph_table("GAMES", headers, body, aligns=aligns, shrink=(5,))
@@ -483,7 +494,7 @@ def _position_table(title: str, rows: list[dict], limit: int) -> str:
                 _name(row),
                 _team(row),
                 _opp(row),
-                fmt_salary(row.get("salary")),
+                salary_cell(row),
                 fmt_points(row.get("mean")),
                 fmt_band(row.get("p10"), row.get("p90")),
                 fmt_per_k(row.get("mean"), row.get("salary")),
@@ -613,15 +624,36 @@ def load_games_sidecar(season: int, week: int, root: Path | None = None) -> dict
     return payload if isinstance(payload, dict) else None
 
 
+def _game_pair(team: object, opponent: object) -> frozenset[str] | None:
+    away = str(team or "").strip().upper()
+    home = str(opponent or "").strip().upper()
+    if not away or not home:
+        return None
+    return frozenset((away, home))
+
+
 def fill_salaries(rows: list[dict], csv_path: str | Path) -> list[dict]:
-    """Fill a null salary from a FanDuel players list (name + team + position)."""
+    """Fill a null salary from a FanDuel players list (name + team + position).
+
+    A player whose game has no rows in that list is marked ``off_slate``.
+    A missing player in a game the CSV does list keeps a null salary.
+    """
     from nfl.players import load_fanduel_csv
 
     index: dict[tuple[str, str, str], int] = {}
+    games: set[frozenset[str]] = set()
     for player in load_fanduel_csv(csv_path):
         index[(match_key(player.name), player.team.upper(), player.position.upper())] = int(
             player.salary
         )
+        pair = _game_pair(player.team, player.opponent)
+        if pair:
+            games.add(pair)
+        if "@" in (player.game or ""):
+            away, home = player.game.split("@", 1)
+            pair = _game_pair(away, home)
+            if pair:
+                games.add(pair)
     filled: list[dict] = []
     for row in rows:
         copy = dict(row)
@@ -633,6 +665,10 @@ def fill_salaries(rows: list[dict], csv_path: str | Path) -> list[dict]:
                 salary = index.get((key[0], key[1], "DEF"))
             if salary is not None:
                 copy["salary"] = salary
+            else:
+                pair = _game_pair(_team(copy), _opp(copy))
+                if pair is not None and pair not in games:
+                    copy["off_slate"] = True
         filled.append(copy)
     return filled
 

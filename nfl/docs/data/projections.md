@@ -25,7 +25,7 @@ successful POST or `--dry-run` and prints that path. The same run writes
 the sim returned game draws. `python3 -m nfl.report --season --week`
 reads the stored `model=sim` rows. It shows those sim scores when the
 sidecar `run_at` matches, and gangstash implied totals otherwise.
-`--csv` fills a null salary from a FanDuel players list.
+`--csv` fills a null salary from a FanDuel players list. A player whose whole game has no rows in that file shows `off slate` in the salary cell. A missing player in a listed game still shows `—`.
 
 ## Keys
 

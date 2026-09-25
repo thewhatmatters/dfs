@@ -174,6 +174,7 @@ class ReportTest(unittest.TestCase):
         )
         self.assertEqual(_data_rows(blocks[0]), 6)
         games_block = blocks[0]
+        self.assertIn("Tm", games_block.splitlines()[2])
         for name in (
             "Patrick Mahomes",
             "Josh Allen",
@@ -183,6 +184,8 @@ class ReportTest(unittest.TestCase):
             "Dak Prescott",
         ):
             self.assertIn(name, games_block)
+        kelce = next(line for line in games_block.splitlines() if "Travis Kelce" in line)
+        self.assertRegex(kelce, r"Travis Kelce\s+\|\s+KC\s+\|")
         self.assertIn("24.1", games_block)
         self.assertIn("27.4", games_block)
         self.assertIn("3.33", text)
@@ -203,6 +206,39 @@ class ReportTest(unittest.TestCase):
             self.assertIn("]", lines[0])
             for line in lines[1:-1]:
                 self.assertTrue(line.startswith("|") and line.endswith("|"))
+
+    def test_scorer_team_is_separate_from_the_score_row(self) -> None:
+        rows = [
+            _row("Patrick Mahomes", "KC", "MIA", "QB", 30, 9000),
+            _row("Tua Tagovailoa", "MIA", "KC", "QB", 12, 7000),
+        ]
+        games = [
+            {
+                "game": "MIA@KC",
+                "away": "MIA",
+                "home": "KC",
+                "source": "sim",
+                "away_median": 17.4,
+                "away_p10": 10.0,
+                "away_p90": 24.0,
+                "home_median": 27.0,
+                "home_p10": 18.0,
+                "home_p90": 36.0,
+            }
+        ]
+        text = build_report(
+            rows,
+            games,
+            season=2026,
+            week=3,
+            run_at=RUN,
+            draws=20,
+            efficiency="data",
+        )
+        line = next(row for row in text.splitlines() if "Patrick Mahomes" in row)
+        self.assertRegex(line, r"MIA\s+\|\s+17\.4")
+        self.assertRegex(line, r"Patrick Mahomes\s+\|\s+KC\s+\|")
+        self.assertLessEqual(len(line), 100)
 
     def test_vegas_label_when_game_results_are_missing(self) -> None:
         rows, _games = _fixture()
@@ -275,7 +311,9 @@ class ReportTest(unittest.TestCase):
         self.assertEqual(side.name, "2026-w3-games.json")
 
     def test_csv_fills_salary_by_name_team_position(self) -> None:
-        rows = [_row("Patrick Mahomes", "KC", "BUF", "QB", 30, None)]
+        priced = _row("Patrick Mahomes", "KC", "BUF", "QB", 30, None)
+        missing = _row("Isiah Pacheco", "KC", "BUF", "RB", 10, None)
+        away = _row("Joe Burrow", "CIN", "DET", "QB", 16, None)
         with tempfile.TemporaryDirectory() as tmp:
             csv_path = Path(tmp) / "players.csv"
             csv_path.write_text(
@@ -283,9 +321,52 @@ class ReportTest(unittest.TestCase):
                 "1,QB,Patrick Mahomes,9000,KC,BUF,KC@BUF\n",
                 encoding="utf-8",
             )
-            filled = fill_salaries(rows, csv_path)
+            filled = fill_salaries([priced, missing, away], csv_path)
         self.assertEqual(filled[0]["salary"], 9000)
-        self.assertIsNone(rows[0]["salary"])
+        self.assertNotIn("off_slate", filled[0])
+        self.assertIsNone(filled[1]["salary"])
+        self.assertNotIn("off_slate", filled[1])
+        self.assertIsNone(filled[2]["salary"])
+        self.assertTrue(filled[2]["off_slate"])
+        self.assertIsNone(priced["salary"])
+        games = [
+            {
+                "game": "KC@BUF",
+                "away": "KC",
+                "home": "BUF",
+                "source": "sim",
+                "away_median": 24.1,
+                "away_p10": 14.0,
+                "away_p90": 35.0,
+                "home_median": 27.4,
+                "home_p10": 17.1,
+                "home_p90": 38.2,
+            }
+        ]
+        shown = build_report(
+            filled,
+            games,
+            season=2026,
+            week=3,
+            run_at=RUN,
+            draws=20,
+            efficiency="data",
+        )
+        self.assertIn("off slate", shown)
+        self.assertIn("9,000", shown)
+        pacheco = next(line for line in shown.splitlines() if "Isiah Pacheco" in line)
+        self.assertNotIn("off slate", pacheco)
+        self.assertIn("—", pacheco)
+        unlabeled = build_report(
+            [priced, missing, away],
+            games,
+            season=2026,
+            week=3,
+            run_at=RUN,
+            draws=20,
+            efficiency="data",
+        )
+        self.assertNotIn("off slate", unlabeled)
 
     def test_matching_sidecar_shows_sim_scores(self) -> None:
         rows, games = _fixture()
@@ -408,6 +489,8 @@ class SimGameResultsTest(unittest.TestCase):
         )
         self.assertNotIn(VEGAS_LABEL, text)
         self.assertIn("[ GAMES ]", text)
+        mahomes = next(line for line in text.splitlines() if "Patrick Mahomes" in line)
+        self.assertRegex(mahomes, r"Patrick Mahomes\s+\|\s+KC\s+\|")
         self.assertIn(fmt_points(summaries[0]["away_median"]), text)
         self.assertIn(fmt_points(summaries[0]["home_median"]), text)
         self.assertIn(fmt_points(summaries[0]["away_p10"]), text)
