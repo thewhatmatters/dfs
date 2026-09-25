@@ -281,14 +281,21 @@ def ingest_slate_props(
     *,
     refresh: bool = False,
     slate_day: date | None = None,
+    rows: list[dict] | None = None,
+    fetch_meta: dict | None = None,
+    keep_rows: bool = False,
 ) -> tuple[dict[str, PlayerProp], dict]:
     day = slate_day or date.today()
-    try:
-        rows, fetch_meta = fetch_props(refresh=refresh, cache_day=day)
-    except GangstashKeyMissing as e:
-        raise PropsKeyMissing(str(e)) from e
-    except GangstashError as e:
-        raise PropsError(str(e)) from e
+    if rows is None:
+        try:
+            rows, fetch_meta = fetch_props(refresh=refresh, cache_day=day)
+        except GangstashKeyMissing as e:
+            raise PropsKeyMissing(str(e)) from e
+        except GangstashError as e:
+            raise PropsError(str(e)) from e
+    else:
+        fetch_meta = dict(fetch_meta or {})
+        rows = list(rows)
     by_key, map_meta = rows_to_props(rows)
     buckets: dict[str, list[Player]] = defaultdict(list)
     for pl in pool:
@@ -324,6 +331,8 @@ def ingest_slate_props(
         **fetch_meta,
         **map_meta,
     }
+    if keep_rows:
+        stats["_rows"] = rows
     return joined, stats
 
 

@@ -14,6 +14,12 @@ A same-day cache is used without the network. If live fetch fails (or the key
 is unset) and an older cache exists, that cache is used and marked stale.
 No cache and no key is an error. truncated=true is an error and is not cached.
 
+Every response may include ``meta`` (dataset, as_of, row_count,
+timestamp_column, observed_at, untimestamped, and includes_baseline on
+injury snapshots). The client returns that object on ``response_meta``
+and still returns ``data``. ``as_of`` is sent only for the snapshot
+datasets that accept it.
+
 Do not scrape sportsbooks. This module only calls the gangstash HTTP API.
 Never send a Supabase service-role key.
 """
@@ -23,7 +29,7 @@ from __future__ import annotations
 import json
 import re
 import urllib.parse
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from nfl import env as envmod
@@ -52,7 +58,32 @@ DATASET_ENV = {
     "dst_weekly": "GANGSTASH_DST_WEEKLY_DATASET",
     "player_usage": "GANGSTASH_PLAYER_USAGE_DATASET",
     "props_closing": "GANGSTASH_PROPS_CLOSING_DATASET",
+    "game_line_snapshots": "GANGSTASH_GAME_LINE_SNAPSHOTS_DATASET",
+    "props_snapshots": "GANGSTASH_PROPS_SNAPSHOTS_DATASET",
+    "injury_snapshots": "GANGSTASH_INJURY_SNAPSHOTS_DATASET",
+    "collector_runs": "GANGSTASH_COLLECTOR_RUNS_DATASET",
 }
+
+# Server accepts as_of only on these dataset= values (data API v12).
+AS_OF_DATASETS = frozenset(
+    {
+        "game_line_snapshots",
+        "props_snapshots",
+        "depth_charts",
+        "depth_charts_weekly",
+        "injury_snapshots",
+    }
+)
+
+_SERVER_META_KEYS = (
+    "dataset",
+    "as_of",
+    "row_count",
+    "timestamp_column",
+    "observed_at",
+    "untimestamped",
+    "includes_baseline",
+)
 
 
 class GangstashError(Exception):
@@ -82,6 +113,104 @@ class GangstashDataKeyMissing(GangstashDataError):
 FALLBACK_FLAGS = (
     "--targets-source=lineups --snaps-source=lineups --depth-source=ourlads"
 )
+
+
+def normalize_as_of(value: str) -> str:
+    """UTC ISO-8601 for the ``as_of`` query. A missing offset is UTC."""
+    text = (value or "").strip()
+    if not text:
+        raise GangstashDataError(
+            "as_of must be an ISO-8601 timestamp. A missing offset is UTC."
+        )
+    parsed = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+    try:
+        stamp = datetime.fromisoformat(parsed)
+    except ValueError as e:
+        raise GangstashDataError(
+            "as_of must be an ISO-8601 timestamp. A missing offset is UTC."
+        ) from e
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    stamp = stamp.astimezone(timezone.utc).replace(microsecond=0)
+    return stamp.isoformat()
+
+
+def reject_as_of(dataset: str, as_of: str | None) -> str | None:
+    """Return a normalized ``as_of``, or None. Refuse it on other datasets."""
+    if as_of is None or str(as_of).strip() == "":
+        return None
+    if dataset not in AS_OF_DATASETS:
+        allowed = ", ".join(sorted(AS_OF_DATASETS))
+        raise GangstashDataError(
+            f"as_of is only valid for {allowed}; refusing as_of on {dataset}"
+        )
+    return normalize_as_of(str(as_of))
+
+
+def server_meta(payload: dict) -> dict:
+    """The response ``meta`` object, or ``{}`` when a cache predates it."""
+    raw = payload.get("meta") if isinstance(payload, dict) else None
+    if not isinstance(raw, dict):
+        return {}
+    return {key: raw[key] for key in _SERVER_META_KEYS if key in raw}
+
+
+def _parse_observed(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        stamp = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.astimezone(timezone.utc)
+
+
+def merge_server_meta(pages: list[dict], *, total_rows: int) -> dict:
+    """Join per-page ``meta`` after the client follows ``truncated``."""
+    metas = [server_meta(page) for page in pages]
+    metas = [meta for meta in metas if meta]
+    if not metas:
+        return {}
+    observed = [
+        stamp
+        for stamp in (_parse_observed(meta.get("observed_at")) for meta in metas)
+        if stamp is not None
+    ]
+    merged = {
+        "dataset": metas[0].get("dataset"),
+        "as_of": metas[0].get("as_of"),
+        "row_count": int(total_rows),
+        "timestamp_column": metas[0].get("timestamp_column"),
+        "observed_at": max(observed).replace(microsecond=0).isoformat() if observed else None,
+        "untimestamped": any(bool(meta.get("untimestamped")) for meta in metas),
+    }
+    if any("includes_baseline" in meta for meta in metas):
+        merged["includes_baseline"] = any(bool(meta.get("includes_baseline")) for meta in metas)
+    return merged
+
+
+def client_meta(
+    payload: dict,
+    *,
+    cache: str | None,
+    cache_stale: bool,
+    live: bool,
+    dataset: str,
+) -> dict:
+    """Caller meta. Existing keys stay; ``response_meta`` is the server object."""
+    return {
+        "cache": cache,
+        "cache_stale": cache_stale,
+        "truncated": bool(payload.get("truncated")),
+        "live": live,
+        "dataset": dataset,
+        "response_meta": server_meta(payload),
+    }
 
 
 def missing_key_message(detail: str) -> str:
@@ -204,12 +333,13 @@ def fetch_props(
     if not refresh and not filtered and today_path.is_file() and today_path.stat().st_size > 2:
         payload = _read_payload(today_path)
         _reject_truncated(payload, filtered=False)
-        return list(payload["data"]), {
-            "cache": str(today_path),
-            "cache_stale": False,
-            "truncated": bool(payload.get("truncated")),
-            "live": False,
-        }
+        return list(payload["data"]), client_meta(
+            payload,
+            cache=str(today_path),
+            cache_stale=False,
+            live=False,
+            dataset="props",
+        )
 
     try:
         payload = _live(
@@ -228,12 +358,13 @@ def fetch_props(
             ) from None
         payload, path = cached
         _reject_truncated(payload, filtered=False)
-        return list(payload["data"]), {
-            "cache": str(path),
-            "cache_stale": path != today_path,
-            "truncated": bool(payload.get("truncated")),
-            "live": False,
-        }
+        return list(payload["data"]), client_meta(
+            payload,
+            cache=str(path),
+            cache_stale=path != today_path,
+            live=False,
+            dataset="props",
+        )
     except GangstashError:
         if refresh or filtered:
             raise
@@ -242,20 +373,22 @@ def fetch_props(
             raise
         payload, path = cached
         _reject_truncated(payload, filtered=False)
-        return list(payload["data"]), {
-            "cache": str(path),
-            "cache_stale": True,
-            "truncated": bool(payload.get("truncated")),
-            "live": False,
-        }
+        return list(payload["data"]), client_meta(
+            payload,
+            cache=str(path),
+            cache_stale=True,
+            live=False,
+            dataset="props",
+        )
 
     _reject_truncated(payload, filtered=filtered)
-    meta = {
-        "cache": None,
-        "cache_stale": False,
-        "truncated": bool(payload.get("truncated")),
-        "live": True,
-    }
+    meta = client_meta(
+        payload,
+        cache=None,
+        cache_stale=False,
+        live=True,
+        dataset="props",
+    )
     if not filtered:
         meta["cache"] = str(_write_cache(day, payload))
     return list(payload["data"]), meta
@@ -352,14 +485,20 @@ def _live_dataset_page(dataset: str, params: dict[str, str], offset: int) -> dic
 def _live_dataset(dataset: str, params: dict[str, str]) -> dict:
     """Follow truncated pages of PAGE_SIZE up to MAX_ROWS. Cache the full board."""
     rows: list[dict] = []
+    pages: list[dict] = []
     offset = 0
     max_pages = max(1, MAX_ROWS // PAGE_SIZE)
     for page in range(max_pages):
         payload = _live_dataset_page(dataset, params, offset)
+        pages.append(payload)
         chunk = list(payload["data"])
         rows.extend(chunk)
         if not payload.get("truncated"):
-            return {"data": rows, "truncated": False}
+            return {
+                "data": rows,
+                "truncated": False,
+                "meta": merge_server_meta(pages, total_rows=len(rows)),
+            }
         if page + 1 >= max_pages or len(rows) >= MAX_ROWS:
             raise GangstashTruncated(
                 f"gangstash {dataset} truncated=true after {len(rows)} rows "
@@ -378,29 +517,40 @@ def fetch_dataset(
     refresh: bool = False,
     cache_day: date | None = None,
     cache_root: Path | None = None,
+    as_of: str | None = None,
 ) -> tuple[list[dict], dict]:
     """GET /data?dataset=… . Return (rows, meta). truncated=true is not cached.
 
     `params` is the query besides `dataset` (season, week, date, …).
     Same-day cache skips the network. A failed live call falls back to an
     older file for the same dataset and query unless `refresh` is set.
+
+    ``as_of`` is ISO-8601 (no offset means UTC). It is sent only for
+    ``game_line_snapshots``, ``props_snapshots``, ``depth_charts``,
+    ``depth_charts_weekly``, and ``injury_snapshots``. Any other dataset
+    raises ``GangstashDataError`` before the request.
     """
     day = cache_day or date.today()
     root = cache_root or DATA_CACHE_DIR
     query = {k: str(v) for k, v in (params or {}).items() if v is not None and str(v) != ""}
     name = _safe_dataset(dataset)
+    stamped = reject_as_of(name, as_of if as_of is not None else query.get("as_of"))
+    if "as_of" in query:
+        query.pop("as_of")
+    if stamped:
+        query["as_of"] = stamped
     today_path = dataset_cache_file(root, day, name, query)
 
     if not refresh and today_path.is_file() and today_path.stat().st_size > 2:
         payload = _read_payload(today_path)
         _reject_truncated(payload, filtered=False, label=name)
-        return list(payload["data"]), {
-            "cache": str(today_path),
-            "cache_stale": False,
-            "truncated": bool(payload.get("truncated")),
-            "live": False,
-            "dataset": name,
-        }
+        return list(payload["data"]), client_meta(
+            payload,
+            cache=str(today_path),
+            cache_stale=False,
+            live=False,
+            dataset=name,
+        )
 
     try:
         payload = _live_dataset(name, query)
@@ -414,13 +564,13 @@ def fetch_dataset(
             ) from None
         payload, path = cached
         _reject_truncated(payload, filtered=False, label=name)
-        return list(payload["data"]), {
-            "cache": str(path),
-            "cache_stale": path != today_path,
-            "truncated": bool(payload.get("truncated")),
-            "live": False,
-            "dataset": name,
-        }
+        return list(payload["data"]), client_meta(
+            payload,
+            cache=str(path),
+            cache_stale=path != today_path,
+            live=False,
+            dataset=name,
+        )
     except GangstashDataError:
         if refresh:
             raise
@@ -429,21 +579,21 @@ def fetch_dataset(
             raise
         payload, path = cached
         _reject_truncated(payload, filtered=False, label=name)
-        return list(payload["data"]), {
-            "cache": str(path),
-            "cache_stale": True,
-            "truncated": bool(payload.get("truncated")),
-            "live": False,
-            "dataset": name,
-        }
+        return list(payload["data"]), client_meta(
+            payload,
+            cache=str(path),
+            cache_stale=True,
+            live=False,
+            dataset=name,
+        )
 
     _reject_truncated(payload, filtered=False, label=name)
     today_path.parent.mkdir(parents=True, exist_ok=True)
     today_path.write_text(json.dumps(payload), encoding="utf-8")
-    return list(payload["data"]), {
-        "cache": str(today_path),
-        "cache_stale": False,
-        "truncated": bool(payload.get("truncated")),
-        "live": True,
-        "dataset": name,
-    }
+    return list(payload["data"]), client_meta(
+        payload,
+        cache=str(today_path),
+        cache_stale=False,
+        live=True,
+        dataset=name,
+    )

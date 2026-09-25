@@ -641,6 +641,91 @@ def fetch_game_lines(
     )
 
 
+def fetch_game_line_snapshots(
+    *,
+    season: int,
+    week: int | None = None,
+    weeks: list[int] | None = None,
+    refresh: bool = False,
+    cache_day: date | None = None,
+    as_of: str | None = None,
+) -> tuple[list[dict], dict]:
+    """`dataset=game_line_snapshots`. `season` is required. `week` is optional.
+
+    Without ``as_of`` the payload is the full history. With ``as_of`` the
+    server returns the latest row per ``(game_id, book, market)`` at or
+    before that time. Rows stay raw (one book and market per row).
+    """
+    if int(season) < 1:
+        raise GangstashDataError("gangstash game_line_snapshots requires season")
+    week_list = list(weeks) if weeks else ([int(week)] if week is not None else [])
+    params: dict[str, str] = {"season": str(int(season))}
+    if week_list:
+        params["week"] = ",".join(str(int(w)) for w in week_list)
+    return fetch_dataset(
+        dataset_id("game_line_snapshots"),
+        params,
+        refresh=refresh,
+        cache_day=cache_day,
+        as_of=as_of,
+    )
+
+
+def consensus_game_lines(rows: list[dict]) -> list[dict]:
+    """Collapse snapshot rows into the ``game_lines`` shape.
+
+    Keeps ``book=consensus`` spread, total, and moneyline. ``spread`` is
+    ``home_line`` (negative when home is favored). One row per game.
+    """
+    by_game: dict[str, dict[str, dict]] = {}
+    order: list[str] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("book") or "").strip().lower() != "consensus":
+            continue
+        game_id = _str(row.get("game_id"))
+        market = _str(row.get("market")).lower()
+        if not game_id or not market:
+            continue
+        if game_id not in by_game:
+            by_game[game_id] = {}
+            order.append(game_id)
+        by_game[game_id][market] = row
+    out: list[dict] = []
+    for game_id in order:
+        markets = by_game[game_id]
+        spread = markets.get("spread")
+        total = markets.get("total")
+        moneyline = markets.get("moneyline")
+        if spread is None and total is None and moneyline is None:
+            continue
+        sample = spread or total or moneyline
+        assert sample is not None
+        stamps = [
+            _str(item.get("scraped_at") or item.get("captured_at"))
+            for item in (spread, total, moneyline)
+            if item is not None
+        ]
+        stamps = [stamp for stamp in stamps if stamp]
+        out.append(
+            {
+                "game_id": game_id,
+                "season": sample.get("season"),
+                "week": sample.get("week"),
+                "commence_time": sample.get("kickoff_at") or sample.get("commence_time"),
+                "home_team_fd": sample.get("home_team_fd"),
+                "away_team_fd": sample.get("away_team_fd"),
+                "spread": None if spread is None else spread.get("home_line"),
+                "total": None if total is None else total.get("total"),
+                "home_moneyline": None if moneyline is None else moneyline.get("home_price"),
+                "away_moneyline": None if moneyline is None else moneyline.get("away_price"),
+                "updated_at": max(stamps) if stamps else None,
+            }
+        )
+    return out
+
+
 @dataclass(frozen=True)
 class GangstashDepthSlot:
     team_fd: str
@@ -783,6 +868,7 @@ def fetch_depth_charts(
     week: int | None = None,
     refresh: bool = False,
     cache_day: date | None = None,
+    as_of: str | None = None,
 ) -> tuple[list[dict], dict]:
     """`dataset=depth_charts`. `position` is pos_abb. Default pos_grp is 3WR 1TE.
 
@@ -806,6 +892,7 @@ def fetch_depth_charts(
         params,
         refresh=refresh,
         cache_day=cache_day,
+        as_of=as_of,
     )
 
 
@@ -819,14 +906,17 @@ def fetch_depth_charts_weekly(
     pos_grp: str | None = BASE_OFFENSE_POS_GRP,
     refresh: bool = False,
     cache_day: date | None = None,
+    as_of: str | None = None,
 ) -> tuple[list[dict], dict]:
     """`dataset=depth_charts_weekly`. `season` is required.
 
     Optional: `week` (one week or a comma list), `team`, `position`
-    (`pos_abb`), `pos_grp`. Each row is that team's last chart strictly
-    before kickoff, so a game that has not kicked off is absent. Rows
-    stay raw and match `depth_charts`, plus `season`, `week`, `game_type`,
-    `game_id`, `opponent`, `kickoff_at`, and `team_fd`.
+    (`pos_abb`), `pos_grp`, `as_of`. Without `as_of`, each row is that
+    team's last chart strictly before kickoff, so a game that has not
+    kicked off is absent. With `as_of`, the server includes those games
+    and caps snapshots at that time. Rows stay raw and match
+    `depth_charts`, plus `season`, `week`, `game_type`, `game_id`,
+    `opponent`, `kickoff_at`, and `team_fd`.
     """
     if int(season) < 1:
         raise GangstashDataError("gangstash depth_charts_weekly requires season")
@@ -845,6 +935,7 @@ def fetch_depth_charts_weekly(
         params,
         refresh=refresh,
         cache_day=cache_day,
+        as_of=as_of,
     )
 
 
@@ -908,6 +999,45 @@ def fetch_week_injuries(
         {"season": str(int(season)), "week": str(int(week))},
         refresh=refresh,
         cache_day=cache_day,
+    )
+
+
+def fetch_injury_snapshots(
+    *,
+    season: int,
+    week: int | None = None,
+    weeks: list[int] | None = None,
+    team: str | None = None,
+    gsis_id: str | None = None,
+    status: str | None = None,
+    refresh: bool = False,
+    cache_day: date | None = None,
+    as_of: str | None = None,
+) -> tuple[list[dict], dict]:
+    """`dataset=injury_snapshots`. `season` is required.
+
+    Filters match ``injuries`` (``week``, ``team``, ``gsis_id``, ``status``).
+    ``as_of`` returns the latest row per player-week at or before that time.
+    Rows with ``is_baseline`` true are seeded copies, not scrape times.
+    """
+    if int(season) < 1:
+        raise GangstashDataError("gangstash injury_snapshots requires season")
+    week_list = list(weeks) if weeks else ([int(week)] if week is not None else [])
+    params: dict[str, str] = {"season": str(int(season))}
+    if week_list:
+        params["week"] = ",".join(str(int(w)) for w in week_list)
+    if team:
+        params["team"] = team.strip().upper()
+    if gsis_id:
+        params["gsis_id"] = gsis_id.strip()
+    if status:
+        params["status"] = status.strip()
+    return fetch_dataset(
+        dataset_id("injury_snapshots"),
+        params,
+        refresh=refresh,
+        cache_day=cache_day,
+        as_of=as_of,
     )
 
 
@@ -1093,6 +1223,72 @@ def fetch_props_closing(
         params["prop"] = str(prop).strip()
     return fetch_dataset(
         dataset_id("props_closing"),
+        params,
+        refresh=refresh,
+        cache_day=cache_day,
+    )
+
+
+def fetch_props_snapshots(
+    *,
+    season: int,
+    week: int | None = None,
+    weeks: list[int] | None = None,
+    player: str | None = None,
+    team: str | None = None,
+    prop: str | None = None,
+    refresh: bool = False,
+    cache_day: date | None = None,
+    as_of: str | None = None,
+) -> tuple[list[dict], dict]:
+    """`dataset=props_snapshots`. `season` is required.
+
+    Optional: ``week``, ``player``, ``team``, ``prop``. Without ``as_of``
+    the payload is full history. With ``as_of`` it is the latest line per
+    player and prop at or before that time.
+    """
+    if int(season) < 1:
+        raise GangstashDataError("gangstash props_snapshots requires season")
+    week_list = list(weeks) if weeks else ([int(week)] if week is not None else [])
+    params: dict[str, str] = {"season": str(int(season))}
+    if week_list:
+        params["week"] = ",".join(str(int(w)) for w in week_list)
+    if player:
+        params["player"] = str(player).strip()
+    if team:
+        params["team"] = str(team).strip().upper()
+    if prop:
+        params["prop"] = str(prop).strip()
+    return fetch_dataset(
+        dataset_id("props_snapshots"),
+        params,
+        refresh=refresh,
+        cache_day=cache_day,
+        as_of=as_of,
+    )
+
+
+def fetch_collector_runs(
+    *,
+    collector: str | None = None,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    refresh: bool = False,
+    cache_day: date | None = None,
+) -> tuple[list[dict], dict]:
+    """`dataset=collector_runs`. ``date_from`` and ``date_to`` are UTC days.
+
+    ``season`` and ``week`` are not sent. ``as_of`` is not valid here.
+    """
+    params: dict[str, str] = {}
+    if collector:
+        params["collector"] = collector.strip()
+    if date_from:
+        params["date_from"] = date_from.strip()
+    if date_to:
+        params["date_to"] = date_to.strip()
+    return fetch_dataset(
+        dataset_id("collector_runs"),
         params,
         refresh=refresh,
         cache_day=cache_day,

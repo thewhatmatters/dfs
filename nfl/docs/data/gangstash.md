@@ -13,11 +13,32 @@ The server also accepts `Authorization: Bearer`. This client sends
 `x-api-key` only. Never put the key in the URL. Never send a Supabase
 service-role key.
 
-Response: `{ "data": [ ... ], "truncated": bool }`. Each page is 1,000 rows.
+Response: `{ "data": [ ... ], "truncated": bool, "meta": { ... } }`.
+`data` and `truncated` are unchanged. `meta` is data API v12: `dataset`,
+`as_of` (UTC echo of the query, or null), `row_count`, `timestamp_column`,
+`observed_at` (max capture or update time among returned rows),
+`untimestamped` (true when legacy 2024 depth rows are present), and
+`includes_baseline` on `injury_snapshots` only. The client keeps the old
+caller keys (`cache`, `cache_stale`, `truncated`, `live`, `dataset`) and
+puts the server object on `response_meta`. A cache written before `meta`
+existed loads with `response_meta: {}`. Paged responses join `row_count`
+to the total rows, take the newest `observed_at`, and OR `untimestamped`
+and `includes_baseline`.
+
+`as_of` is an ISO-8601 query param (no offset means UTC). The server
+accepts it only on `game_line_snapshots`, `props_snapshots`,
+`depth_charts`, `depth_charts_weekly`, and `injury_snapshots`, and returns
+the latest row per key at or before that time. The client refuses `as_of`
+on any other dataset before the request (`GangstashDataError`). It is part
+of the cache query slug. Snapshot datasets without `as_of` return full
+history.
+
+Each page is 1,000 rows.
 `truncated=true` means another page exists. The client follows `offset=1000`,
 `offset=2000`, … and caches the joined board. A result still truncated at
-20,000 rows is a hard stop and is not cached. `400` is an unknown dataset or
-a missing required param. `401` is no key.
+20,000 rows is a hard stop and is not cached. `400` is an unknown dataset,
+a missing required param, or `as_of` on a dataset that does not accept it.
+`401` is no key.
 
 Same-day cache: `nfl/data/gangstash-data/YYYY-MM-DD/<dataset>/<query>.json`
 (gitignored). A same-day file skips the network. If the live call fails or
@@ -82,6 +103,10 @@ python3 -m nfl.gangstash_data team-stats-weekly --season 2026 --week 1,2
 | `GANGSTASH_DST_WEEKLY_DATASET` | `dst_weekly` | `dataset=` value |
 | `GANGSTASH_PLAYER_USAGE_DATASET` | `player_usage` | `dataset=` value |
 | `GANGSTASH_PROPS_CLOSING_DATASET` | `props_closing` | `dataset=` value |
+| `GANGSTASH_GAME_LINE_SNAPSHOTS_DATASET` | `game_line_snapshots` | `dataset=` value |
+| `GANGSTASH_PROPS_SNAPSHOTS_DATASET` | `props_snapshots` | `dataset=` value |
+| `GANGSTASH_INJURY_SNAPSHOTS_DATASET` | `injury_snapshots` | `dataset=` value |
+| `GANGSTASH_COLLECTOR_RUNS_DATASET` | `collector_runs` | `dataset=` value |
 
 ## Queries this client sends
 
@@ -98,6 +123,10 @@ python3 -m nfl.gangstash_data team-stats-weekly --season 2026 --week 1,2
 | `dst_weekly` | `season` (required), optional `week`, optional `team` | DEF actuals for the backtest. Join is `(season, week, team)`. `fd_points` is the FanDuel score |
 | `player_usage` | `season` required; `week`, `team`, `gsis_id`, `position` optional | one row per player-week. The sim feed sends season and the prior-week list only |
 | `props_closing` | `season` required; `week`, `player`, `team`, `prop` optional | last pre-kickoff BettingPros line per player and prop. Starts 2026 week 3. The holdout turns pass/rush/rec yards, receptions, and TD lines into FanDuel points. An empty or unknown dataset is skipped |
+| `game_line_snapshots` | `season` required; optional `week`; optional `as_of` | append-only line history, one row per `(game_id, book, market)`. `as_of` is the latest row per key at or before that time. Without `as_of` the payload is full history. `nfl.publish_projections --as-of` keeps `book=consensus` and maps `home_line` to `spread` (negative = home favored), `total`, and moneyline prices into the `game_lines` shape |
+| `props_snapshots` | `season` required; optional `week`, `player`, `team`, `prop`, `as_of` | BettingPros prop history. `as_of` is the latest line per player and prop. Publish copies `captured_at` onto `scraped_at` so the existing prop order still applies |
+| `injury_snapshots` | `season` required; same filters as `injuries` (`week`, `team`, `gsis_id`, `status`); optional `as_of` | append-only. Rows use `full_name` and `report_status`. `is_baseline=true` rows are seeded copies, not scrape times. Publish drops them before scoring and does not treat their timestamps as `observed_at` |
+| `collector_runs` | optional `collector`, `date_from`, `date_to` (inclusive UTC days of `started_at`) | `run_id`, `collector`, `started_at`, `finished_at`, `status`, `row_counts`, `git_sha`, `args`. `as_of`, `season`, and `week` are not sent. `as_of` on this dataset is a client error |
 | `snaps` | `season` (required), `week` (single or `1,2`), optional `position` (`WR`/`TE`/`RB`), `team` (FD or nflverse; `JAC` and `JAX` both work) | 2026 weeks 1–2 are 2,994 rows (185 RB, 335 WR, 220 TE). `offense_pct` is a 0–1 fraction |
 
 ## Response fields
@@ -201,12 +230,17 @@ with no skill rows is the same choke. `--skip-depth` still leaves the
 unlisted prior.
 
 **`depth_charts_weekly`** is the same chart plus `season`, `week`,
-`game_type`, `game_id`, `opponent`, `kickoff_at`, and `team_fd`. Each row
-is the last chart strictly before that game's kickoff, so it exists only
-after kickoff. `nfl.backtest` uses it for the target week. A missing
+`game_type`, `game_id`, `opponent`, `kickoff_at`, and `team_fd`. Without
+`as_of`, each row is the last chart strictly before that game's kickoff,
+so it exists only after kickoff. With `as_of`, the server includes games
+that have not kicked off and caps ESPN snapshots at that time. Legacy
+`nflverse_weekly` rows have a null `snapshot_at` and set
+`meta.untimestamped`. `nfl.backtest` uses it for the target week. A missing
 weekly payload is `missing: depth_charts_weekly` and the backtest falls
-back to `depth_charts`. Live and nightly projections stay on
-`depth_charts`. The chart is ESPN via nflverse from game-day morning and
+back to `depth_charts`. The default nightly publish stays on
+`depth_charts`. `python3 -m nfl.publish_projections --as-of` reads this
+dataset at that time (`pos_grp` omitted so QBs are included; games that
+have not kicked off are included). The chart is ESPN via nflverse from game-day morning and
 does not list inactives. A few rows have no `player_id`; those match on
 name and team. The listed QB1 is the main-pool starter. The hindsight
 pool still uses the QB who actually took the snaps.

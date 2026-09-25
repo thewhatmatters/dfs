@@ -52,9 +52,9 @@ def load_week_injuries(
 ):
     """Current-week ``dataset=injuries`` rows and cache meta.
 
-    Point-in-time ``injury_snapshots`` (an ``as_of`` read that skips
-    ``is_baseline``) is not on this revision. The nightly path uses the
-    week feed. Rows stay raw.
+    ``nfl.publish_projections --as-of`` reads ``injury_snapshots`` itself
+    and drops ``is_baseline`` rows. This helper stays the live week feed.
+    Rows stay raw.
     """
     from nfl.gangstash_data import fetch_week_injuries
 

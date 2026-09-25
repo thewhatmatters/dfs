@@ -27,7 +27,12 @@ from nfl.http import HttpAuthError, HttpError
 from nfl.gangstash_data import (
     aggregate_snap_window,
     aggregate_target_window,
+    consensus_game_lines,
+    fetch_collector_runs,
+    fetch_game_line_snapshots,
     fetch_game_lines,
+    fetch_injury_snapshots,
+    fetch_props_snapshots,
     fetch_snaps,
     fetch_targets,
     fetch_team_stats,
@@ -1365,6 +1370,234 @@ class PagingTest(unittest.TestCase):
                     )
             self.assertIn("401", str(ctx.exception))
             self.assertEqual(list(root.rglob("*.json")), [])
+
+
+class PointInTimeReaderTest(unittest.TestCase):
+    def test_meta_is_returned_and_cached(self) -> None:
+        day = date(2026, 9, 24)
+
+        def fake_http(url, headers=None, timeout=30):
+            return {
+                "data": [{"player_name": "A"}],
+                "truncated": False,
+                "meta": {
+                    "dataset": "targets",
+                    "as_of": None,
+                    "row_count": 1,
+                    "timestamp_column": "scraped_at",
+                    "observed_at": "2026-09-24T12:00:00Z",
+                    "untimestamped": False,
+                },
+            }, {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            with patch("nfl.gangstash.envmod.get", side_effect=_env_get), patch(
+                "nfl.gangstash.http_json", side_effect=fake_http
+            ):
+                rows, meta = fetch_dataset(
+                    "targets",
+                    {"season": "2026"},
+                    cache_day=day,
+                    cache_root=root,
+                    refresh=True,
+                )
+            cached = json.loads(Path(meta["cache"]).read_text(encoding="utf-8"))
+        self.assertEqual(rows[0]["player_name"], "A")
+        self.assertEqual(meta["dataset"], "targets")
+        self.assertFalse(meta["truncated"])
+        self.assertEqual(meta["response_meta"]["observed_at"], "2026-09-24T12:00:00+00:00")
+        self.assertFalse(meta["response_meta"]["untimestamped"])
+        self.assertEqual(meta["response_meta"]["row_count"], 1)
+        self.assertEqual(cached["meta"]["row_count"], 1)
+
+    def test_old_cache_without_meta_still_loads(self) -> None:
+        day = date(2026, 9, 24)
+        params = {"season": "2026"}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = dataset_cache_file(root, day, "targets", params)
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                json.dumps({"data": [{"player_name": "A"}], "truncated": False}),
+                encoding="utf-8",
+            )
+            with patch("nfl.gangstash.http_json") as http:
+                rows, meta = fetch_dataset("targets", params, cache_day=day, cache_root=root)
+        http.assert_not_called()
+        self.assertEqual(rows[0]["player_name"], "A")
+        self.assertEqual(meta["response_meta"], {})
+
+    def test_paged_meta_keeps_the_newest_observed_at(self) -> None:
+        def fake_http(url, headers=None, timeout=30):
+            if "offset=" not in url:
+                return {
+                    "data": [{"player_name": "A"}],
+                    "truncated": True,
+                    "meta": {
+                        "dataset": "targets",
+                        "as_of": None,
+                        "row_count": 1,
+                        "timestamp_column": "scraped_at",
+                        "observed_at": "2026-09-24T01:00:00Z",
+                        "untimestamped": False,
+                    },
+                }, {}
+            return {
+                "data": [{"player_name": "B"}],
+                "truncated": False,
+                "meta": {
+                    "dataset": "targets",
+                    "as_of": None,
+                    "row_count": 1,
+                    "timestamp_column": "scraped_at",
+                    "observed_at": "2026-09-24T18:00:00Z",
+                    "untimestamped": True,
+                },
+            }, {}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("nfl.gangstash.envmod.get", side_effect=_env_get), patch(
+                "nfl.gangstash.http_json", side_effect=fake_http
+            ):
+                rows, meta = fetch_dataset(
+                    "targets",
+                    {"season": "2026"},
+                    cache_day=date(2026, 9, 24),
+                    cache_root=Path(tmp),
+                    refresh=True,
+                )
+        self.assertEqual([row["player_name"] for row in rows], ["A", "B"])
+        self.assertEqual(meta["response_meta"]["row_count"], 2)
+        self.assertEqual(meta["response_meta"]["observed_at"], "2026-09-24T18:00:00+00:00")
+        self.assertTrue(meta["response_meta"]["untimestamped"])
+
+    def test_as_of_on_targets_is_refused_before_http(self) -> None:
+        with patch("nfl.gangstash.http_json") as http:
+            with self.assertRaises(GangstashDataError) as ctx:
+                fetch_dataset(
+                    "targets",
+                    {"season": "2026"},
+                    as_of="2026-09-25T12:00:00",
+                    refresh=True,
+                )
+        http.assert_not_called()
+        self.assertIn("as_of", str(ctx.exception))
+        self.assertIn("targets", str(ctx.exception))
+
+    def test_as_of_is_sent_on_a_snapshot_dataset(self) -> None:
+        calls: list[str] = []
+
+        def fake_http(url, headers=None, timeout=30):
+            calls.append(url)
+            name = "unknown"
+            if "dataset=" in url:
+                name = url.split("dataset=", 1)[1].split("&", 1)[0]
+            return {
+                "data": [],
+                "truncated": False,
+                "meta": {
+                    "dataset": name,
+                    "as_of": "2026-09-25T12:00:00.000Z",
+                    "row_count": 0,
+                    "timestamp_column": "captured_at",
+                    "observed_at": None,
+                    "untimestamped": False,
+                },
+            }, {}
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "nfl.gangstash.DATA_CACHE_DIR", Path(tmp)
+        ), patch("nfl.gangstash.envmod.get", side_effect=_env_get), patch(
+            "nfl.gangstash.http_json", side_effect=fake_http
+        ):
+            rows, meta = fetch_game_line_snapshots(
+                season=2026,
+                week=3,
+                as_of="2026-09-25T12:00:00",
+                refresh=True,
+                cache_day=date(2026, 9, 25),
+            )
+            props, _pmeta = fetch_props_snapshots(
+                season=2026,
+                week=3,
+                player="Patrick Mahomes",
+                as_of="2026-09-25T12:00:00Z",
+                refresh=True,
+                cache_day=date(2026, 9, 25),
+            )
+            injuries, imeta = fetch_injury_snapshots(
+                season=2026,
+                week=3,
+                as_of="2026-09-25T16:00:00+00:00",
+                refresh=True,
+                cache_day=date(2026, 9, 25),
+            )
+            runs, _rmeta = fetch_collector_runs(
+                collector="bettingpros-odds",
+                date_to="2026-09-25",
+                refresh=True,
+                cache_day=date(2026, 9, 25),
+            )
+        self.assertEqual(rows, [])
+        self.assertEqual(props, [])
+        self.assertEqual(injuries, [])
+        self.assertEqual(runs, [])
+        self.assertIn("dataset=game_line_snapshots", calls[0])
+        self.assertIn("as_of=2026-09-25T12%3A00%3A00%2B00%3A00", calls[0])
+        self.assertIn("week=3", calls[0])
+        self.assertIn("dataset=props_snapshots", calls[1])
+        self.assertIn("player=Patrick", calls[1])
+        self.assertIn("dataset=injury_snapshots", calls[2])
+        self.assertEqual(imeta["response_meta"]["dataset"], "injury_snapshots")
+        self.assertIn("dataset=collector_runs", calls[3])
+        self.assertIn("collector=bettingpros-odds", calls[3])
+        self.assertIn("date_to=2026-09-25", calls[3])
+        self.assertNotIn("as_of=", calls[3])
+        self.assertIsNone(meta["response_meta"]["observed_at"])
+
+    def test_consensus_lines_keep_the_home_spread_sign(self) -> None:
+        lines = consensus_game_lines(
+            [
+                {
+                    "game_id": "gid",
+                    "season": 2026,
+                    "week": 3,
+                    "kickoff_at": "2026-09-20T17:00:00Z",
+                    "home_team_fd": "BUF",
+                    "away_team_fd": "KC",
+                    "book": "consensus",
+                    "market": "spread",
+                    "home_line": -3.5,
+                    "captured_at": "2026-09-20T12:00:00Z",
+                },
+                {
+                    "game_id": "gid",
+                    "season": 2026,
+                    "week": 3,
+                    "kickoff_at": "2026-09-20T17:00:00Z",
+                    "home_team_fd": "BUF",
+                    "away_team_fd": "KC",
+                    "book": "consensus",
+                    "market": "total",
+                    "total": 47.5,
+                    "captured_at": "2026-09-20T12:00:00Z",
+                },
+                {
+                    "game_id": "gid",
+                    "season": 2026,
+                    "week": 3,
+                    "book": "draftkings",
+                    "market": "spread",
+                    "home_line": -4.5,
+                },
+            ]
+        )
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["spread"], -3.5)
+        self.assertEqual(lines[0]["total"], 47.5)
+        self.assertEqual(lines[0]["commence_time"], "2026-09-20T17:00:00Z")
+        self.assertEqual(lines[0]["home_team_fd"], "BUF")
 
 
 @unittest.skipUnless(

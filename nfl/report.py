@@ -551,6 +551,7 @@ def build_report(
     run_at: str | None,
     draws: int | None,
     efficiency: str | None,
+    notes: list | None = None,
 ) -> str:
     """Render the nightly report. ``games`` is sim bands, raw draws, or vegas totals."""
     shown = projection_rows(list(rows or []))
@@ -576,6 +577,9 @@ def build_report(
         lines.append("")
         lines.append(_fence(_position_table(title, _ranked(shown, pos), limit)))
     lines.append("")
+    if notes:
+        lines.append("stale inputs: " + "; ".join(str(note) for note in notes))
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -599,6 +603,7 @@ def write_report(
     draws: int | None,
     efficiency: str | None,
     dest: Path | None = None,
+    notes: list | None = None,
 ) -> Path:
     text = build_report(
         rows,
@@ -608,6 +613,7 @@ def write_report(
         run_at=run_at,
         draws=draws,
         efficiency=efficiency,
+        notes=notes,
     )
     path = report_path(season, week, run_at, dest)
     path.parent.mkdir(parents=True, exist_ok=True)

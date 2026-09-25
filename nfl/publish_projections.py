@@ -26,17 +26,24 @@ There is no other read source. `--refresh` (the default) does not
 fall back to a cache when the key is missing.
 `--report` writes `nfl/reports/<season>-w<week>-<date>.md` after a
 successful POST or `--dry-run` and prints that path.
+Every successful run also writes
+`nfl/reports/<season>-w<week>-<date>.manifest.json` (git sha, dirty
+flag, seed, draws, as_of, CLI args, per-dataset freshness, input run
+ids, Python version). `--as-of` defaults to the run start and keeps
+the current reads. An explicit `--as-of` reads snapshot datasets.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
+import platform
 import subprocess
 import sys
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -48,14 +55,24 @@ from nfl.gangstash import (
     GangstashDataKeyMissing,
     GangstashError,
     GangstashKeyMissing,
+    normalize_as_of,
 )
 from nfl.gangstash_data import (
     aggregate_snap_window,
     aggregate_target_window,
+    consensus_game_lines,
+    fetch_collector_runs,
     fetch_depth_charts,
+    fetch_depth_charts_weekly,
+    fetch_game_line_snapshots,
     fetch_game_lines,
+    fetch_injury_snapshots,
+    fetch_player_stats_weekly,
+    fetch_player_usage,
+    fetch_props_snapshots,
     fetch_snaps,
     fetch_targets,
+    fetch_team_stats,
 )
 from nfl.http import HttpError, http_json_post
 from nfl.injuries import apply_projection_injuries, is_pool_out
@@ -102,7 +119,26 @@ ROW_FIELDS = (
     "p50",
     "p90",
     "inputs",
+    "as_of",
+    "input_run_ids",
 )
+
+# Latest succeeded collector_runs row for each command that feeds a publish.
+# Names match dagg `runlog.Config.Collector` (the cmd directory).
+FEED_COLLECTORS = (
+    "bettingpros-odds",
+    "bettingpros-pbcs",
+    "nflverse-depth-charts",
+    "nflverse-depth-charts-weekly",
+    "nflverse-injuries",
+    "nflverse-player-stats",
+    "nflverse-player-usage",
+    "nflverse-snaps",
+    "nflverse-targets",
+    "nflverse-team-stats",
+)
+MAX_INPUT_RUN_IDS = 100
+STALE_HOURS = 36
 
 
 class PublishError(Exception):
@@ -115,6 +151,25 @@ class ProjectionsKeyMissing(PublishError):
 
 class StaleInputs(PublishError):
     """Game lines or depth are missing or from a stale cache."""
+
+
+@dataclass
+class DatasetRecord:
+    """Rows that were scored, plus the server freshness flags."""
+
+    rows: list
+    observed_at: str | None = None
+    untimestamped: bool = False
+
+
+class RunCapture:
+    """Provenance for one publish. ``datasets`` is keyed by dataset name."""
+
+    def __init__(self) -> None:
+        self.datasets = {}
+        self.line_rows = []
+        self.input_run_ids = []
+        self.point_in_time = False
 
 
 @dataclass(frozen=True)
@@ -360,6 +415,211 @@ def sim_parts(sim: SimResult | tuple | dict | None) -> tuple[dict | None, str, t
     return by_pid, str(mode), tuple(draws)
 
 
+def _parse_utc(value: object) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    try:
+        stamp = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    return stamp.astimezone(timezone.utc)
+
+
+def _remember(
+    capture: RunCapture,
+    name: str,
+    rows: list,
+    meta: dict | None,
+    *,
+    observed_at: str | None = None,
+    normalized: list | None = None,
+    observed_set: bool = False,
+) -> None:
+    """Keep the rows that were scored and the server freshness flags.
+
+    ``observed_set`` uses ``observed_at`` even when it is None, so a
+    baseline-only injury snapshot does not claim the seed time.
+    """
+    server = {}
+    if isinstance(meta, dict):
+        raw = meta.get("response_meta")
+        if isinstance(raw, dict):
+            server = raw
+    used = list(rows if normalized is None else normalized)
+    if observed_set:
+        obs = observed_at
+    else:
+        obs = observed_at if observed_at is not None else server.get("observed_at")
+    if obs is not None:
+        obs = str(obs)
+    flag = bool(server.get("untimestamped"))
+    prev = capture.datasets.get(name)
+    if prev is None:
+        capture.datasets[name] = DatasetRecord(
+            rows=used,
+            observed_at=obs,
+            untimestamped=flag,
+        )
+        return
+    prev.rows.extend(used)
+    prev.untimestamped = bool(prev.untimestamped or flag)
+    if obs:
+        previous = _parse_utc(prev.observed_at)
+        current = _parse_utc(obs)
+        if previous is None or (current is not None and current > previous):
+            prev.observed_at = obs
+
+
+def canonical_sha256(rows: list) -> str:
+    """sha256 of rows as canonical JSON (sorted keys, sorted rows)."""
+    encoded = [
+        json.dumps(row, sort_keys=True, separators=(",", ":"), default=str)
+        for row in rows
+        if isinstance(row, dict)
+    ]
+    encoded.sort()
+    payload = "[" + ",".join(encoded) + "]"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def dataset_manifest(capture: RunCapture) -> dict:
+    out = {}
+    for name in sorted(capture.datasets):
+        record = capture.datasets[name]
+        out[name] = {
+            "row_count": len(record.rows),
+            "observed_at": record.observed_at,
+            "sha256": canonical_sha256(record.rows),
+            "untimestamped": bool(record.untimestamped),
+        }
+    return out
+
+
+def freshness_warnings(capture: RunCapture, *, now: datetime) -> list[str]:
+    """Datasets whose capture time is older than 36h, or legacy untimestamped rows."""
+    moment = now if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    moment = moment.astimezone(timezone.utc)
+    lines: list[str] = []
+    for name in sorted(capture.datasets):
+        record = capture.datasets[name]
+        if record.untimestamped:
+            lines.append(f"{name} untimestamped")
+        observed = _parse_utc(record.observed_at)
+        if observed is None:
+            continue
+        age = moment - observed
+        if age > timedelta(hours=STALE_HOURS):
+            lines.append(f"{name} observed_at {record.observed_at} is older than 36h")
+    return lines
+
+
+def select_input_run_ids(rows: list, *, as_of: datetime) -> list[str]:
+    """Latest succeeded run at or before ``as_of`` for each feed collector.
+
+    ``finished_at`` is the cutoff: a run that had not finished was not
+    knowable. At most ``MAX_INPUT_RUN_IDS`` ids, in collector-name order.
+    """
+    cutoff = as_of if as_of.tzinfo else as_of.replace(tzinfo=timezone.utc)
+    cutoff = cutoff.astimezone(timezone.utc)
+    wanted = set(FEED_COLLECTORS)
+    best: dict[str, tuple] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("status") or "") != "succeeded":
+            continue
+        collector = str(row.get("collector") or "")
+        if collector not in wanted:
+            continue
+        finished = _parse_utc(row.get("finished_at"))
+        if finished is None or finished > cutoff:
+            continue
+        started = _parse_utc(row.get("started_at")) or finished
+        run_id = str(row.get("run_id") or "").strip().lower()
+        if not run_id:
+            continue
+        rank = (finished, started, run_id)
+        prev = best.get(collector)
+        if prev is None or rank > prev[0]:
+            best[collector] = (rank, run_id)
+    ids = [best[name][1] for name in FEED_COLLECTORS if name in best]
+    return ids[:MAX_INPUT_RUN_IDS]
+
+
+def git_state() -> tuple[str, bool]:
+    """Full HEAD sha and whether the worktree is dirty."""
+    root = Path(__file__).resolve().parent.parent
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=root,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        sha = "unknown"
+    try:
+        dirty_out = subprocess.check_output(
+            ["git", "status", "--porcelain"],
+            cwd=root,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        )
+        dirty = bool(dirty_out.strip())
+    except (OSError, subprocess.CalledProcessError):
+        dirty = False
+    return sha or "unknown", dirty
+
+
+def build_manifest(
+    capture: RunCapture,
+    *,
+    seed: int,
+    draws: int,
+    as_of: str,
+    cli_args: list,
+) -> dict:
+    sha, dirty = git_state()
+    return {
+        "git_sha": sha,
+        "dirty": dirty,
+        "seed": int(seed),
+        "draws": int(draws),
+        "as_of": as_of,
+        "cli_args": list(cli_args),
+        "datasets": dataset_manifest(capture),
+        "input_run_ids": list(capture.input_run_ids),
+        "python": platform.python_version(),
+        "point_in_time": bool(capture.point_in_time),
+    }
+
+
+def manifest_path(season: int, week: int, run_at: str, root: Path | None = None) -> Path:
+    from nfl.report import REPORTS_DIR, report_day
+
+    dest = root or REPORTS_DIR
+    return dest / f"{int(season)}-w{int(week)}-{report_day(run_at)}.manifest.json"
+
+
+def write_manifest(
+    payload: dict,
+    *,
+    season: int,
+    week: int,
+    run_at: str,
+    dest: Path | None = None,
+) -> Path:
+    path = manifest_path(season, week, run_at, dest)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
 def _stale(meta: dict, label: str) -> None:
     if meta.get("cache_stale"):
         raise StaleInputs(f"{label} cache is stale")
@@ -409,6 +669,80 @@ def resolve_nfl_week(
             f"game_lines returned {got_season} week {got_week}, expected {season} week {week}"
         )
     return int(season), int(week), rows
+
+
+def _kickoff_et_day(row: dict) -> date | None:
+    stamp = _parse_utc(row.get("commence_time") or row.get("kickoff_at"))
+    if stamp is None:
+        return None
+    return stamp.astimezone(ET).date()
+
+
+def _season_guess(day: date) -> int:
+    """NFL season year. January and February belong to the previous season."""
+    return day.year if day.month >= 3 else day.year - 1
+
+
+def resolve_nfl_week_as_of(
+    today: date,
+    *,
+    refresh: bool,
+    as_of: str,
+    season: int | None = None,
+    week: int | None = None,
+) -> tuple[int, int, list[dict], dict]:
+    """Week from ``game_line_snapshots`` at ``as_of``, collapsed to consensus lines."""
+    if (season is None) ^ (week is None):
+        raise PublishError("pass both --season and --week")
+    if season is not None and week is not None:
+        rows, meta = fetch_game_line_snapshots(
+            season=int(season),
+            week=int(week),
+            refresh=refresh,
+            as_of=as_of,
+        )
+        _stale(meta, f"game_line_snapshots {season} week {week}")
+        lines = consensus_game_lines(rows)
+        if not lines:
+            raise StaleInputs(f"no game_line_snapshots for {season} week {week} at {as_of}")
+        got_season, got_week = _week_from_rows(lines)
+        if got_season != int(season) or got_week != int(week):
+            raise StaleInputs(
+                f"game_line_snapshots returned {got_season} week {got_week}, "
+                f"expected {season} week {week}"
+            )
+        return int(season), int(week), lines, meta
+
+    guesses = [_season_guess(today)]
+    other = today.year if guesses[0] != today.year else today.year - 1
+    if other not in guesses:
+        guesses.append(other)
+    last_meta: dict = {}
+    for guess in guesses:
+        rows, meta = fetch_game_line_snapshots(season=int(guess), refresh=refresh, as_of=as_of)
+        last_meta = meta
+        if meta.get("cache_stale"):
+            continue
+        lines = consensus_game_lines(rows)
+        deltas = list(range(0, 8)) + list(range(-1, -7, -1))
+        for delta in deltas:
+            day = today + timedelta(days=delta)
+            anchor = [row for row in lines if _kickoff_et_day(row) == day]
+            if not anchor:
+                continue
+            found_season, found_week = _week_from_rows(anchor)
+            week_lines = [
+                row
+                for row in lines
+                if int(row.get("season") or 0) == found_season
+                and int(row.get("week") or 0) == found_week
+            ]
+            if not week_lines:
+                continue
+            return found_season, found_week, week_lines, meta
+    if last_meta.get("cache_stale"):
+        raise StaleInputs("game_line_snapshots cache is stale")
+    raise StaleInputs(f"no game_line_snapshots near {today.isoformat()} at {as_of}")
 
 
 def _team_lines(rows: list[dict]) -> dict[str, tuple[TeamLine, str | None]]:
@@ -931,6 +1265,8 @@ def _row(
     p50: float | None,
     p90: float | None,
     sim_efficiency: str | None = None,
+    as_of: str | None = None,
+    input_run_ids: list | None = None,
 ) -> dict:
     pl = entry.player
     return {
@@ -953,6 +1289,8 @@ def _row(
         "p50": None if p50 is None else round(float(p50), 4),
         "p90": None if p90 is None else round(float(p90), 4),
         "inputs": _inputs(pl, entry, sim_efficiency=sim_efficiency),
+        "as_of": as_of,
+        "input_run_ids": list(input_run_ids or []),
     }
 
 
@@ -966,6 +1304,8 @@ def projection_rows(
     model_version: str,
     sim_by_pid: dict | None = None,
     sim_efficiency: str = "data",
+    as_of: str | None = None,
+    input_run_ids: list | None = None,
 ) -> list[dict]:
     rows: list[dict] = []
     for entry in entries:
@@ -983,6 +1323,8 @@ def projection_rows(
                 p10=None,
                 p50=None,
                 p90=None,
+                as_of=as_of,
+                input_run_ids=input_run_ids,
             )
         )
     if not sim_by_pid:
@@ -1009,6 +1351,8 @@ def projection_rows(
                 p50=float(stats.p50),
                 p90=float(stats.p90),
                 sim_efficiency=sim_efficiency,
+                as_of=as_of,
+                input_run_ids=input_run_ids,
             )
         )
     if missing:
@@ -1044,6 +1388,7 @@ def write_local(rows: list[dict], dest_dir: Path, stem: str) -> tuple[Path, Path
         for row in rows:
             flat = dict(row)
             flat["inputs"] = json.dumps(row.get("inputs") or {}, separators=(",", ":"))
+            flat["input_run_ids"] = json.dumps(row.get("input_run_ids") or [], separators=(",", ":"))
             writer.writerow(flat)
     return json_path, csv_path
 
@@ -1075,9 +1420,161 @@ def _load_depth(refresh: bool) -> tuple[list[dict], dict]:
             extra, meta_q = fetch_depth_charts(position="QB", pos_grp=None, refresh=refresh)
             _stale(meta_q, "depth_charts QB")
             rows = list(rows) + list(extra)
+            meta = _merge_fetch_meta(meta, meta_q)
     if not rows:
         raise StaleInputs("no depth_charts rows")
     return rows, meta
+
+
+def _call_depth_weekly(season: int, week: int, refresh: bool, as_of: str, **kwargs):
+    return fetch_depth_charts_weekly(
+        season=int(season),
+        week=int(week),
+        position=kwargs.get("position"),
+        pos_grp=kwargs.get("pos_grp"),
+        refresh=refresh,
+        as_of=as_of,
+    )
+
+
+def _load_depth_weekly(
+    season: int,
+    week: int,
+    refresh: bool,
+    as_of: str,
+) -> tuple[list[dict], dict]:
+    """Chart in force at ``as_of``, including games that have not kicked off."""
+    try:
+        rows, meta = _call_depth_weekly(season, week, refresh, as_of, pos_grp=None)
+    except GangstashDataError as e:
+        rows = []
+        meta = {"cache_stale": False, "response_meta": {}}
+        for pos in SKILL_POSITIONS:
+            chunk, meta = _call_depth_weekly(
+                season, week, refresh, as_of, position=pos, pos_grp=None
+            )
+            _stale(meta, f"depth_charts_weekly {pos}")
+            rows.extend(chunk)
+        if not rows:
+            raise PublishError(str(e)) from e
+    else:
+        _stale(meta, "depth_charts_weekly")
+        if not _has_qb(rows):
+            extra, meta_q = _call_depth_weekly(
+                season, week, refresh, as_of, position="QB", pos_grp=None
+            )
+            _stale(meta_q, "depth_charts_weekly QB")
+            rows = list(rows) + list(extra)
+            meta = _merge_fetch_meta(meta, meta_q)
+    if not rows:
+        raise StaleInputs("no depth_charts_weekly rows")
+    return _uniquify_legacy_ranks(rows), meta
+
+
+def _merge_fetch_meta(left: dict, right: dict) -> dict:
+    """Keep both server metas' freshness when a QB chart is appended."""
+    merged = dict(left)
+    left_server = dict(left.get("response_meta") or {})
+    right_server = dict(right.get("response_meta") or {})
+    if not left_server and not right_server:
+        return merged
+    observed = [
+        stamp
+        for stamp in (
+            _parse_utc(left_server.get("observed_at")),
+            _parse_utc(right_server.get("observed_at")),
+        )
+        if stamp is not None
+    ]
+    server = dict(left_server or right_server)
+    if observed:
+        server["observed_at"] = max(observed).replace(microsecond=0).isoformat()
+    server["untimestamped"] = bool(
+        left_server.get("untimestamped") or right_server.get("untimestamped")
+    )
+    if "includes_baseline" in left_server or "includes_baseline" in right_server:
+        server["includes_baseline"] = bool(
+            left_server.get("includes_baseline") or right_server.get("includes_baseline")
+        )
+    merged["response_meta"] = server
+    merged["cache_stale"] = bool(left.get("cache_stale") or right.get("cache_stale"))
+    return merged
+
+
+def _uniquify_legacy_ranks(rows: list[dict]) -> list[dict]:
+    """Rewrite tied 2024 weekly ranks to 1..n. ESPN charts stay as published."""
+    if not any(isinstance(row, dict) and row.get("chart_format") == "nflverse_weekly" for row in rows):
+        return rows
+    groups: dict[tuple[str, str], list[int]] = {}
+    order: list[tuple[str, str]] = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict) or row.get("chart_format") != "nflverse_weekly":
+            continue
+        team = str(row.get("team_fd") or "")
+        pos = str(row.get("pos_abb") or "").upper()
+        key = (team, pos)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(index)
+    rewritten = [dict(row) if isinstance(row, dict) else row for row in rows]
+    for key in order:
+        indexes = groups[key]
+        ranks = []
+        for index in indexes:
+            try:
+                ranks.append(int(rewritten[index].get("pos_rank")))
+            except (TypeError, ValueError):
+                ranks.append(None)
+        present = [rank for rank in ranks if rank is not None]
+        if len(present) != len(indexes) or len(present) == len(set(present)):
+            continue
+        ordered = sorted(
+            indexes,
+            key=lambda index: (
+                int(rewritten[index].get("pos_rank") or 0),
+                str(rewritten[index].get("pos_slot") or ""),
+                str(rewritten[index].get("player_name") or ""),
+            ),
+        )
+        for rank, index in enumerate(ordered, start=1):
+            rewritten[index]["pos_rank"] = rank
+    return rewritten
+
+
+def _injury_records(rows: list[dict]) -> tuple[list[dict], str | None]:
+    """Drop seeded baseline rows. ``observed_at`` is the latest real capture."""
+    kept: list[dict] = []
+    stamps: list[datetime] = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("is_baseline") is True:
+            continue
+        stamp = _parse_utc(row.get("captured_at"))
+        if stamp is not None:
+            stamps.append(stamp)
+        kept.append(
+            {
+                "season": row.get("season"),
+                "week": row.get("week"),
+                "player_name": row.get("full_name") or row.get("player_name") or row.get("name"),
+                "status": row.get("report_status") or row.get("status") or "",
+                "team_fd": row.get("team_fd") or row.get("team"),
+                "gsis_id": row.get("gsis_id"),
+                "player_id": row.get("player_id"),
+            }
+        )
+    observed = max(stamps).replace(microsecond=0).isoformat() if stamps else None
+    return kept, observed
+
+
+def _with_prop_stamp(row: dict) -> dict:
+    """``rows_to_props`` orders on ``scraped_at``. Snapshots carry ``captured_at``."""
+    if row.get("scraped_at"):
+        return row
+    copied = dict(row)
+    if copied.get("captured_at"):
+        copied["scraped_at"] = copied["captured_at"]
+    return copied
 
 
 def _optional_window(
@@ -1098,7 +1595,7 @@ def _optional_window(
         raise PublishError(str(e)) from e
 
 
-def _load_targets(season: int, refresh: bool) -> tuple[list[TargetWeekRow], list[dict]]:
+def _load_targets(season: int, refresh: bool) -> tuple[list[TargetWeekRow], list[dict], dict]:
     raw, meta = fetch_targets(season=season, weeks=None, refresh=refresh)
     _stale(meta, "targets")
     normalized = _optional_window("targets", raw, aggregate_target_window)
@@ -1117,10 +1614,10 @@ def _load_targets(season: int, refresh: bool) -> tuple[list[TargetWeekRow], list
         )
         for item in normalized
     ]
-    return rows, normalized
+    return rows, raw, meta
 
 
-def _load_snaps(season: int, refresh: bool) -> tuple[list[SnapWeekRow], list[dict]]:
+def _load_snaps(season: int, refresh: bool) -> tuple[list[SnapWeekRow], list[dict], dict]:
     raw, meta = fetch_snaps(season=season, weeks=None, refresh=refresh)
     _stale(meta, "snaps")
     normalized = _optional_window("snaps", raw, aggregate_snap_window)
@@ -1140,28 +1637,127 @@ def _load_snaps(season: int, refresh: bool) -> tuple[list[SnapWeekRow], list[dic
         )
         for item in normalized
     ]
-    return rows, normalized
+    return rows, raw, meta
 
 
-def load_slate(args: argparse.Namespace, today: date) -> tuple[int, int, list[PublishEntry]]:
-    season, week, line_rows = resolve_nfl_week(
-        today,
-        refresh=bool(args.refresh),
-        season=args.season,
-        week=args.week,
+def _load_input_run_ids(as_of: datetime, *, refresh: bool) -> tuple[list[str], dict]:
+    """One ``collector_runs`` read through ``as_of``'s UTC day."""
+    rows, meta = fetch_collector_runs(
+        date_to=as_of.astimezone(timezone.utc).date().isoformat(),
+        refresh=refresh,
     )
-    depth_rows, _depth_meta = _load_depth(bool(args.refresh))
-    target_rows, target_ids = _load_targets(season, bool(args.refresh))
-    snap_rows, snap_ids = _load_snaps(season, bool(args.refresh))
-    from nfl.sim_feed import load_week_injuries
+    _stale(meta, "collector_runs")
+    return select_input_run_ids(rows, as_of=as_of), meta
 
-    injury_rows, injury_meta = load_week_injuries(
-        season=season,
-        week=week,
-        refresh=bool(args.refresh),
+
+def _capture_sim_feeds(capture: RunCapture, season: int) -> None:
+    """Re-read the sim feeds from the same-day cache. Does not change draws."""
+    pulls = (
+        ("team_stats", lambda: fetch_team_stats(season=int(season), refresh=False)),
+        (
+            "player_stats_weekly",
+            lambda: fetch_player_stats_weekly(season=int(season), weeks=None, refresh=False),
+        ),
+        (
+            "player_usage",
+            lambda: fetch_player_usage(season=int(season), weeks=None, refresh=False),
+        ),
     )
-    _stale(injury_meta, "injuries")
+    for name, fetch in pulls:
+        try:
+            rows, meta = fetch()
+        except (GangstashDataError, GangstashDataKeyMissing):
+            continue
+        _remember(capture, name, rows, meta)
+
+
+def load_slate(
+    args: argparse.Namespace,
+    today: date,
+    *,
+    as_of: datetime | None = None,
+    point_in_time: bool = False,
+) -> tuple:
+    """Score the slate. Return ``(season, week, entries, capture)``.
+
+    The default path reads the current game lines, depth chart, props
+    board, and ``dataset=injuries``. ``point_in_time`` reads snapshot
+    datasets at ``as_of``, including ``injury_snapshots`` with baseline
+    rows excluded. Both paths drop Out/IR/NA and promote depth the same way.
+    """
+    moment = as_of or datetime.now(timezone.utc).replace(microsecond=0)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    moment = moment.astimezone(timezone.utc).replace(microsecond=0)
+    as_of_text = normalize_as_of(moment.isoformat())
+    capture = RunCapture()
+    capture.point_in_time = bool(point_in_time)
+    refresh = bool(args.refresh)
+    if point_in_time:
+        season, week, line_rows, line_meta = resolve_nfl_week_as_of(
+            today,
+            refresh=refresh,
+            as_of=as_of_text,
+            season=args.season,
+            week=args.week,
+        )
+        _remember(capture, "game_line_snapshots", line_rows, line_meta)
+        depth_rows, depth_meta = _load_depth_weekly(season, week, refresh, as_of_text)
+        _remember(capture, "depth_charts_weekly", depth_rows, depth_meta)
+    else:
+        season, week, line_rows = resolve_nfl_week(
+            today,
+            refresh=refresh,
+            season=args.season,
+            week=args.week,
+        )
+        # Score the rows resolve just returned. A second read is only for
+        # meta, and only replaces the board when it is the same payload.
+        cached_rows, line_meta = fetch_game_lines(
+            season=season,
+            week=week,
+            refresh=False,
+        )
+        _stale(line_meta, f"game_lines {season} week {week}")
+        if cached_rows == line_rows:
+            line_rows = cached_rows
+        _remember(capture, "game_lines", line_rows, line_meta)
+        depth_rows, depth_meta = _load_depth(refresh)
+        _remember(capture, "depth_charts", depth_rows, depth_meta)
+    capture.line_rows = list(line_rows)
+    target_rows, target_ids, target_meta = _load_targets(season, refresh)
+    _remember(capture, "targets", target_ids, target_meta)
+    snap_rows, snap_ids, snap_meta = _load_snaps(season, refresh)
+    _remember(capture, "snaps", snap_ids, snap_meta)
     csv_players = load_fanduel_csv(args.csv) if args.csv else None
+    if point_in_time:
+        raw_injuries, injury_meta = fetch_injury_snapshots(
+            season=season,
+            week=week,
+            refresh=refresh,
+            as_of=as_of_text,
+        )
+        _stale(injury_meta, "injury_snapshots")
+        injury_rows, injury_observed = _injury_records(raw_injuries)
+        _remember(
+            capture,
+            "injury_snapshots",
+            injury_rows,
+            injury_meta,
+            observed_at=injury_observed,
+            normalized=injury_rows,
+            observed_set=True,
+        )
+    else:
+        from nfl.sim_feed import load_week_injuries
+
+        injury_rows, injury_meta = load_week_injuries(
+            season=season,
+            week=week,
+            refresh=refresh,
+        )
+        _stale(injury_meta, "injuries")
+        _remember(capture, "injuries", injury_rows, injury_meta)
     entries = build_entries(
         line_rows,
         depth_rows,
@@ -1173,17 +1769,41 @@ def load_slate(args: argparse.Namespace, today: date) -> tuple[int, int, list[Pu
         injury_season=season,
         injury_week=week,
     )
-    try:
-        by_pid, prop_meta = ingest_slate_props(
-            [e.player for e in entries],
-            refresh=bool(args.refresh),
+    if point_in_time:
+        prop_rows, prop_meta = fetch_props_snapshots(
+            season=season,
+            week=week,
+            refresh=refresh,
+            as_of=as_of_text,
         )
-    except PropsKeyMissing as e:
-        raise PublishError(str(e)) from e
-    except PropsError as e:
-        raise PublishError(str(e)) from e
-    if prop_meta.get("cache_stale"):
-        raise StaleInputs("props cache is stale")
+        _stale(prop_meta, "props_snapshots")
+        adapted = [_with_prop_stamp(row) for row in prop_rows if isinstance(row, dict)]
+        _remember(capture, "props_snapshots", adapted, prop_meta)
+        try:
+            by_pid, prop_stats = ingest_slate_props(
+                [e.player for e in entries],
+                rows=adapted,
+                fetch_meta=prop_meta,
+            )
+        except PropsKeyMissing as e:
+            raise PublishError(str(e)) from e
+        except PropsError as e:
+            raise PublishError(str(e)) from e
+    else:
+        try:
+            by_pid, prop_stats = ingest_slate_props(
+                [e.player for e in entries],
+                refresh=refresh,
+                keep_rows=True,
+            )
+        except PropsKeyMissing as e:
+            raise PublishError(str(e)) from e
+        except PropsError as e:
+            raise PublishError(str(e)) from e
+        if prop_stats.get("cache_stale"):
+            raise StaleInputs("props cache is stale")
+        prop_rows = list(prop_stats.pop("_rows", []) or [])
+        _remember(capture, "props", prop_rows, prop_stats)
     scored = attach_props([e.player for e in entries], by_pid)
     by_scored = {pl.pid: pl for pl in scored}
     entries = [
@@ -1211,7 +1831,14 @@ def load_slate(args: argparse.Namespace, today: date) -> tuple[int, int, list[Pu
         f"injuries out {n_out}  rows {len(injury_rows)}",
         file=sys.stderr,
     )
-    return season, week, entries
+    run_ids, runs_meta = _load_input_run_ids(moment, refresh=refresh)
+    _remember(capture, "collector_runs", [], runs_meta)
+    # The run log is provenance, not a scored board. Drop it from the manifest
+    # dataset map so a missing timestamp on the log is not a stale-input warning
+    # about the lines themselves.
+    capture.datasets.pop("collector_runs", None)
+    capture.input_run_ids = run_ids
+    return season, week, entries, capture
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1255,6 +1882,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="After a successful POST or --dry-run, write the Monte Carlo "
         "report under nfl/reports/ and print its path",
     )
+    ap.add_argument(
+        "--as-of",
+        default=None,
+        help="ISO-8601 point in time (no offset means UTC). Default is this "
+        "run's start, which keeps the current game lines, depth chart, "
+        "props board, and injuries dataset and still records provenance. "
+        "An explicit value reads game_line_snapshots, props_snapshots, "
+        "depth_charts_weekly, and injury_snapshots at that time "
+        "(is_baseline rows excluded).",
+    )
     return ap.parse_args(argv)
 
 
@@ -1266,6 +1903,8 @@ def emit_projection_report(
     season: int,
     week: int,
     run_at: str,
+    notes: list | None = None,
+    line_rows: list | None = None,
 ) -> Path:
     """Write the markdown report and, when sim game draws exist, the sidecar."""
     from nfl.report import (
@@ -1283,11 +1922,12 @@ def emit_projection_report(
     else:
         games = []
         try:
-            line_rows, _meta = fetch_game_lines(
-                season=int(season),
-                week=int(week),
-                refresh=False,
-            )
+            if line_rows is None:
+                line_rows, _meta = fetch_game_lines(
+                    season=int(season),
+                    week=int(week),
+                    refresh=False,
+                )
             games = vegas_games_from_lines(line_rows)
         except Exception as e:
             print(f"report: game lines unavailable ({e})", file=sys.stderr)
@@ -1306,7 +1946,66 @@ def emit_projection_report(
             if has_sim and efficiency_from_rows(used) == "unknown"
             else efficiency_from_rows(used)
         ),
+        notes=notes,
     )
+
+
+def _publish_side_files(
+    args: argparse.Namespace,
+    rows: list[dict],
+    game_draws: tuple,
+    capture: RunCapture,
+    *,
+    season: int,
+    week: int,
+    run_at: str,
+    started: datetime,
+    as_of_text: str,
+    cli_args: list,
+) -> int:
+    """Manifest, stale warning, and the optional markdown report."""
+    warnings = freshness_warnings(capture, now=started)
+    if warnings:
+        print(
+            "publish projections: stale inputs: " + "; ".join(warnings),
+            file=sys.stderr,
+        )
+    try:
+        manifest = build_manifest(
+            capture,
+            seed=int(args.sim_seed),
+            draws=int(args.sim),
+            as_of=as_of_text,
+            cli_args=cli_args,
+        )
+        manifest_file = write_manifest(
+            manifest,
+            season=season,
+            week=week,
+            run_at=run_at,
+        )
+    except OSError as e:
+        print(f"publish projections: {e}", file=sys.stderr)
+        return 1
+    print(f"manifest {manifest_file}", file=sys.stderr)
+    if not args.report:
+        return 0
+    try:
+        path = emit_projection_report(
+            args,
+            rows,
+            game_draws,
+            season=season,
+            week=week,
+            run_at=run_at,
+            notes=warnings,
+            line_rows=capture.line_rows or None,
+        )
+    except Exception as e:
+        print(f"publish projections: {e}", file=sys.stderr)
+        return 1
+    print(path)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1314,6 +2013,15 @@ def main(argv: list[str] | None = None) -> int:
     if args.sim < 0:
         print("publish projections: --sim must be >= 0", file=sys.stderr)
         return 1
+    cli_args = list(sys.argv[1:] if argv is None else argv)
+    started = datetime.now(timezone.utc).replace(microsecond=0)
+    point_in_time = args.as_of is not None
+    try:
+        as_of_text = normalize_as_of(args.as_of) if point_in_time else normalize_as_of(started.isoformat())
+    except GangstashDataError as e:
+        print(f"publish projections: {e}", file=sys.stderr)
+        return 1
+    as_of = _parse_utc(as_of_text) or started
     key = None
     if not args.dry_run:
         try:
@@ -1323,7 +2031,13 @@ def main(argv: list[str] | None = None) -> int:
             return 1
     today = datetime.now(ET).date()
     try:
-        season, week, entries = load_slate(args, today)
+        loaded = load_slate(args, today, as_of=as_of, point_in_time=point_in_time)
+        if len(loaded) == 4:
+            season, week, entries, capture = loaded
+        else:
+            season, week, entries = loaded
+            capture = RunCapture()
+            capture.point_in_time = point_in_time
         sim = maybe_sim(
             entries,
             args.sim,
@@ -1334,6 +2048,8 @@ def main(argv: list[str] | None = None) -> int:
             sim_efficiency=args.sim_efficiency,
         )
         sim_by_pid, used_efficiency, game_draws = sim_parts(sim)
+        if args.sim > 0 and len(loaded) == 4 and load_simulate_games() is not None:
+            _capture_sim_feeds(capture, season)
     except StaleInputs as e:
         print(f"publish projections: {e}", file=sys.stderr)
         return 1
@@ -1361,10 +2077,13 @@ def main(argv: list[str] | None = None) -> int:
         model_version=version,
         sim_by_pid=sim_by_pid,
         sim_efficiency=used_efficiency,
+        as_of=as_of_text,
+        input_run_ids=list(capture.input_run_ids),
     )
     print(
         f"projections {season} week {week} {args.season_type} "
-        f"run_at={run_at} model_version={version} sim_efficiency={used_efficiency}",
+        f"run_at={run_at} model_version={version} sim_efficiency={used_efficiency} "
+        f"as_of={as_of_text}",
         file=sys.stderr,
     )
     print(summarize(rows), file=sys.stderr)
@@ -1374,21 +2093,18 @@ def main(argv: list[str] | None = None) -> int:
         stem = f"{season}-w{int(week):02d}-{stamp}"
         json_path, csv_path = write_local(rows, dest, stem)
         print(f"dry-run wrote {json_path} and {csv_path}; not posted", file=sys.stderr)
-        if args.report:
-            try:
-                path = emit_projection_report(
-                    args,
-                    rows,
-                    game_draws,
-                    season=season,
-                    week=week,
-                    run_at=run_at,
-                )
-            except Exception as e:
-                print(f"publish projections: {e}", file=sys.stderr)
-                return 1
-            print(path)
-        return 0
+        return _publish_side_files(
+            args,
+            rows,
+            game_draws,
+            capture,
+            season=season,
+            week=week,
+            run_at=run_at,
+            started=started,
+            as_of_text=as_of_text,
+            cli_args=cli_args,
+        )
     assert key is not None
     try:
         inserted, updated = post_projection_rows(rows, key=key)
@@ -1396,21 +2112,18 @@ def main(argv: list[str] | None = None) -> int:
         print(f"publish projections: {e}", file=sys.stderr)
         return 1
     print(f"posted inserted={inserted} updated={updated}", file=sys.stderr)
-    if args.report:
-        try:
-            path = emit_projection_report(
-                args,
-                rows,
-                game_draws,
-                season=season,
-                week=week,
-                run_at=run_at,
-            )
-        except Exception as e:
-            print(f"publish projections: {e}", file=sys.stderr)
-            return 1
-        print(path)
-    return 0
+    return _publish_side_files(
+        args,
+        rows,
+        game_draws,
+        capture,
+        season=season,
+        week=week,
+        run_at=run_at,
+        started=started,
+        as_of_text=as_of_text,
+        cli_args=cli_args,
+    )
 
 
 if __name__ == "__main__":

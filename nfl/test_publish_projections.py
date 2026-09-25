@@ -6,7 +6,7 @@ import io
 import json
 import unittest
 from contextlib import redirect_stderr
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import patch
 
 from nfl.backtest import players_from_depth_chart
@@ -15,11 +15,16 @@ from nfl.projections import week1_score
 from nfl.publish_projections import (
     CHUNK_SIZE,
     PROJECTIONS_URL,
+    DatasetRecord,
     ProjectionsKeyMissing,
     PublishEntry,
+    RunCapture,
     StaleInputs,
     build_entries,
+    build_manifest,
     chunk_rows,
+    freshness_warnings,
+    load_slate,
     main,
     maybe_sim,
     parse_args,
@@ -27,8 +32,10 @@ from nfl.publish_projections import (
     _team_lines,
     projection_rows,
     resolve_nfl_week,
+    select_input_run_ids,
     summarize,
     write_local,
+    write_manifest,
 )
 from nfl.sim import simulate_games
 from nfl.snaps import SnapWeekRow
@@ -277,7 +284,7 @@ class PayloadTest(unittest.TestCase):
         self.assertTrue(all("sim_efficiency" not in r["inputs"] for r in board))
         self.assertTrue(all(r["inputs"]["sim_efficiency"] == "data" for r in sims))
 
-        def load(_args, _today):
+        def load(_args, _today, **_kwargs):
             return 2026, 3, entries
 
         with patch("nfl.publish_projections.load_slate", load), patch(
@@ -585,7 +592,7 @@ class ExitTest(unittest.TestCase):
             ],
         )
 
-        def load(_args, _today):
+        def load(_args, _today, **_kwargs):
             return 2026, 3, entries
 
         err = io.StringIO()
@@ -656,7 +663,7 @@ class ExitTest(unittest.TestCase):
             ],
         )
 
-        def load(args, today):
+        def load(args, today, **_kwargs):
             return 2026, 3, entries
 
         with patch("nfl.publish_projections.load_slate", load), patch(
@@ -772,7 +779,7 @@ class ReportFlagTest(unittest.TestCase):
             draws,
         )
 
-        def load(_args, _today):
+        def load(_args, _today, **_kwargs):
             return 2026, 3, entries
 
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as reports:
@@ -1105,6 +1112,612 @@ class DuplicateDepthPidTest(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual({entry.player.position for entry in rows}, {"QB", "TE"})
         self.assertNotIn("depth collapse", err.getvalue())
+
+
+class ProvenanceTest(unittest.TestCase):
+    def _board(self):
+        return [
+            _depth("Patrick Mahomes", "KC", "QB", 1, "00-0033873"),
+            _depth("Josh Allen", "BUF", "QB", 1, "00-0034857"),
+            _depth("Travis Kelce", "KC", "TE", 1, "00-0030506"),
+        ]
+
+    def _props(self):
+        return [
+            {
+                "player_name": "Patrick Mahomes",
+                "prop": "Passing Yards",
+                "line": 275.5,
+                "scraped_at": "2026-09-25T12:00:00Z",
+            }
+        ]
+
+    def _meta(self, observed="2026-09-25T12:00:00+00:00", untimestamped=False):
+        return {
+            "cache": None,
+            "cache_stale": False,
+            "truncated": False,
+            "live": True,
+            "response_meta": {
+                "observed_at": observed,
+                "untimestamped": untimestamped,
+                "row_count": 1,
+                "timestamp_column": "captured_at",
+            },
+        }
+
+    def test_default_means_match_current_sources(self) -> None:
+        """Provenance does not change the numbers the current datasets produce."""
+        lines = [_line()]
+        depth = self._board()
+        props = self._props()
+        prop_meta = self._meta()
+        before = build_entries(lines, depth)
+        with patch("nfl.props.fetch_props", return_value=(props, prop_meta)):
+            from nfl.props import ingest_slate_props
+            from nfl.props import attach_props
+
+            by_pid, _stats = ingest_slate_props([entry.player for entry in before])
+        before_players = attach_props([entry.player for entry in before], by_pid)
+        before_means = {
+            player.name: round(float(player.objective or 0), 4) for player in before_players
+        }
+
+        def lines_fetch(**kwargs):
+            return lines, self._meta("2026-09-25T11:00:00+00:00")
+
+        def depth_fetch(**kwargs):
+            return depth, self._meta()
+
+        def empty_fetch(**kwargs):
+            return [], self._meta()
+
+        runs = [
+            {
+                "run_id": "11111111-1111-1111-1111-111111111111",
+                "collector": "bettingpros-odds",
+                "started_at": "2026-09-25T10:00:00Z",
+                "finished_at": "2026-09-25T10:05:00Z",
+                "status": "succeeded",
+            },
+            {
+                "run_id": "22222222-2222-2222-2222-222222222222",
+                "collector": "bettingpros-odds",
+                "started_at": "2026-09-25T15:00:00Z",
+                "finished_at": "2026-09-25T15:05:00Z",
+                "status": "succeeded",
+            },
+            {
+                "run_id": "33333333-3333-3333-3333-333333333333",
+                "collector": "bettingpros-pbcs",
+                "started_at": "2026-09-25T09:00:00Z",
+                "finished_at": "2026-09-25T09:05:00Z",
+                "status": "failed",
+            },
+        ]
+        args = parse_args(["--season", "2026", "--week", "3", "--sim", "0"])
+        as_of = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
+        with patch("nfl.publish_projections.fetch_game_lines", lines_fetch), patch(
+            "nfl.publish_projections.fetch_depth_charts", depth_fetch
+        ), patch("nfl.publish_projections.fetch_targets", empty_fetch), patch(
+            "nfl.publish_projections.fetch_snaps", empty_fetch
+        ), patch(
+            "nfl.sim_feed.load_week_injuries",
+            return_value=([], self._meta()),
+        ), patch("nfl.props.fetch_props", return_value=(list(props), self._meta())), patch(
+            "nfl.publish_projections.fetch_game_line_snapshots"
+        ) as snapshots, patch(
+            "nfl.publish_projections.fetch_props_snapshots"
+        ) as prop_snaps, patch(
+            "nfl.publish_projections.fetch_depth_charts_weekly"
+        ) as weekly, patch(
+            "nfl.publish_projections.fetch_injury_snapshots"
+        ) as injuries, patch(
+            "nfl.publish_projections.fetch_collector_runs",
+            return_value=(runs, self._meta()),
+        ):
+            _season, _week, entries, capture = load_slate(
+                args,
+                date(2026, 9, 25),
+                as_of=as_of,
+                point_in_time=False,
+            )
+        snapshots.assert_not_called()
+        prop_snaps.assert_not_called()
+        weekly.assert_not_called()
+        injuries.assert_not_called()
+        after_means = {
+            entry.player.name: round(float(entry.player.objective or 0), 4)
+            for entry in entries
+        }
+        self.assertEqual(after_means, before_means)
+        stamped = projection_rows(
+            entries,
+            season=2026,
+            week=3,
+            season_type="REG",
+            run_at="2026-09-25T12:00:00+00:00",
+            model_version="abc",
+            as_of="2026-09-25T12:00:00+00:00",
+            input_run_ids=capture.input_run_ids,
+        )
+        bare = projection_rows(
+            entries,
+            season=2026,
+            week=3,
+            season_type="REG",
+            run_at="2026-09-25T12:00:00+00:00",
+            model_version="abc",
+        )
+        self.assertEqual([row["mean"] for row in stamped], [row["mean"] for row in bare])
+        self.assertTrue(all(row["as_of"] == "2026-09-25T12:00:00+00:00" for row in stamped))
+        self.assertEqual(
+            stamped[0]["input_run_ids"],
+            ["11111111-1111-1111-1111-111111111111"],
+        )
+        self.assertIn("game_lines", capture.datasets)
+        self.assertIn("injuries", capture.datasets)
+        self.assertNotIn("game_line_snapshots", capture.datasets)
+        self.assertNotIn("injury_snapshots", capture.datasets)
+
+    def test_default_out_matches_the_main_injury_path(self) -> None:
+        """No --as-of uses dataset=injuries and the same drop-and-promote as main."""
+        from nfl.publish_projections import _apply_entry_injuries
+        from nfl.props import attach_props, ingest_slate_props
+
+        lines = [_line()]
+        depth = self._board() + [_depth("Carson Wentz", "KC", "QB", 2, "00-0033102")]
+        injury_rows = [
+            {
+                "season": 2026,
+                "week": 3,
+                "full_name": "Patrick Mahomes",
+                "team_fd": "KC",
+                "gsis_id": "00-0033873",
+                "report_status": "Out",
+            }
+        ]
+        before = build_entries(
+            lines,
+            depth,
+            injury_rows=injury_rows,
+            injury_season=2026,
+            injury_week=3,
+        )
+        with patch("nfl.props.fetch_props", return_value=([], self._meta())):
+            by_pid, _stats = ingest_slate_props([entry.player for entry in before])
+        scored = attach_props([entry.player for entry in before], by_pid)
+        by_scored = {player.pid: player for player in scored}
+        before = [
+            PublishEntry(
+                player=by_scored[entry.player.pid],
+                gsis_id=entry.gsis_id,
+                player_id=entry.player_id,
+                game_id=entry.game_id,
+                fanduel_id=entry.fanduel_id,
+                salary=entry.salary,
+            )
+            for entry in before
+        ]
+        before = _apply_entry_injuries(
+            before,
+            injury_rows,
+            season=2026,
+            week=3,
+            csv_players=None,
+        )
+        before_means = {
+            entry.player.name: round(float(entry.player.objective or 0), 4)
+            for entry in before
+        }
+        runs = [
+            {
+                "run_id": "44444444-4444-4444-4444-444444444444",
+                "collector": "nflverse-injuries",
+                "started_at": "2026-09-25T11:00:00Z",
+                "finished_at": "2026-09-25T11:10:00Z",
+                "status": "succeeded",
+            },
+            {
+                "run_id": "55555555-5555-5555-5555-555555555555",
+                "collector": "nflverse-injuries",
+                "started_at": "2026-09-25T17:00:00Z",
+                "finished_at": "2026-09-25T18:00:00Z",
+                "status": "succeeded",
+            },
+        ]
+        args = parse_args(["--season", "2026", "--week", "3", "--sim", "0"])
+        with patch(
+            "nfl.publish_projections.fetch_game_lines",
+            return_value=(lines, self._meta()),
+        ), patch(
+            "nfl.publish_projections.fetch_depth_charts",
+            return_value=(depth, self._meta()),
+        ), patch(
+            "nfl.publish_projections.fetch_targets",
+            return_value=([], self._meta()),
+        ), patch(
+            "nfl.publish_projections.fetch_snaps",
+            return_value=([], self._meta()),
+        ), patch(
+            "nfl.sim_feed.load_week_injuries",
+            return_value=(injury_rows, self._meta()),
+        ) as week_injuries, patch(
+            "nfl.props.fetch_props",
+            return_value=([], self._meta()),
+        ), patch(
+            "nfl.publish_projections.fetch_injury_snapshots"
+        ) as snapshots, patch(
+            "nfl.publish_projections.fetch_collector_runs",
+            return_value=(runs, self._meta()),
+        ):
+            _season, _week, entries, capture = load_slate(
+                args,
+                date(2026, 9, 25),
+                as_of=datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc),
+                point_in_time=False,
+            )
+        week_injuries.assert_called_once()
+        snapshots.assert_not_called()
+        after_means = {
+            entry.player.name: round(float(entry.player.objective or 0), 4)
+            for entry in entries
+        }
+        self.assertEqual(after_means, before_means)
+        mahomes = next(entry.player for entry in entries if entry.player.name == "Patrick Mahomes")
+        wentz = next(entry.player for entry in entries if entry.player.name == "Carson Wentz")
+        self.assertEqual(mahomes.injury, "O")
+        self.assertEqual(mahomes.objective, 0.0)
+        self.assertEqual(wentz.depth_rank, 1)
+        self.assertEqual(
+            capture.input_run_ids,
+            ["44444444-4444-4444-4444-444444444444"],
+        )
+        self.assertIn("injuries", capture.datasets)
+
+    def test_explicit_as_of_reads_snapshots_and_skips_baseline_injuries(self) -> None:
+        lines = [_line()]
+        depth = self._board()
+        args = parse_args(["--season", "2026", "--week", "3", "--as-of", "2026-09-25T12:00:00"])
+        as_of = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
+        calls: list[str] = []
+
+        def snapshots(**kwargs):
+            calls.append("lines")
+            self.assertEqual(kwargs.get("as_of"), "2026-09-25T12:00:00+00:00")
+            return [
+                {
+                    "game_id": "2026_03_KC_BUF",
+                    "season": 2026,
+                    "week": 3,
+                    "kickoff_at": "2026-09-20T17:00:00Z",
+                    "home_team_fd": "BUF",
+                    "away_team_fd": "KC",
+                    "book": "consensus",
+                    "market": "spread",
+                    "home_line": -3.5,
+                    "captured_at": "2026-09-25T11:00:00Z",
+                },
+                {
+                    "game_id": "2026_03_KC_BUF",
+                    "season": 2026,
+                    "week": 3,
+                    "kickoff_at": "2026-09-20T17:00:00Z",
+                    "home_team_fd": "BUF",
+                    "away_team_fd": "KC",
+                    "book": "consensus",
+                    "market": "total",
+                    "total": 47.5,
+                    "captured_at": "2026-09-25T11:00:00Z",
+                },
+            ], self._meta("2026-09-25T11:00:00+00:00")
+
+        def weekly(**kwargs):
+            calls.append("depth")
+            self.assertEqual(kwargs.get("as_of"), "2026-09-25T12:00:00+00:00")
+            return depth, self._meta()
+
+        def prop_snaps(**kwargs):
+            calls.append("props")
+            return [
+                {
+                    "player_name": "Patrick Mahomes",
+                    "prop": "Passing Yards",
+                    "line": 275.5,
+                    "captured_at": "2026-09-25T11:30:00Z",
+                }
+            ], self._meta()
+
+        def injury_snaps(**kwargs):
+            calls.append("injuries")
+            return [
+                {
+                    "season": 2026,
+                    "week": 3,
+                    "full_name": "Patrick Mahomes",
+                    "team_fd": "KC",
+                    "gsis_id": "00-0033873",
+                    "report_status": "Out",
+                    "is_baseline": True,
+                    "captured_at": "2026-09-01T00:00:00Z",
+                }
+            ], {
+                "cache_stale": False,
+                "response_meta": {
+                    "observed_at": "2026-09-01T00:00:00+00:00",
+                    "untimestamped": False,
+                    "includes_baseline": True,
+                },
+            }
+
+        with patch("nfl.publish_projections.fetch_game_lines") as current_lines, patch(
+            "nfl.publish_projections.fetch_game_line_snapshots", snapshots
+        ), patch("nfl.publish_projections.fetch_depth_charts") as current_depth, patch(
+            "nfl.publish_projections.fetch_depth_charts_weekly", weekly
+        ), patch("nfl.publish_projections.fetch_targets", return_value=([], self._meta())), patch(
+            "nfl.publish_projections.fetch_snaps", return_value=([], self._meta())
+        ), patch("nfl.publish_projections.fetch_props_snapshots", prop_snaps), patch(
+            "nfl.props.fetch_props"
+        ) as current_props, patch(
+            "nfl.publish_projections.fetch_injury_snapshots", injury_snaps
+        ), patch(
+            "nfl.sim_feed.load_week_injuries",
+            side_effect=AssertionError("default injuries feed"),
+        ), patch(
+            "nfl.publish_projections.fetch_collector_runs",
+            return_value=(
+                [
+                    {
+                        "run_id": "44444444-4444-4444-4444-444444444444",
+                        "collector": "nflverse-injuries",
+                        "started_at": "2026-09-25T11:00:00Z",
+                        "finished_at": "2026-09-25T11:40:00Z",
+                        "status": "succeeded",
+                    }
+                ],
+                self._meta(),
+            ),
+        ):
+            _season, _week, entries, capture = load_slate(
+                args,
+                date(2026, 9, 25),
+                as_of=as_of,
+                point_in_time=True,
+            )
+        current_lines.assert_not_called()
+        current_depth.assert_not_called()
+        current_props.assert_not_called()
+        self.assertEqual(calls, ["lines", "depth", "injuries", "props"])
+        mahomes = next(entry.player for entry in entries if entry.player.name == "Patrick Mahomes")
+        self.assertEqual(mahomes.depth_rank, 1)
+        self.assertEqual(mahomes.injury, "")
+        self.assertIsNone(capture.datasets["injury_snapshots"].observed_at)
+        self.assertEqual(capture.datasets["injury_snapshots"].rows, [])
+        direct = build_entries(lines, depth)
+        with patch(
+            "nfl.props.fetch_props",
+            return_value=(self._props(), self._meta()),
+        ):
+            from nfl.props import attach_props, ingest_slate_props
+
+            by_pid, _stats = ingest_slate_props([entry.player for entry in direct])
+        direct_players = {
+            player.name: player
+            for player in attach_props([entry.player for entry in direct], by_pid)
+        }
+        pit = {entry.player.name: entry.player for entry in entries}
+        self.assertEqual(
+            round(float(pit["Patrick Mahomes"].objective or 0), 4),
+            round(float(direct_players["Patrick Mahomes"].objective or 0), 4),
+        )
+        self.assertEqual(
+            capture.input_run_ids,
+            ["44444444-4444-4444-4444-444444444444"],
+        )
+
+    def test_real_inactive_at_as_of_changes_the_chart(self) -> None:
+        depth = self._board()
+        args = parse_args(["--season", "2026", "--week", "3", "--as-of", "2026-09-25T18:00:00Z"])
+
+        def snapshots(**kwargs):
+            row = _line()
+            return [
+                {
+                    "game_id": row["game_id"],
+                    "season": 2026,
+                    "week": 3,
+                    "kickoff_at": row["commence_time"],
+                    "home_team_fd": "BUF",
+                    "away_team_fd": "KC",
+                    "book": "consensus",
+                    "market": "spread",
+                    "home_line": row["spread"],
+                    "captured_at": "2026-09-25T16:00:00Z",
+                },
+                {
+                    "game_id": row["game_id"],
+                    "season": 2026,
+                    "week": 3,
+                    "kickoff_at": row["commence_time"],
+                    "home_team_fd": "BUF",
+                    "away_team_fd": "KC",
+                    "book": "consensus",
+                    "market": "total",
+                    "total": row["total"],
+                    "captured_at": "2026-09-25T16:00:00Z",
+                },
+            ], self._meta("2026-09-25T16:00:00+00:00")
+
+        def injuries(**kwargs):
+            return [
+                {
+                    "season": 2026,
+                    "week": 3,
+                    "full_name": "Patrick Mahomes",
+                    "team_fd": "KC",
+                    "gsis_id": "00-0033873",
+                    "report_status": "Out",
+                    "is_baseline": False,
+                    "captured_at": "2026-09-25T17:00:00Z",
+                }
+            ], self._meta("2026-09-25T17:00:00+00:00")
+
+        with patch("nfl.publish_projections.fetch_game_line_snapshots", snapshots), patch(
+            "nfl.publish_projections.fetch_depth_charts_weekly",
+            return_value=(depth, self._meta()),
+        ), patch(
+            "nfl.publish_projections.fetch_targets", return_value=([], self._meta())
+        ), patch(
+            "nfl.publish_projections.fetch_snaps", return_value=([], self._meta())
+        ), patch(
+            "nfl.publish_projections.fetch_props_snapshots",
+            return_value=([], self._meta()),
+        ), patch(
+            "nfl.publish_projections.fetch_injury_snapshots", injuries
+        ), patch(
+            "nfl.sim_feed.load_week_injuries",
+            side_effect=AssertionError("default injuries feed"),
+        ), patch(
+            "nfl.publish_projections.fetch_collector_runs",
+            return_value=([], self._meta()),
+        ):
+            _season, _week, entries, capture = load_slate(
+                args,
+                date(2026, 9, 25),
+                as_of=datetime(2026, 9, 25, 18, 0, tzinfo=timezone.utc),
+                point_in_time=True,
+            )
+        mahomes = next(entry.player for entry in entries if entry.player.name == "Patrick Mahomes")
+        self.assertEqual(mahomes.injury, "O")
+        self.assertEqual(mahomes.objective, 0.0)
+        self.assertIsNone(mahomes.depth_rank)
+        self.assertEqual(
+            capture.datasets["injury_snapshots"].observed_at,
+            "2026-09-25T17:00:00+00:00",
+        )
+        self.assertEqual(len(capture.datasets["injury_snapshots"].rows), 1)
+
+    def test_selects_latest_succeeded_run_before_as_of(self) -> None:
+        as_of = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
+        ids = select_input_run_ids(
+            [
+                {
+                    "run_id": "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
+                    "collector": "nflverse-targets",
+                    "finished_at": "2026-09-25T11:00:00Z",
+                    "status": "succeeded",
+                },
+                {
+                    "run_id": "BBBBBBBB-BBBB-BBBB-BBBB-BBBBBBBBBBBB",
+                    "collector": "nflverse-targets",
+                    "finished_at": "2026-09-25T13:00:00Z",
+                    "status": "succeeded",
+                },
+                {
+                    "run_id": "CCCCCCCC-CCCC-CCCC-CCCC-CCCCCCCCCCCC",
+                    "collector": "nflverse-snaps",
+                    "finished_at": "2026-09-25T11:30:00Z",
+                    "status": "partial",
+                },
+            ],
+            as_of=as_of,
+        )
+        self.assertEqual(ids, ["aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"])
+
+    def test_stale_and_untimestamped_warn_on_stderr_and_the_report(self) -> None:
+        import io
+        import tempfile
+        from contextlib import redirect_stderr, redirect_stdout
+        from pathlib import Path
+
+        from nfl.report import build_report
+
+        capture = RunCapture()
+        old = (datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc) - timedelta(hours=40)).isoformat()
+        capture.datasets["game_lines"] = DatasetRecord(
+            rows=[{"game_id": "g"}],
+            observed_at=old,
+            untimestamped=False,
+        )
+        capture.datasets["depth_charts_weekly"] = DatasetRecord(
+            rows=[{"player_name": "A", "chart_format": "nflverse_weekly"}],
+            observed_at="2026-09-25T11:00:00+00:00",
+            untimestamped=True,
+        )
+        now = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)
+        warnings = freshness_warnings(capture, now=now)
+        self.assertEqual(len(warnings), 2)
+        stale = next(line for line in warnings if "game_lines" in line)
+        legacy = next(line for line in warnings if "depth_charts_weekly" in line)
+        self.assertIn("36h", stale)
+        self.assertIn("untimestamped", legacy)
+        capture.line_rows = [{"game_id": "g", "home_team": "KC", "away_team": "BUF"}]
+        text = build_report(
+            [],
+            [],
+            season=2026,
+            week=3,
+            run_at="2026-09-25T12:00:00+00:00",
+            draws=0,
+            efficiency="data",
+            notes=warnings,
+        )
+        self.assertTrue(text.strip().endswith("stale inputs: " + "; ".join(warnings)))
+        entries = build_entries(
+            [_line()],
+            [
+                _depth("Patrick Mahomes", "KC", "QB", 1, "00-0033873"),
+                _depth("Josh Allen", "BUF", "QB", 1, "00-0034857"),
+            ],
+        )
+
+        def load(_args, _today, **_kwargs):
+            return 2026, 3, entries, capture
+
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "nfl.publish_projections.load_slate", load
+        ), patch("nfl.publish_projections.maybe_sim", return_value=(None, "data")), patch(
+            "nfl.publish_projections.model_version", return_value="abc"
+        ), patch("nfl.report.REPORTS_DIR", Path(tmp)):
+            err = io.StringIO()
+            out = io.StringIO()
+            with redirect_stderr(err), redirect_stdout(out):
+                rc = main(
+                    ["--dry-run", "--report", "--sim", "0", "--out-dir", tmp, "--season", "2026", "--week", "3"]
+                )
+            self.assertEqual(rc, 0)
+            self.assertIn("stale inputs:", err.getvalue())
+            self.assertIn("untimestamped", err.getvalue())
+            report = next(Path(tmp).glob("*.md")).read_text(encoding="utf-8")
+            self.assertIn("stale inputs:", report)
+            manifest = json.loads(next(Path(tmp).glob("*.manifest.json")).read_text(encoding="utf-8"))
+            for key in (
+                "git_sha",
+                "dirty",
+                "seed",
+                "draws",
+                "as_of",
+                "cli_args",
+                "datasets",
+                "input_run_ids",
+                "python",
+            ):
+                self.assertIn(key, manifest)
+            self.assertIn("game_lines", manifest["datasets"])
+            self.assertIn("sha256", manifest["datasets"]["game_lines"])
+            self.assertEqual(manifest["datasets"]["game_lines"]["row_count"], 1)
+            self.assertTrue(manifest["datasets"]["depth_charts_weekly"]["untimestamped"])
+            self.assertEqual(manifest["draws"], 0)
+            self.assertEqual(manifest["seed"], 1)
+            self.assertFalse(manifest["point_in_time"])
+            written = write_manifest(
+                build_manifest(capture, seed=1, draws=0, as_of=manifest["as_of"], cli_args=["--dry-run"]),
+                season=2026,
+                week=3,
+                run_at="2026-09-25T12:00:00+00:00",
+                dest=Path(tmp) / "again",
+            )
+            self.assertTrue(written.name.endswith(".manifest.json"))
 
 
 if __name__ == "__main__":
