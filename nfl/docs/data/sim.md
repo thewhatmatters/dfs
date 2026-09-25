@@ -112,7 +112,7 @@ The starter's passing yards and passing TDs are the **sum of the receiving lines
 
 **RB rush share**
 
-Team rush attempts are the scripted count above (team_stats rush rate plus the margin, capped by the implied-total yard budget). Every roster RB splits that pool, not only the backs who have target weeks.
+Team rush attempts are the scripted count above (team_stats rush rate plus the margin, capped by the implied-total yard budget). Every active roster RB splits that pool, not only the backs who have target weeks. O, D, IR, and NA are left out and the remaining backs are renormalized.
 
 - Snap share and carry share are each normalized, then combined with a geometric mean when a back has both. Carry counts come from `carries` / `rushing_attempts` on a target row or from `player_stats_weekly`.
 - A back with only snaps (or only carries) keeps that one signal.
@@ -123,13 +123,13 @@ The passing QB's rush attempts are his own carry history when he has it. Otherwi
 
 Players with no target weeks stay on the deterministic role share, including an RB who only has snaps. Snaps change rush mix only for RBs who already have target weeks.
 
-The passing QB does not stay on that role share, including when his receivers have target history. Role share was team points × 0.50, so an implied 17.5 starter landed near 8.8 with a p90 near 11.4. With no catcher history he is the pass-yard and pass-TD anchors (neutral pass rate, not the drawn margin) scaled by drawn team points / implied, plus a rush floor of max(12 yards, 0.8 × implied) or the rush-yard prop. With catcher history the passing floor is the same implied-total anchor (scripted pass rate, or the passing prop) and the rush count is the floor above. Other QBs on the team score 0. O, D, IR, and NA do not keep the starter job. The no-history scale keeps the QB linear in team points, so a teammate on the role share stays highly correlated with him.
+The passing QB does not stay on that role share, including when his receivers have target history. Role share was team points × 0.50, so an implied 17.5 starter landed near 8.8 with a p90 near 11.4. With no catcher history he is the pass-yard and pass-TD anchors (neutral pass rate, not the drawn margin) scaled by drawn team points / implied, plus a rush floor of max(12 yards, 0.8 × implied) or the rush-yard prop. With catcher history the passing floor is the same implied-total anchor (scripted pass rate, or the passing prop) and the rush count is the floor above. Other QBs on the team score 0. O, D, IR, and NA do not keep the starter job or a target or rush share. They score 0 instead of a role-share stub. The no-history scale keeps the QB linear in team points, so a teammate on the role share stays highly correlated with him.
 
 **Inputs:** `targets` rows: `season`, `week`, `position`, `player_name`, `team_fd`, `targets`, `target_share`, `team_targets`, `team_pass_attempts`, `gsis_id` (optional `player_id`). `snaps` rows: the same identity fields plus `offense_pct` (fraction, or a percent above `1.5`).
 
 ### Efficiency (layer 4)
 
-`PlaceholderEfficiency` uses one league rate per position. `DataEfficiency` replaces those rates with shrunk history from `player_stats_weekly` and `team_stats_weekly`. `--sim-efficiency {placeholder,data}` selects them. The default on `--sim` and `nfl.backtest` is `data`. `simulate_games` with no efficiency argument still uses the placeholder, so an empty bundle keeps the same draws. Neither class changes `week1_score` or the ILP.
+`PlaceholderEfficiency` uses one league rate per position. `DataEfficiency` replaces those rates with shrunk history from `player_stats_weekly` and `team_stats_weekly`. `--sim-efficiency {placeholder,data}` selects them. The default on `--sim`, `nfl.backtest`, and `nfl.publish_projections` is `placeholder` until data mode beats the board. `simulate_games` with no efficiency argument still uses the placeholder, so an empty bundle keeps the same draws. Neither class changes `week1_score` or the ILP.
 
 Both classes turn opportunities into FanDuel points: yards per target / rush and TD rates, plus the 100- and 300-yard bonuses when that game's sampled yards cross the line. Passing props are applied as the team anchor before this class scores the line. A rush-yard prop is that RB's rush attempts (`prop / 4.4`).
 
@@ -141,15 +141,15 @@ Data mode, prior-count blend `(n * observed + prior_n * prior) / (n + prior_n)`:
 
 | Level | Targets | Carries | Pass attempts |
 |---|---:|---:|---:|
-| Player | 25 | 20 | 40 |
-| Team and position | 60 | 40 | 80 |
+| Player | 80 | 80 | 40 |
+| Team and position | 200 | 160 | 80 |
 | League and position | 200 | 150 | 250 |
 
-The league rate is shrunk toward the placeholder constants. A player with no history stays on those constants. The backtest sets `before_week` to the scored week, so week N and later rows are dropped. A season-to-date `team_stats` row (no week) is not used for that cutoff. The optimizer, with no week cutoff, uses `team_weeks` when the feed has them and otherwise the season board.
+One prior week sits mostly on the prior. A bellcow week is about 20 carries and a tight end week is about 6 targets, so those counts are a small share of the player prior. The team-position prior is a few team-weeks for the same reason: the player shrinks toward the team rate, and a one-week team rate must not become that target. The league rate is shrunk toward the placeholder constants. A player with no history stays on those constants. The backtest and the nightly publish set `before_week` to the scored week, so week N and later rows are dropped. A season-to-date `team_stats` row (no week) is not used for that cutoff. The optimizer, with no week cutoff, uses `team_weeks` when the feed has them and otherwise the season board.
 
 Opponent defense scales pass efficiency by pass EPA and success allowed, and rush efficiency by rush EPA and success allowed. Early-down rates win when those columns are present. The sample is shrunk with a 100-play prior. The multiplier is clamped to ±15%. One EPA per play above the league is +0.50 before that clamp. Red-zone TD rate (offense, and defense allowed) nudges the team TD anchor, clamped to ±15%.
 
-Offense pass EPA versus rush EPA, plus the same gap in what the defense allows, tilts the pass yard anchor by at most ±8%. Rush attempts take the complement (`2 - tilt`), so Vegas stays the scoring center. After that, player rates only redistribute the anchored passing yards and TDs across catchers.
+Offense pass EPA versus rush EPA, plus the same gap in what the defense allows, tilts the pass yard anchor by at most ±8%. Rush attempts stay on the implied-total script. The rush-yard budget takes the complement (`2 - tilt`) times the opponent rush multiplier, and that product is clamped again to ±15% (`COMBINED_CLAMP`), so 1.08 × 1.15 cannot become 1.24. Team rush yards are `sum(rushes × prior yards per carry) × that one scale`. A hot yards-per-carry or rush TD rate only steals share from other rushers. Receiving yards and receiving TDs were already rescaled to the pass anchor, so a hot tight end rate redistributes that pie and does not add to it. O, D, IR, and NA players are left out of target and rush shares. Their share is renormalized onto active teammates.
 
 Optional columns stay `None` and are skipped until the aggregator ships them: `receiving_air_yards`, `target_share`, `air_yards_share`, `wopr`, `red_zone_targets`, `red_zone_carries`, `goal_line_carries` on a player-week; `plays_per_game`, `seconds_per_play`, and the neutral pair on a team-week; `yards_per_carry_allowed`, `yards_per_dropback_allowed`, `yards_per_attempt_allowed`, `sack_rate`, `air_yards_per_attempt_allowed` on a defense. Air yards, red-zone targets, and goal-line carries blend 10% into yards per target or the TD rate when present. Yards allowed and sack rate blend into the opponent multiplier and still hit the ±15% clamp. Plays per game and seconds per play are stored and do not change layer 2.
 

@@ -19,6 +19,7 @@ from nfl.publish_projections import (
     chunk_rows,
     main,
     maybe_sim,
+    parse_args,
     post_projection_rows,
     projection_rows,
     resolve_nfl_week,
@@ -271,11 +272,12 @@ class SimGuardTest(unittest.TestCase):
 
         bundle = object()
 
-        def fake(players, n, seed, inputs=None):
+        def fake(players, n, seed, inputs=None, efficiency=None):
             seen["n"] = n
             seen["seed"] = seed
             seen["count"] = len(players)
             seen["inputs"] = inputs
+            seen["efficiency"] = efficiency
             return Result()
 
         with patch("nfl.publish_projections.load_simulate_games", return_value=fake), patch(
@@ -288,6 +290,47 @@ class SimGuardTest(unittest.TestCase):
         self.assertEqual(seen["n"], 25)
         self.assertEqual(seen["seed"], 3)
         self.assertEqual(seen["count"], len(entries))
+        from nfl.sim_efficiency import PlaceholderEfficiency
+
+        self.assertIsInstance(seen["efficiency"], PlaceholderEfficiency)
+
+    def test_data_efficiency_is_passed_into_the_sim(self) -> None:
+        from nfl.sim_efficiency import DataEfficiency
+        from nfl.sim_inputs import SimInputs
+
+        entries = build_entries(
+            [_line()],
+            [
+                _depth("Patrick Mahomes", "KC", "QB", 1, "00-0033873"),
+                _depth("Josh Allen", "BUF", "QB", 1, "00-0034857"),
+            ],
+        )
+        seen: dict = {}
+
+        def fake(players, n, seed, inputs=None, efficiency=None):
+            del players, n, seed, inputs
+            seen["efficiency"] = efficiency
+
+            class Result:
+                by_pid: dict = {}
+
+            return Result()
+
+        with patch("nfl.publish_projections.load_simulate_games", return_value=fake), patch(
+            "nfl.sim_feed.resolve_sim_inputs",
+            return_value=(SimInputs(), "sim inputs: test"),
+        ):
+            maybe_sim(
+                entries,
+                10,
+                1,
+                season=2026,
+                refresh=True,
+                week=3,
+                sim_efficiency="data",
+            )
+        self.assertIsInstance(seen["efficiency"], DataEfficiency)
+        self.assertEqual(parse_args([]).sim_efficiency, "placeholder")
 
     def test_stale_sim_inputs_exit(self) -> None:
         entries = build_entries(

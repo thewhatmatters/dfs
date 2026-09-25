@@ -124,6 +124,9 @@ class FlagsTest(unittest.TestCase):
         self.assertEqual(seed.sim_seed, 7)
         default_seed = parse_args(["--csv", "x.csv"])
         self.assertEqual(default_seed.sim_seed, 1)
+        self.assertEqual(default_seed.sim_efficiency, "placeholder")
+        data_eff = parse_args(["--csv", "x.csv", "--sim-efficiency", "data"])
+        self.assertEqual(data_eff.sim_efficiency, "data")
         self.assertIsNone(default_seed.sim_inputs)
         loaded = parse_args(
             ["--csv", "x.csv", "--sim-inputs", "nfl/testdata/sim_layers.json"]
@@ -1532,6 +1535,99 @@ class LiveShapeTest(unittest.TestCase):
         self.assertEqual(set(gs.draws["qb3"]), {0.0})
         self.assertNotEqual(gs.draws["qb1"], gs.draws["qb2"])
         self.assertGreater(gs.by_pid["qb1"].p10, 1.0)
+
+    def test_inactive_players_lose_target_and_rush_share(self):
+        from dataclasses import replace
+
+        from nfl.sim_efficiency import DataEfficiency
+        from nfl.sim_inputs import PlayerWeek
+
+        targets = []
+        for week in (1, 2, 3):
+            targets.append(_week_row("A.J. Brown", week, 0.30))
+            targets.append(_week_row("Kayshon Boutte", week, 0.18))
+        base = sim_inputs_from_records(targets=targets)
+        history = PlayerWeek(
+            season=2025,
+            week=1,
+            position="WR",
+            player_name="A.J. Brown",
+            team_fd="ARI",
+            targets=8,
+            receptions=6,
+            receiving_yards=90,
+            receiving_tds=1,
+        )
+        inputs = replace(base, player_weeks=(history,))
+        common = dict(
+            team="ARI",
+            opponent="SEA",
+            game="SEA@ARI",
+            total=47.0,
+            spread=-3.0,
+            implied_total=25.0,
+        )
+        healthy = _pl(pid="aj", name="A.J. Brown", position="WR", depth_rank=1, **common)
+        ir = _pl(
+            pid="aj",
+            name="A.J. Brown",
+            position="WR",
+            depth_rank=1,
+            injury="IR",
+            **common,
+        )
+        mate = _pl(
+            pid="kb",
+            name="Kayshon Boutte",
+            position="WR",
+            depth_rank=2,
+            **common,
+        )
+        qb = _pl(
+            pid="qb",
+            name="Jacoby Brissett",
+            position="QB",
+            depth_rank=1,
+            salary=7500,
+            **common,
+        )
+        both = simulate_games(
+            [qb, healthy, mate],
+            n=60,
+            seed=1,
+            inputs=inputs,
+            efficiency=DataEfficiency(inputs, before_week=4),
+        )
+        out = simulate_games(
+            [qb, ir, mate],
+            n=60,
+            seed=1,
+            inputs=inputs,
+            efficiency=DataEfficiency(inputs, before_week=4),
+        )
+        self.assertLess(out.by_pid["aj"].mean, 0.05)
+        self.assertGreater(out.by_pid["kb"].mean, both.by_pid["kb"].mean + 0.5)
+
+        rb_targets = [_week_row("Michael Wilson", week, 0.22) for week in (1, 2, 3)]
+        rb_inputs = sim_inputs_from_records(targets=rb_targets)
+        wr = _pl(pid="wr", name="Michael Wilson", position="WR", depth_rank=1, **common)
+        lead = _pl(pid="rb1", name="James Conner", position="RB", depth_rank=1, **common)
+        hurt = _pl(
+            pid="rb2",
+            name="Trey Benson",
+            position="RB",
+            depth_rank=2,
+            injury="O",
+            **common,
+        )
+        rushes = simulate_games(
+            [qb, wr, lead, hurt],
+            n=40,
+            seed=2,
+            inputs=rb_inputs,
+        )
+        self.assertLess(rushes.by_pid["rb2"].mean, 0.05)
+        self.assertGreater(rushes.by_pid["rb1"].mean, 1.0)
 
     def test_zero_filled_weeks_do_not_dilute_share(self):
         star = [

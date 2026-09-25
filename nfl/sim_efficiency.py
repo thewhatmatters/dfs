@@ -14,11 +14,15 @@ yards are the sum of the same receiving lines.
 
 Data-mode constants (prior opportunity counts):
 
-- player targets 25, carries 20, pass attempts 40
-- team-position targets 60, carries 40, pass attempts 80
+- player targets 80, carries 80, pass attempts 40
+- team-position targets 200, carries 160, pass attempts 80
 - league targets 200, carries 150, pass attempts 250
   (empirical league rate, shrunk toward the placeholder constants)
+- one week of carries or targets sits mostly on the prior
 - opponent shrinkage 100 plays; multiplier clamped to ±15%
+- pass-tilt × opponent rush multiplier clamped again to ±15%
+  (they do not stack). Team rush yards stay on the implied-total
+  budget; player rates only redistribute that budget
 - 1.0 EPA/play above the league is +0.50 on that multiplier, before the clamp
 - red-zone TD multiplier clamped to ±15%
 - pass-vs-rush yardage tilt clamped to ±8% (Vegas stays the scoring center)
@@ -40,6 +44,10 @@ from nfl.players import Player
 from nfl.rules import skill_fd_points
 from nfl.sim_inputs import PlayerWeek, SimInputs, TeamStat
 
+# One prior week should sit mostly on the documented rate. A bellcow week
+# is ~20 carries; a TE week is ~6 targets. Those counts are a small share
+# of the prior, so a single hot game cannot set yards per carry or the
+# TD rate. Team-position priors are a few team-weeks for the same reason.
 # League-average rates. Not fit to a slate and not tilted to props.
 PASS_YPA = 7.1
 PASS_TD_RATE = 0.045
@@ -57,11 +65,11 @@ YARD_SIGMA_FRAC = 0.22
 YARD_SIGMA_FLOOR = 12.0
 
 # Empirical-Bayes prior counts. ``(n * obs + prior_n * prior) / (n + prior_n)``.
-PRIOR_TARGETS = 25.0
-PRIOR_CARRIES = 20.0
+PRIOR_TARGETS = 80.0
+PRIOR_CARRIES = 80.0
 PRIOR_PASS_ATTEMPTS = 40.0
-TEAM_PRIOR_TARGETS = 60.0
-TEAM_PRIOR_CARRIES = 40.0
+TEAM_PRIOR_TARGETS = 200.0
+TEAM_PRIOR_CARRIES = 160.0
 TEAM_PRIOR_PASS_ATTEMPTS = 80.0
 LEAGUE_PRIOR_TARGETS = 200.0
 LEAGUE_PRIOR_CARRIES = 150.0
@@ -77,9 +85,12 @@ LEAGUE_RUSH_SUCCESS = 0.42
 LEAGUE_RZ_TD = 0.55
 RZ_PRIOR_PLAYS = 25.0
 RZ_TD_CLAMP = 0.15
-# Pass yard anchor moves at most this far. Rush attempts take the complement.
+# Pass yard anchor moves at most this far. The rush-yard budget takes the
+# complement, then the product with the opponent rush multiplier is clamped
+# again so the two cannot stack.
 YARD_TILT_MAX = 0.08
 YARD_TILT_PER_EPA = 0.12
+COMBINED_CLAMP = 0.15
 # Optional columns. Skipped when the field is None.
 AIR_YARDS_BLEND = 0.10
 LEAGUE_AIR_YARDS_PER_TARGET = 8.0
@@ -116,6 +127,10 @@ class OpportunityCount:
     rushes: float = 0.0
     receiving: ReceivingLine | None = None
     team_receiving: tuple[ReceivingLine, ...] | None = None
+    # Set by DataEfficiency.allocate_rush. None keeps the unanchored path
+    # (placeholder draws, and a points() call that did not pre-allocate).
+    rush_yards: float | None = None
+    rush_tds: float | None = None
 
 
 class EfficiencyModel(Protocol):
@@ -241,6 +256,24 @@ def shrink(observed: float, n: float, prior: float, prior_n: float) -> float:
 
 def clamp(value: float, lo: float, hi: float) -> float:
     return min(float(hi), max(float(lo), float(value)))
+
+
+def _spread(raw: list[float], budget: float) -> list[float]:
+    """Scale ``raw`` so it sums to ``budget``.
+
+    An equal budget returns the same values, including the case where the
+    scale was exactly 1, so an empty history does not change the float
+    passed to ``sample_yards``.
+    """
+    total = sum(raw)
+    if total <= 1e-9:
+        return [0.0 for _ in raw]
+    if budget == total:
+        return list(raw)
+    factor = budget / total
+    if factor == 1.0:
+        return list(raw)
+    return [value * factor for value in raw]
 
 
 def position_rates(position: str) -> dict[str, float]:
@@ -619,6 +652,67 @@ class DataEfficiency:
             mult *= 1.0 - SACK_TO_MULT * (side.sack_rate - LEAGUE_SACK_RATE)
         return clamp(mult, 1.0 - OPP_CLAMP, 1.0 + OPP_CLAMP)
 
+    def rush_budget_scale(
+        self,
+        team: str,
+        opponent: str | None,
+        pass_tilt: float,
+    ) -> float:
+        """One scale for the team rush-yard budget.
+
+        The rush complement of the pass tilt (``2 - tilt``) and the opponent
+        rush multiplier are multiplied, then clamped to ±``COMBINED_CLAMP``.
+        A pass tilt of 0.92 (rush complement 1.08) and a 1.15 opponent
+        adjustment become 1.15, not 1.242. Player yards per carry are not
+        in this scale.
+        """
+        tilt = float(pass_tilt) if pass_tilt else 1.0
+        rush_leg = max(0.0, 2.0 - tilt)
+        return clamp(
+            rush_leg * self.rush_multiplier(opponent),
+            1.0 - COMBINED_CLAMP,
+            1.0 + COMBINED_CLAMP,
+        )
+
+    def allocate_rush(
+        self,
+        specs: list[tuple[Player, float]],
+        *,
+        team: str,
+        opponent: str | None,
+        pass_tilt: float,
+    ) -> dict[str, tuple[float, float]]:
+        """``pid → (rush yards, rush TDs)`` summing to the implied budget.
+
+        Weights are shrunk yards per carry and TD rate, so a hot back takes
+        a larger share. The team total stays ``sum(rushes × prior)`` times
+        one clamped scale. It does not also multiply by the hot rate.
+        """
+        if not specs:
+            return {}
+        yard_scale = self.rush_budget_scale(team, opponent, pass_tilt)
+        td_scale = self.td_multiplier(team, opponent)
+        raw_yd: list[float] = []
+        prior_yd: list[float] = []
+        raw_td: list[float] = []
+        prior_td: list[float] = []
+        for player, rushes in specs:
+            pos = (player.position or "RB").upper()
+            rates = self.rates_for(player, pos)
+            prior = position_rates(pos)
+            carries = max(0.0, float(rushes))
+            raw_yd.append(carries * rates["yards_per_carry"])
+            prior_yd.append(carries * prior["yards_per_carry"])
+            raw_td.append(carries * rates["rush_td_per_carry"])
+            prior_td.append(carries * prior["rush_td_per_carry"])
+        yard_budget = sum(prior_yd) if yard_scale == 1.0 else sum(prior_yd) * yard_scale
+        td_budget = sum(prior_td) if td_scale == 1.0 else sum(prior_td) * td_scale
+        yards = _spread(raw_yd, yard_budget)
+        tds = _spread(raw_td, td_budget)
+        return {
+            player.pid: (yards[i], tds[i]) for i, (player, _rushes) in enumerate(specs)
+        }
+
     def rush_multiplier(self, opponent: str | None) -> float:
         side = self._sides.get(((opponent or "").upper(), "defense"))
         if side is None:
@@ -738,6 +832,50 @@ class DataEfficiency:
             rec_td=t * td_rate,
         )
 
+    def _rush_scoring(
+        self,
+        rng: random.Random,
+        player: Player,
+        pos: str,
+        rushes: float,
+        rates: dict[str, float],
+        opportunities: OpportunityCount,
+    ) -> tuple[float, float]:
+        """One rush-yard draw and the rush-TD expectation.
+
+        Pre-allocated yards and TDs are the team budget. They are not
+        multiplied again. A direct ``points`` call clamps
+        ``(rate / prior) × opponent`` to ±``COMBINED_CLAMP`` so a hot
+        one-week rate and the opponent adjustment cannot stack. Rates that
+        are still the prior, with a multiplier of 1, keep ``rushes × rate``.
+        """
+        if opportunities.rush_yards is not None or opportunities.rush_tds is not None:
+            yards = opportunities.rush_yards
+            if yards is None:
+                yards = rushes * rates["yards_per_carry"]
+            tds = opportunities.rush_tds
+            if tds is None:
+                tds = rushes * rates["rush_td_per_carry"]
+            return sample_yards(rng, yards), tds
+        prior = position_rates(pos)
+        return (
+            sample_yards(
+                rng,
+                _clamped_mean(
+                    rushes,
+                    rates["yards_per_carry"],
+                    prior["yards_per_carry"],
+                    self.rush_multiplier(player.opponent),
+                ),
+            ),
+            _clamped_mean(
+                rushes,
+                rates["rush_td_per_carry"],
+                prior["rush_td_per_carry"],
+                self.td_multiplier(player.team, player.opponent),
+            ),
+        )
+
     def points(
         self,
         rng: random.Random,
@@ -762,15 +900,9 @@ class DataEfficiency:
             else:
                 pass_yd = sum(line.rec_yd for line in opportunities.team_receiving)
                 pass_td = sum(line.rec_td for line in opportunities.team_receiving)
-            ypc = rates["yards_per_carry"]
-            rush_mult = self.rush_multiplier(player.opponent)
-            if rush_mult != 1.0:
-                ypc *= rush_mult
-            rush_yd = sample_yards(rng, rushes * ypc)
-            rush_td = rushes * rates["rush_td_per_carry"]
-            td_mult = self.td_multiplier(player.team, player.opponent)
-            if td_mult != 1.0:
-                rush_td *= td_mult
+            rush_yd, rush_td = self._rush_scoring(
+                rng, player, pos, rushes, rates, opportunities
+            )
             return max(
                 0.0,
                 skill_fd_points(
@@ -786,15 +918,9 @@ class DataEfficiency:
         else:
             line = opportunities.receiving
         rushes = max(0.0, opportunities.rushes)
-        ypc = rates["yards_per_carry"]
-        rush_mult = self.rush_multiplier(player.opponent)
-        if rush_mult != 1.0:
-            ypc *= rush_mult
-        rush_yd = sample_yards(rng, rushes * ypc)
-        rush_td = rushes * rates["rush_td_per_carry"]
-        td_mult = self.td_multiplier(player.team, player.opponent)
-        if td_mult != 1.0:
-            rush_td *= td_mult
+        rush_yd, rush_td = self._rush_scoring(
+            rng, player, pos, rushes, rates, opportunities
+        )
         return max(
             0.0,
             skill_fd_points(
@@ -854,14 +980,31 @@ def _index_sides(
     return {key: _weighted(group) for key, group in grouped.items()}
 
 
+def _clamped_mean(count: float, rate: float, prior: float, multiplier: float) -> float:
+    """``count × prior × clamp((rate / prior) × multiplier)``.
+
+    ``multiplier == 1`` and ``rate == prior`` returns ``count × rate`` with
+    no extra multiply, so the placeholder float is unchanged.
+    """
+    carries = max(0.0, float(count))
+    if multiplier == 1.0 and rate == prior:
+        return carries * rate
+    ratio = (rate / prior) if prior else 1.0
+    scale = clamp(ratio * multiplier, 1.0 - COMBINED_CLAMP, 1.0 + COMBINED_CLAMP)
+    base = carries * prior
+    if scale == 1.0:
+        return base
+    return base * scale
+
+
 def build_efficiency(
     mode: str | None,
     inputs: SimInputs | None,
     *,
     before_week: int | None = None,
 ) -> EfficiencyModel:
-    """``data`` (default) or ``placeholder``."""
-    name = (mode or "data").strip().lower()
+    """``placeholder`` (default) or ``data``."""
+    name = (mode or "placeholder").strip().lower()
     if name == "placeholder":
         return PlaceholderEfficiency()
     if name != "data":

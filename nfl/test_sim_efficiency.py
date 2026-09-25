@@ -9,9 +9,12 @@ from nfl.players import Player
 from nfl.projections import week1_score
 from nfl.sim import simulate_games
 from nfl.sim_efficiency import (
+    COMBINED_CLAMP,
     OPP_CLAMP,
+    PRIOR_CARRIES,
     PRIOR_TARGETS,
     YARD_TILT_MAX,
+    YARDS_PER_RUSH,
     DataEfficiency,
     PlaceholderEfficiency,
     build_efficiency,
@@ -106,6 +109,30 @@ class ShrinkageTest(unittest.TestCase):
         prior = position_rates("WR")["catch_rate"]
         self.assertGreater(rates["catch_rate"], prior)
         self.assertLess(rates["catch_rate"], 1.0)
+
+    def test_one_week_of_carries_stays_near_the_prior(self) -> None:
+        hot = _week(
+            1,
+            position="RB",
+            player_name="Derrick Henry",
+            team_fd="BAL",
+            carries=20,
+            rushing_yards=130,
+            rushing_tds=2,
+        )
+        eff = DataEfficiency(SimInputs(player_weeks=(hot,)), before_week=2)
+        rates = eff.rates_for(
+            _pl(name="Derrick Henry", team="BAL", position="RB"),
+            "RB",
+        )
+        ypc = rates["yards_per_carry"]
+        observed = 130 / 20
+        prior = YARDS_PER_RUSH["RB"]
+        self.assertGreater(ypc, prior)
+        self.assertLess(abs(ypc - prior), abs(ypc - observed))
+        self.assertLess(ypc, 5.2)
+        # 20 carries against an 80-carry prior is one fifth of the blend.
+        self.assertLess((20.0 / (20.0 + PRIOR_CARRIES)), 0.25)
 
 
 class OpponentClampTest(unittest.TestCase):
@@ -204,6 +231,91 @@ class OpponentClampTest(unittest.TestCase):
         eff = DataEfficiency(SimInputs(team_weeks=(off, de)), before_week=2)
         self.assertAlmostEqual(eff.td_multiplier("DET", "NO"), 1.0 + 0.15, places=4)
 
+    def test_rush_complement_and_opponent_do_not_stack(self) -> None:
+        eff = DataEfficiency(
+            SimInputs(
+                team_weeks=(
+                    self._defense(rush_epa_per_play=8.0, rush_success_rate=0.90),
+                )
+            ),
+            before_week=2,
+        )
+        self.assertAlmostEqual(eff.rush_multiplier("NO"), 1.0 + OPP_CLAMP, places=4)
+        # Pass tilt 0.92 → rush complement 1.08. 1.08 × 1.15 = 1.242.
+        scale = eff.rush_budget_scale("DET", "NO", 0.92)
+        self.assertAlmostEqual(scale, 1.0 + COMBINED_CLAMP, places=4)
+        self.assertLess(scale, 1.08 * 1.15)
+
+
+class RushBudgetTest(unittest.TestCase):
+    def test_empty_history_budget_is_the_prior_yards(self) -> None:
+        rb = _pl(pid="rb", name="Justice Hill", team="BAL", position="RB", opponent="CLE")
+        eff = DataEfficiency(SimInputs())
+        got = eff.allocate_rush(
+            [(rb, 10.0)],
+            team="BAL",
+            opponent="CLE",
+            pass_tilt=1.0,
+        )
+        self.assertEqual(got[rb.pid][0], 10.0 * YARDS_PER_RUSH["RB"])
+        self.assertEqual(got[rb.pid][1], 10.0 * 0.025)
+
+    def test_hot_ypc_redistributes_and_does_not_add(self) -> None:
+        henry = _pl(
+            pid="henry",
+            name="Derrick Henry",
+            team="BAL",
+            position="RB",
+            opponent="CLE",
+        )
+        other = _pl(
+            pid="hill",
+            name="Justice Hill",
+            team="BAL",
+            position="RB",
+            opponent="CLE",
+        )
+        hot = _week(
+            1,
+            position="RB",
+            player_name="Derrick Henry",
+            team_fd="BAL",
+            carries=22,
+            rushing_yards=143,
+            rushing_tds=2,
+        )
+        defense = TeamStat(
+            team_fd="CLE",
+            side="defense",
+            week=1,
+            rush_epa_per_play=8.0,
+            rush_success_rate=0.90,
+            rush_n=10_000,
+            n=10_000,
+        )
+        eff = DataEfficiency(
+            SimInputs(player_weeks=(hot,), team_weeks=(defense,)),
+            before_week=2,
+        )
+        henry_rushes = 18.0
+        other_rushes = 6.0
+        got = eff.allocate_rush(
+            [(henry, henry_rushes), (other, other_rushes)],
+            team="BAL",
+            opponent="CLE",
+            pass_tilt=0.92,
+        )
+        prior = YARDS_PER_RUSH["RB"]
+        scale = eff.rush_budget_scale("BAL", "CLE", 0.92)
+        budget = (henry_rushes + other_rushes) * prior * scale
+        self.assertAlmostEqual(got["henry"][0] + got["hill"][0], budget, places=4)
+        self.assertAlmostEqual(scale, 1.0 + COMBINED_CLAMP, places=4)
+        # The bellcow is the larger share, and still under the unanchored stack.
+        self.assertGreater(got["henry"][0], henry_rushes * prior * scale * 0.5)
+        self.assertLess(got["henry"][0], henry_rushes * (143 / 22) * 1.15)
+        prior_share = henry_rushes * prior / ((henry_rushes + other_rushes) * prior)
+        self.assertGreater(got["henry"][0], prior_share * budget)
+
 
 class WeekScopeTest(unittest.TestCase):
     def test_target_week_does_not_leak_into_the_rate(self) -> None:
@@ -218,7 +330,10 @@ class WeekScopeTest(unittest.TestCase):
         held_rate = held.rates_for(player, "WR")["catch_rate"]
         leaked_rate = leaked.rates_for(player, "WR")["catch_rate"]
         self.assertLess(held_rate, 0.62)
-        self.assertGreater(leaked_rate, held_rate + 0.15)
+        # One week is a small share of the prior, so the leaked week moves
+        # the rate without jumping most of the way to the observation.
+        self.assertGreater(leaked_rate, held_rate + 0.08)
+        self.assertLess(leaked_rate, 0.85)
 
     def test_season_board_is_ignored_when_the_week_is_set(self) -> None:
         season = TeamStat(
@@ -325,3 +440,6 @@ class FallbackTest(unittest.TestCase):
         self.assertAlmostEqual(a.rec_yd, b.rec_yd, places=6)
         self.assertAlmostEqual(a.receptions, b.receptions, places=6)
         self.assertAlmostEqual(a.rec_td, b.rec_td, places=6)
+
+    def test_omitted_mode_is_placeholder(self) -> None:
+        self.assertIsInstance(build_efficiency(None, None), PlaceholderEfficiency)

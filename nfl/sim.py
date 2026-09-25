@@ -23,14 +23,18 @@ share that world:
    rush-yard floor. With catcher history the same passing floor is the
    implied-total anchor, and the rush count is his own carries or at least
    max(league rush share, that yard floor). Other QBs on that team score 0.
-   O, D, IR, and NA do not keep the starter job.
+   O, D, IR, and NA do not keep the starter job, and they do not draw
+   target or rush share. That share is renormalized onto active teammates.
 
 Efficiency (yards per opportunity, TD rates) is ``PlaceholderEfficiency``
 or ``DataEfficiency`` in ``nfl/sim_efficiency.py``. ``DataEfficiency`` is
 layer 4 (shrunk player rates and a clamped opponent). It is not a
 prop-line calibration. ``simulate_games`` still defaults to the
 placeholder so empty inputs and existing callers keep the same draws.
-The CLI flag is ``--sim-efficiency {placeholder,data}`` (default ``data``).
+The CLI flag is ``--sim-efficiency {placeholder,data}`` (default
+``placeholder`` until data mode beats it). Data mode keeps team rush
+attempts on the implied script and redistributes the rush-yard budget.
+It does not also scale attempts.
 
 Inputs are ``SimInputs`` (team stats, weekly targets, optional snaps).
 The sim does not call Gangstash. Empty inputs reproduce the role-share
@@ -651,8 +655,12 @@ def _score_fallback(
     group: list[Player],
     index: _HistoryIndex | None,
 ) -> float:
-    """Role share, except the passing QB (anchors) and his backups (0)."""
-    if (player.position or "").upper() == "QB" and is_inactive(player):
+    """Role share, except the passing QB (anchors) and his backups (0).
+
+    O, D, IR, and NA score 0. They are already out of the target and rush
+    shares, so a fallback must not put a role-share stub back on them.
+    """
+    if is_inactive(player) and not _is_dst(player):
         return 0.0
     if (player.position or "").upper() != "QB":
         return _score_world(player, team_pts, opp_pts)
@@ -1289,11 +1297,12 @@ def _qb_depth_key(player: Player) -> tuple:
     return (rank, -(player.salary or 0), player.pid)
 
 
-def _catchers(
+def _target_candidates(
     team: str,
     group: list[Player],
     index: _HistoryIndex,
 ) -> list[Player]:
+    """WR/TE/RB with a positive target share, including inactive players."""
     out: list[Player] = []
     for pl in group:
         if (pl.team or "").upper() != team:
@@ -1303,6 +1312,45 @@ def _catchers(
         if mean_target_share(index.target_weeks(pl), index.snap_weeks(pl)) > 0:
             out.append(pl)
     return out
+
+
+def _catchers(
+    team: str,
+    group: list[Player],
+    index: _HistoryIndex,
+) -> list[Player]:
+    """Active catchers. O, D, IR, and NA do not take a target share."""
+    return [pl for pl in _target_candidates(team, group, index) if not is_inactive(pl)]
+
+
+def _fold_inactive_targets(
+    active: list[float],
+    inactive: list[float],
+) -> tuple[list[float], float]:
+    """Move inactive target share onto active catchers.
+
+    ``other`` stays the residual of the original shares (rostered plus
+    inactive), after the same >1 normalization. Inactive mass is not dumped
+    into that unrostered bucket. No active catchers: the mass falls into
+    ``other``.
+    """
+    all_sum = sum(active) + sum(inactive)
+    if all_sum > 1.0:
+        scale = 1.0 / all_sum
+        active = [value * scale for value in active]
+        inactive_mass = sum(inactive) * scale
+        other = 0.0
+    else:
+        inactive_mass = sum(inactive)
+        other = 1.0 - all_sum
+    active_sum = sum(active)
+    if inactive_mass > 0.0 and active_sum > 0.0:
+        active = [
+            value + inactive_mass * (value / active_sum) for value in active
+        ]
+    elif inactive_mass > 0.0:
+        other += inactive_mass
+    return active, other
 
 
 def _snap_pct_by_week(snaps: list[SnapWeek] | None) -> dict[int, float]:
@@ -1459,15 +1507,16 @@ def _tilt_anchors(
 ) -> tuple[float, float, float]:
     """Pass-vs-rush tilt and a red-zone TD nudge. Placeholder has neither.
 
-    A pass-anchor scale above 1 raises passing yards and trims rush
-    attempts by the complement, so the Vegas total stays the center.
+    A pass-anchor scale above 1 raises passing yards. Rush attempts stay
+    on the implied script. Data mode puts the rush complement on the
+    rush-yard budget (``allocate_rush``), so volume and efficiency do not
+    both scale.
     """
     scale_fn = getattr(eff, "pass_anchor_scale", None)
     if scale_fn is not None:
         tilt = float(scale_fn(team, opponent or None))
         if tilt != 1.0:
             yard_anchor *= tilt
-            rush_attempts *= max(0.0, 2.0 - tilt)
     td_fn = getattr(eff, "td_anchor_scale", None)
     if td_fn is not None:
         td_scale = float(td_fn(team, opponent or None))
@@ -1533,17 +1582,21 @@ def _draw_team_opportunities(
         mean_target_share(index.target_weeks(pl), index.snap_weeks(pl))
         for pl in catchers
     ]
+    inactive = [
+        pl
+        for pl in _target_candidates(team, team_players, index)
+        if is_inactive(pl)
+    ]
+    inactive_means = [
+        mean_target_share(index.target_weeks(pl), index.snap_weeks(pl))
+        for pl in inactive
+    ]
     series = [
         _weekly_shares(index.target_weeks(pl), index.snap_weeks(pl))
         for pl in catchers
     ]
     kappa = share_kappa(series)
-    mean_sum = sum(means)
-    if mean_sum > 1.0:
-        means = [m / mean_sum for m in means]
-        other = 0.0
-    else:
-        other = 1.0 - mean_sum
+    means, other = _fold_inactive_targets(means, inactive_means)
     simplex_means = list(means)
     if other > 1e-6:
         simplex_means.append(other)
@@ -1551,7 +1604,11 @@ def _draw_team_opportunities(
     target_share = {pl.pid: drawn[i] for i, pl in enumerate(catchers)}
     other_share = drawn[-1] if other > 1e-6 else 0.0
 
-    rbs = [pl for pl in team_players if (pl.position or "").upper() == "RB"]
+    rbs = [
+        pl
+        for pl in team_players
+        if (pl.position or "").upper() == "RB" and not is_inactive(pl)
+    ]
     snap_means = {pl.pid: index.snap_mean(pl) for pl in rbs}
     carry_means = {pl.pid: index.mean_carries(pl) for pl in rbs}
     rush_means, any_rush_signal = blended_rush_shares(rbs, snap_means, carry_means)
@@ -1574,6 +1631,9 @@ def _draw_team_opportunities(
         qb_rushes = min(qb_rushes, rush_attempts)
     rb_pool = max(0.0, rush_attempts - qb_rushes)
     rb_rushes = _rb_rush_attempts(rbs, rush_share, rb_pool)
+    rush_alloc = _rush_allocation(
+        eff, team, opponent, starter, qb_rushes, rbs, rb_rushes
+    )
     out: dict[str, OpportunityCount] = {}
     lines: list[ReceivingLine] = []
     raw_by_pid: dict[str, tuple[float, float, ReceivingLine]] = {}
@@ -1593,29 +1653,69 @@ def _draw_team_opportunities(
     cursor = 0
     for pl in catchers:
         targets, rushes, _raw = raw_by_pid[pl.pid]
+        rush_yards, rush_tds = rush_alloc.get(pl.pid, (None, None))
         out[pl.pid] = OpportunityCount(
             targets=targets,
             rushes=rushes,
             receiving=team_lines[cursor],
+            rush_yards=rush_yards,
+            rush_tds=rush_tds,
         )
         cursor += 1
     for pl in rbs:
         if pl.pid in out:
             continue
-        out[pl.pid] = OpportunityCount(rushes=rb_rushes.get(pl.pid, 0.0))
+        rush_yards, rush_tds = rush_alloc.get(pl.pid, (None, None))
+        out[pl.pid] = OpportunityCount(
+            rushes=rb_rushes.get(pl.pid, 0.0),
+            rush_yards=rush_yards,
+            rush_tds=rush_tds,
+        )
     for pl in team_players:
         if (pl.position or "").upper() != "QB":
             continue
         if starter is not None and pl.pid == starter.pid:
+            rush_yards, rush_tds = rush_alloc.get(pl.pid, (None, None))
             out[pl.pid] = OpportunityCount(
                 pass_attempts=pass_attempts,
                 rushes=qb_rushes,
                 team_receiving=team_lines,
+                rush_yards=rush_yards,
+                rush_tds=rush_tds,
             )
         else:
             # In the dict so the backup is not scored off team points.
             out[pl.pid] = OpportunityCount()
     return out
+
+
+def _rush_allocation(
+    eff: EfficiencyModel,
+    team: str,
+    opponent: str,
+    starter: Player | None,
+    qb_rushes: float,
+    rbs: list[Player],
+    rb_rushes: dict[str, float],
+) -> dict[str, tuple[float, float]]:
+    """Data-mode rush yards and TDs. Placeholder has no allocator."""
+    alloc = getattr(eff, "allocate_rush", None)
+    if alloc is None:
+        return {}
+    specs: list[tuple[Player, float]] = []
+    if starter is not None and qb_rushes > 0:
+        specs.append((starter, qb_rushes))
+    for pl in rbs:
+        carries = rb_rushes.get(pl.pid, 0.0)
+        if carries > 0:
+            specs.append((pl, carries))
+    if not specs:
+        return {}
+    tilt = 1.0
+    scale_fn = getattr(eff, "pass_anchor_scale", None)
+    if scale_fn is not None:
+        tilt = float(scale_fn(team, opponent or None))
+    return alloc(specs, team=team, opponent=opponent or None, pass_tilt=tilt)
 
 
 class _HistoryIndex:

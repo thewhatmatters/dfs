@@ -26,8 +26,9 @@ snaps). A questionable player is not handed off. A Q with no stat row, or
 0 offensive snaps, is counted as a DNP and the projection stays.
 
 ``--projection-source`` stays ``board`` on the optimizer. This command
-only compares the two. ``--sim-efficiency data`` (the default) scores the
-sim with shrunk prior-week rates. ``placeholder`` keeps the league averages.
+only compares the two. ``--sim-efficiency`` defaults to ``placeholder``
+(league-average rates) until ``data`` beats it. ``data`` scores the sim
+with shrunk prior-week rates.
 """
 
 from __future__ import annotations
@@ -689,7 +690,13 @@ def apply_week_context(
     if injury_raw:
         parsed = injury_rows_from_records(injury_raw, season=season, week=week)
         if parsed:
+            before = [pl.injury for pl in players]
             players = stamp_injuries(players, parsed)
+            stamped = sum(
+                1 for old, pl in zip(before, players) if pl.injury != old
+            )
+            if stamped:
+                notes.append(f"injuries: gangstash {stamped}")
 
     chart, note = _depth_table(depth_raw or [], season=season, week=week)
     if depth_note:
@@ -741,7 +748,7 @@ def run_backtest(
     n: int = 400,
     seed: int = 1,
     starters_only: bool = False,
-    efficiency: str = "data",
+    efficiency: str = "placeholder",
 ) -> BacktestReport:
     """Score ``players`` against weekly ``fd_points``. No network."""
     noted = _order_missing(list(missing or []))
@@ -1110,6 +1117,10 @@ def _load_live(
     )
     if injury_err:
         injury_raw = []
+        # The CSV injury column is already on the pool. No-CSV mode has
+        # nowhere else to read O/D/IR/NA, so a failed fetch is visible.
+        if players is None:
+            missing.append("injuries")
     depth_fetched, _depth_err = _fetch_rows(
         lambda: fetch_depth_charts(season=season, week=week)
     )
@@ -1221,9 +1232,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--sim-efficiency",
         choices=("placeholder", "data"),
-        default="data",
-        help="layer-4 efficiency: data uses prior-week gangstash rates "
-        "(default); placeholder keeps the league-average rates",
+        default="placeholder",
+        help="layer-4 efficiency: placeholder (default) keeps the "
+        "league-average rates; data uses prior-week gangstash rates",
     )
     args = ap.parse_args(argv)
     if args.week < 1 or args.season < 1:

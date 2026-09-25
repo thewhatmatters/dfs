@@ -22,6 +22,7 @@ from nfl.backtest import (
     run_backtest,
     summarize_errors,
 )
+from nfl.injuries import injury_rows_from_records
 from nfl.props import props_for_week
 from nfl.sim import simulate_games
 from nfl.gangstash import GangstashDataError, GangstashDataKeyMissing, dataset_cache_file
@@ -170,6 +171,9 @@ class BacktestReportTest(unittest.TestCase):
                 "nfl.backtest.fetch_player_stats_weekly",
                 return_value=(actual, {"live": False}),
             ), patch(
+                "nfl.backtest.fetch_dst_weekly",
+                return_value=([], {}),
+            ), patch(
                 "nfl.backtest.fetch_closing_lines",
                 return_value=([], {"live": False}),
             ), patch(
@@ -227,6 +231,9 @@ class BacktestReportTest(unittest.TestCase):
             with patch(
                 "nfl.backtest.fetch_player_stats_weekly",
                 side_effect=GangstashDataKeyMissing("GANGSTASH_API_KEY is not set"),
+            ), patch(
+                "nfl.backtest.fetch_dst_weekly",
+                return_value=([], {}),
             ):
                 buf = io.StringIO()
                 with redirect_stdout(buf):
@@ -365,6 +372,9 @@ class WeekScopeTest(unittest.TestCase):
                 "nfl.backtest.fetch_player_stats_weekly",
                 return_value=(actual, {"live": False}),
             ), patch(
+                "nfl.backtest.fetch_dst_weekly",
+                return_value=([], {}),
+            ), patch(
                 "nfl.backtest.fetch_closing_lines",
                 return_value=([], {"live": False}),
             ), patch(
@@ -426,6 +436,9 @@ class WeekScopeTest(unittest.TestCase):
                 "nfl.backtest.fetch_player_stats_weekly",
                 return_value=(actual, {"live": False}),
             ), patch(
+                "nfl.backtest.fetch_dst_weekly",
+                return_value=([], {}),
+            ), patch(
                 "nfl.backtest.fetch_closing_lines",
                 side_effect=AssertionError("network"),
             ), patch(
@@ -470,6 +483,7 @@ class WeekScopeTest(unittest.TestCase):
         text = buf.getvalue()
         self.assertNotIn("closing_lines", text.split("missing:")[1].split("\n")[0])
         self.assertIn("QB", text)
+        self.assertIn("sim efficiency: placeholder", text)
 
     def test_injured_starter_loses_the_pass_volume(self) -> None:
         darnold = _pl(
@@ -531,6 +545,86 @@ class WeekScopeTest(unittest.TestCase):
         gs = simulate_games(players, n=40, seed=1)
         self.assertGreater(gs.by_pid["lock"].mean, 12.0)
         self.assertLess(gs.by_pid["darnold"].mean, 0.5)
+
+    def test_injury_id_stamps_without_a_name(self) -> None:
+        rows = injury_rows_from_records(
+            [
+                {
+                    "player_id": "00-0035676",
+                    "gsis_id": "00-0035676",
+                    "status": "IR",
+                    "season": 2026,
+                    "week": 2,
+                },
+                {
+                    "player_id": "lane",
+                    "status": "Doubtful",
+                    "team": "BAL",
+                    "season": 2026,
+                },
+                {
+                    "player_id": "dated",
+                    "status": "Out",
+                    "team": "NE",
+                    "season": 2026,
+                    "week": 2,
+                },
+            ],
+            season=2026,
+            week=2,
+        )
+        # One row in the payload has a week, so the undated Lane row is dropped.
+        self.assertEqual([row.player_id for row in rows], ["00-0035676", "dated"])
+        undated = injury_rows_from_records(
+            [
+                {
+                    "player_id": "lane",
+                    "player_name": "Ja'Kobi Lane",
+                    "status": "D",
+                    "team": "BAL",
+                    "season": 2026,
+                }
+            ],
+            season=2026,
+            week=2,
+        )
+        self.assertEqual(len(undated), 1)
+        brown = _pl(
+            pid="00-0035676",
+            name="A.J. Brown",
+            position="WR",
+            team="NE",
+            opponent="MIA",
+            game="MIA@NE",
+        )
+        players, gaps, notes = apply_week_context(
+            [brown],
+            season=2026,
+            week=2,
+            line_rows=[
+                {
+                    "home_team_fd": "NE",
+                    "away_team_fd": "MIA",
+                    "season": 2026,
+                    "week": 2,
+                    "spread": -3.0,
+                    "total": 44.0,
+                }
+            ],
+            injury_raw=[
+                {
+                    "gsis_id": "00-0035676",
+                    "player_id": "00-0035676",
+                    "status": "IR",
+                    "season": 2026,
+                    "week": 2,
+                }
+            ],
+            lines_attached=True,
+        )
+        self.assertEqual(players[0].injury, "IR")
+        self.assertIn("injuries: gangstash 1", notes)
+        self.assertNotIn("injuries", gaps)
 
     def test_starters_are_depth_1_who_played(self) -> None:
         starter = _pl(
@@ -916,6 +1010,9 @@ class WeekScopeTest(unittest.TestCase):
             with patch(
                 "nfl.backtest.fetch_player_stats_weekly",
                 return_value=([_actual("Malik Willis", "MIA", 14.0)], {}),
+            ), patch(
+                "nfl.backtest.fetch_dst_weekly",
+                return_value=([], {}),
             ):
                 err = io.StringIO()
                 with redirect_stderr(err):
@@ -955,6 +1052,9 @@ class WeekScopeTest(unittest.TestCase):
             with patch(
                 "nfl.backtest.fetch_player_stats_weekly",
                 return_value=([_actual("Malik Willis", "MIA", 14.0)], {}),
+            ), patch(
+                "nfl.backtest.fetch_dst_weekly",
+                return_value=([], {}),
             ):
                 err = io.StringIO()
                 with redirect_stderr(err):
@@ -984,6 +1084,9 @@ class WeekScopeTest(unittest.TestCase):
             with patch(
                 "nfl.backtest.fetch_player_stats_weekly",
                 return_value=([_actual("QB One", "DET", 11.0)], {}),
+            ), patch(
+                "nfl.backtest.fetch_dst_weekly",
+                return_value=([], {}),
             ), patch(
                 "nfl.backtest.fetch_closing_lines",
                 side_effect=GangstashDataError("gangstash closing_lines Unknown dataset"),
@@ -1313,6 +1416,7 @@ class LiveBacktestFixesTest(unittest.TestCase):
         def_row = next(row for row in report.rows if row.position == "DEF")
         self.assertEqual(def_row.n, 1)
         self.assertIn("DEF", report.to_text())
+        self.assertIn("sim efficiency: placeholder", report.to_text())
         starter_pos = [row.position for row in report.starters]
         self.assertIn("DEF", starter_pos)
 
@@ -1469,6 +1573,62 @@ class LiveBacktestFixesTest(unittest.TestCase):
         self.assertIn("pool: hindsight", text)
         self.assertIn("DEF", text)
         self.assertIn("QB", text)
+
+    def test_no_csv_names_a_failed_injury_fetch(self) -> None:
+        closing = [
+            {
+                "season": 2026,
+                "week": 2,
+                "home_team": "DET",
+                "away_team": "NO",
+                "home_line": -3.0,
+                "total": 47.0,
+                "implied_home_total": 25.0,
+                "implied_away_total": 22.0,
+                "kickoff": "2026-09-14T17:00:00Z",
+            }
+        ]
+        depth = [
+            _depth("Jared Goff", "DET", "QB", 1),
+            _depth("Derek Carr", "NO", "QB", 1),
+        ]
+        with patch(
+            "nfl.backtest.fetch_player_stats_weekly",
+            return_value=([_actual("Jared Goff", "DET", 18.0, pass_attempts=30)], {}),
+        ), patch(
+            "nfl.backtest.fetch_dst_weekly",
+            return_value=([], {}),
+        ), patch(
+            "nfl.backtest.fetch_closing_lines",
+            return_value=(closing, {}),
+        ), patch(
+            "nfl.backtest.fetch_game_lines",
+            side_effect=AssertionError("game_lines"),
+        ), patch(
+            "nfl.backtest.fetch_week_injuries",
+            side_effect=GangstashDataError("gangstash injuries down"),
+        ), patch(
+            "nfl.backtest.fetch_depth_charts",
+            return_value=(depth, {}),
+        ), patch(
+            "nfl.backtest.load_optimizer_targets",
+            return_value=([], {}),
+        ), patch(
+            "nfl.backtest.load_optimizer_snaps",
+            return_value=([], {}),
+        ), patch(
+            "nfl.backtest.fetch_props",
+            return_value=([], {}),
+        ), patch(
+            "nfl.backtest.resolve_sim_inputs",
+            return_value=(None, ""),
+        ), patch("nfl.gangstash.http_json", side_effect=AssertionError("network")):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                code = main(["--season", "2026", "--week", "2", "--n", "5"])
+        self.assertEqual(code, 0)
+        missing = buf.getvalue().split("missing:", 1)[1].split("\n", 1)[0]
+        self.assertIn("injuries", missing)
 
 
 if __name__ == "__main__":

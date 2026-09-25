@@ -423,9 +423,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument(
         "--sim-efficiency",
         choices=("placeholder", "data"),
-        default="data",
-        help="layer-4 efficiency for --sim: data (default) uses shrunk "
-        "gangstash player and team rates; placeholder keeps league averages. "
+        default="placeholder",
+        help="layer-4 efficiency for --sim: placeholder (default) keeps "
+        "league averages; data uses shrunk gangstash player and team rates. "
         "Does not change the board.",
     )
     ap.add_argument(

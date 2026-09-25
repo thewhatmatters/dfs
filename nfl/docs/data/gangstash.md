@@ -88,7 +88,7 @@ python3 -m nfl.gangstash_data team-stats-weekly --season 2026 --week 1,2
 | `game_lines` | `date=YYYY-MM-DD` (ET kickoff) **or** `season` + one `week` | optimizer sends the slate **date** only, unless `--week` is set |
 | `closing_lines` | `season` + one `week` | preferred for a past `--week` and for `nfl.backtest`. Live rows use `home_line` (negative = home favored), `total`, `implied_home_total`, `implied_away_total`. `kickoff` may be null. A row that still will not parse is skipped and the week falls through to `game_lines` |
 | `depth_charts` | optional `team`, `position` (that is `pos_abb`), `pos_grp`, `season`, `week` | optimizer requests `pos_grp=3WR 1TE`. A chart with no `week` column is the current chart |
-| `injuries` | `season` + one `week` | not deployed. Backtest uses the FanDuel CSV indicator and ignores an Unknown dataset |
+| `injuries` | `season` required; `week`, `team`, `gsis_id`, and `status` optional. Rows carry `player_id` | live. Backtest stamps the week. No-CSV mode uses this feed. A CSV pool still prefers to stay quiet when the fetch fails |
 | `team_stats` | `season` (required), `season_type` (default `REG`), optional `side` (`offense`/`defense`), `team` | not scored |
 | `team_stats_weekly` | `season` + `week` (single or comma list), optional `team` | backtest pools weeks before the target into team EPA variance. The optimizer still overlays rates on the season board |
 | `dst_weekly` | `season` (required), optional `week`, optional `team` | DEF actuals for the backtest. Join is `(season, week, team)`. `fd_points` is the FanDuel score |
@@ -160,12 +160,15 @@ A missing required column, or zero games after the season/week filter, is
 an error. A simple file (no nflverse schedule columns) still errors on a
 column the reader does not know.
 
-**`injuries`:** not deployed (Unknown dataset). The backtest does not list
-that as missing and does not stop. It reads the FanDuel CSV Injury Indicator
-(`O` / `D` / `IR` / `Q` / `NA`). `O`, `D`, `IR`, and `NA` hand the chart
-slot to the next healthy player. `Q` keeps the pre-game projection. If this
-dataset later returns `player_name`, `team_fd`, `status`, `season`, `week`,
-those rows are applied for that week.
+**`injuries`:** live. `season` is required. `week`, `team`, `gsis_id`, and
+`status` are optional. Rows carry `player_id`. The backtest stamps the
+week onto the pool (id match, then team and name). `O`, `D`, `IR`, and
+`NA` are out of the sim's target and rush shares and hand the chart slot
+to the next healthy player. `Q` keeps the pre-game projection. A FanDuel
+CSV still has its Injury Indicator. A failed injuries fetch on a CSV pool
+is not listed as missing. No-CSV mode has no indicator column, so a failed
+fetch is `missing: injuries` and does not stop the week. An Unknown dataset
+on a CSV pool is still a quiet skip.
 
 **`depth_charts`** (latest ESPN via nflverse): `team`, `team_fd`, `pos_grp`,
 `pos_abb`, `pos_name`, `pos_slot`, `pos_rank`, `player_name`, `gsis_id`,
