@@ -28,6 +28,9 @@ DROP_STATUSES = frozenset(
 # states. Q is questionable and stays the starter. NA matches the optimizer
 # pool filter (inactive, not a body part).
 INACTIVE_CODES = frozenset({"O", "D", "IR", "NA", "SUSP"})
+# Nightly projections. Out and IR leave the sim pool. Doubtful stays
+# at full value and is only flagged. Questionable is unchanged.
+POOL_OUT_CODES = frozenset({"O", "IR", "NA", "SUSP"})
 _CODE_WORDS = {
     "o": "O",
     "out": "O",
@@ -55,6 +58,7 @@ class InjuryRow:
     status: str
     gsis_id: str | None = None
     player_id: str | None = None
+    player_key: str | None = None
 
 
 def _cache_path() -> Path:
@@ -131,10 +135,15 @@ def injury_rows_from_records(
     """Gangstash ``dataset=injuries`` rows for one season and week.
 
     ``season`` is required on the query. ``week``, ``team``, ``gsis_id``,
-    and ``status`` may be absent. A row is kept with ``player_id`` or
-    ``gsis_id`` even when the name is blank. A mismatched season or week
-    is dropped. If any row carries a week, undated rows are dropped. If
-    none do, they are kept: the query was already that season and week.
+    and ``status`` may be absent. Live rows use ``full_name``,
+    ``report_status``, ``gsis_id``, and ``player_key`` (``practice_status``
+    and ``date_modified`` are ignored). Older rows used ``player_name`` /
+    ``name``, ``status``, and ``player_id``. Both shapes parse.
+
+    A row is kept with ``player_id``, ``gsis_id``, or ``player_key`` even
+    when the name is blank. A mismatched season or week is dropped. If
+    any row carries a week, undated rows are dropped. If none do, they
+    are kept: the query was already that season and week.
     """
     saw_week = any(
         isinstance(row, dict) and not _blank(row.get("week")) for row in rows
@@ -159,21 +168,24 @@ def injury_rows_from_records(
                 continue
         elif saw_week:
             continue
-        name = str(row.get("player_name") or row.get("name") or "").strip()
-        status = str(row.get("status") or "").strip()
+        name = str(
+            row.get("full_name") or row.get("player_name") or row.get("name") or ""
+        ).strip()
+        status = str(row.get("report_status") or row.get("status") or "").strip()
         team_raw = str(row.get("team_fd") or row.get("team") or "").strip()
-        gsis_id = _opt_id(row, "gsis_id")
+        player_key = _opt_id(row, "player_key")
+        gsis_id = _opt_id(row, "gsis_id") or player_key
         player_id = _opt_id(row, "player_id")
-        if not name and not gsis_id and not player_id:
+        if not name and not gsis_id and not player_id and not player_key:
             continue
         team = ""
         if team_raw:
             try:
                 team = require_fd(team_raw).fd
             except UnmappedTeam:
-                if not gsis_id and not player_id:
+                if not gsis_id and not player_id and not player_key:
                     continue
-        elif not gsis_id and not player_id:
+        elif not gsis_id and not player_id and not player_key:
             continue
         out.append(
             InjuryRow(
@@ -182,6 +194,7 @@ def injury_rows_from_records(
                 status=status,
                 gsis_id=gsis_id,
                 player_id=player_id,
+                player_key=player_key,
             )
         )
     return out
@@ -203,11 +216,17 @@ def is_inactive(player: Player) -> bool:
     return injury_code(player.injury) in INACTIVE_CODES
 
 
+def is_pool_out(player: Player) -> bool:
+    """Out, IR, NA, or suspended. Doubtful and Questionable stay."""
+    return injury_code(player.injury) in POOL_OUT_CODES
+
+
 def stamp_injuries(players: list[Player], rows: list[InjuryRow]) -> list[Player]:
     """Write gangstash statuses onto matching players. CSV codes stay otherwise.
 
-    A row matches ``Player.pid`` against ``gsis_id`` or ``player_id`` first
-    (depth-chart pools use the gsis id as the pid), then ``(team, name)``.
+    A row matches ``Player.pid`` against ``gsis_id``, ``player_key``, or
+    ``player_id`` first (depth-chart pools use the gsis id as the pid),
+    then ``(team, name)``.
     """
     by_id: dict[str, str] = {}
     by_key: dict[tuple[str, str], str] = {}
@@ -215,10 +234,9 @@ def stamp_injuries(players: list[Player], rows: list[InjuryRow]) -> list[Player]
         code = injury_code(row.status)
         if not code:
             continue
-        if row.gsis_id:
-            by_id[row.gsis_id] = code
-        if row.player_id:
-            by_id[row.player_id] = code
+        for ident in (row.gsis_id, row.player_key, row.player_id):
+            if ident:
+                by_id[ident] = code
         if row.name and row.team:
             by_key[(row.team, match_key(row.name))] = code
     out: list[Player] = []
@@ -270,6 +288,173 @@ def handoff_chart(players: list[Player]) -> list[Player]:
         patched = replace(pl, depth_rank=new_rank[pl.pid])
         out.append(replace(patched, objective=score_player(patched)))
     return out
+
+
+def _zero_out(player: Player) -> Player:
+    """Out of the sim. Objective is 0 so a board row cannot keep the old mean."""
+    return replace(
+        player,
+        depth_rank=None,
+        target_share=None,
+        snap_share=None,
+        objective=0.0,
+    )
+
+
+def _higher_share(own: float | None, other: float | None) -> float | None:
+    """Keep the larger share. A missing side does not pull the other down."""
+    if own is None:
+        return other
+    if other is None:
+        return own
+    return own if own >= other else other
+
+
+def promote_out_chart(players: list[Player]) -> list[Player]:
+    """Fill an Out/IR/NA/SUSP depth slot with the next player at that position.
+
+    Ranks are rewritten only inside a team and position that lost a
+    charted player. A group with no removal keeps its ranks, including
+    gaps. The player who steps into an Out player's slot keeps
+    ``max(own share, that slot's share)`` for targets and snaps. A
+    healthy player's share stays on that player. Doubtful and
+    Questionable keep their rank, share, and objective. An out player's
+    objective is 0.
+    """
+    groups: dict[tuple[str, str], list[Player]] = {}
+    for pl in players:
+        pos = (pl.position or "").upper()
+        if pos in {"D", "DEF"}:
+            continue
+        groups.setdefault(((pl.team or "").upper(), pos), []).append(pl)
+    updates: dict[str, Player] = {}
+    for group in groups.values():
+        charted = [pl for pl in group if pl.depth_rank is not None]
+        charted.sort(
+            key=lambda pl: (
+                int(pl.depth_rank or 0),
+                -(pl.salary or 0),
+                pl.pid,
+            )
+        )
+        removed = [pl for pl in charted if is_pool_out(pl)]
+        if not removed:
+            for pl in group:
+                if is_pool_out(pl):
+                    updates[pl.pid] = _zero_out(pl)
+            continue
+        healthy = [pl for pl in charted if not is_pool_out(pl)]
+        for index, pl in enumerate(healthy):
+            role = charted[index]
+            rank = index + 1
+            target = pl.target_share
+            snap = pl.snap_share
+            tgt_source = pl.targets_source
+            snap_source = pl.snaps_source
+            # Only the vacated Out slot moves. The next player never
+            # inherits a healthy teammate's larger share.
+            if role.pid != pl.pid and is_pool_out(role):
+                if pl.target_share is None and role.target_share is not None:
+                    tgt_source = "inherited"
+                if pl.snap_share is None and role.snap_share is not None:
+                    snap_source = "inherited"
+                target = _higher_share(pl.target_share, role.target_share)
+                snap = _higher_share(pl.snap_share, role.snap_share)
+            if (
+                rank == pl.depth_rank
+                and target == pl.target_share
+                and snap == pl.snap_share
+                and tgt_source == pl.targets_source
+                and snap_source == pl.snaps_source
+            ):
+                continue
+            patched = replace(
+                pl,
+                depth_rank=rank,
+                target_share=target,
+                snap_share=snap,
+                targets_source=tgt_source,
+                snaps_source=snap_source,
+            )
+            updates[pl.pid] = replace(patched, objective=score_player(patched))
+        for pl in group:
+            if is_pool_out(pl):
+                updates[pl.pid] = _zero_out(pl)
+    return [updates.get(pl.pid, pl) for pl in players]
+
+
+def _csv_injury_index(
+    csv_players: list[Player] | None,
+) -> dict[tuple[str, str, str], str]:
+    """``(team, match_key, position) → injury code`` from a FanDuel CSV."""
+    out: dict[tuple[str, str, str], str] = {}
+    for pl in csv_players or []:
+        code = injury_code(pl.injury)
+        if not code:
+            continue
+        try:
+            team = require_fd(pl.team).fd
+        except UnmappedTeam:
+            continue
+        pos = (pl.position or "").upper()
+        if pos in {"DEF", "DST"}:
+            pos = "D"
+        out[(team, match_key(pl.name), pos)] = code
+    return out
+
+
+def _overlay_csv_injury(
+    players: list[Player],
+    csv_players: list[Player] | None,
+) -> list[Player]:
+    """FanDuel ``O`` / ``IR`` / ``NA`` forces a player out.
+
+    ``Q`` and ``D`` fill a blank injury and do not clear a gangstash code.
+    """
+    index = _csv_injury_index(csv_players)
+    if not index:
+        return players
+    out: list[Player] = []
+    for pl in players:
+        pos = (pl.position or "").upper()
+        if pos in {"DEF", "DST"}:
+            pos = "D"
+        code = index.get((pl.team, match_key(pl.name), pos))
+        if not code:
+            out.append(pl)
+            continue
+        if code in POOL_OUT_CODES:
+            if injury_code(pl.injury) == code:
+                out.append(pl)
+                continue
+            out.append(replace(pl, injury=code))
+            continue
+        if pl.injury:
+            out.append(pl)
+            continue
+        out.append(replace(pl, injury=code))
+    return out
+
+
+def apply_projection_injuries(
+    players: list[Player],
+    rows: list[dict] | None,
+    *,
+    season: int,
+    week: int,
+    csv_players: list[Player] | None = None,
+) -> list[Player]:
+    """Stamp the week, honor a CSV O/IR, then promote the vacated role.
+
+    ``rows`` are raw gangstash injury records. ``None`` skips that feed.
+    An empty list means the week had no injury rows.
+    """
+    stamped = players
+    if rows is not None:
+        parsed = injury_rows_from_records(rows, season=season, week=week)
+        stamped = stamp_injuries(players, parsed)
+    overlaid = _overlay_csv_injury(stamped, csv_players)
+    return promote_out_chart(overlaid)
 
 
 def drop_keys(rows: list[InjuryRow]) -> set[tuple[str, str]]:

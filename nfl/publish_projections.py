@@ -1,8 +1,9 @@
 """Publish nightly NFL projections to gangstash.
 
 Board rows are `week1_score` for every skill player and DEF on the current
-week's slate. Inputs are gangstash game lines, depth, targets, snaps, and
-props. A FanDuel players CSV is optional (salary and FanDuel id only).
+week's slate. Inputs are gangstash game lines, depth, targets, snaps, props,
+and the week's injuries. A FanDuel players CSV is optional (salary,
+FanDuel id, and an O/IR injury indicator).
 
     python3 -m nfl.publish_projections --refresh
     python3 -m nfl.publish_projections --dry-run
@@ -20,7 +21,7 @@ fall back to placeholder and the board, and the log says so. The
 nightly publish still posts the board.
 
 `GANGSTASH_API_KEY` is required to read game lines, depth, targets,
-snaps, and props. If it is unset the command exits 1 before posting.
+snaps, props, and injuries. If it is unset the command exits 1 before posting.
 There is no other read source. `--refresh` (the default) does not
 fall back to a cache when the key is missing.
 `--report` writes `nfl/reports/<season>-w<week>-<date>.md` after a
@@ -57,6 +58,7 @@ from nfl.gangstash_data import (
     fetch_targets,
 )
 from nfl.http import HttpError, http_json_post
+from nfl.injuries import apply_projection_injuries, is_pool_out
 from nfl.lines import TeamLine, implied_totals
 from nfl.names import match_key
 from nfl.ourlads import skill_pos
@@ -241,7 +243,7 @@ def missing_read_key_message(detail: str) -> str:
         text = f"GANGSTASH_API_KEY is not set ({text})"
     return (
         f"{text}. publish_projections reads game lines, depth, targets, "
-        "snaps, and props from gangstash and exits without posting. "
+        "snaps, props, and injuries from gangstash and exits without posting. "
         "Set GANGSTASH_API_KEY. The default --refresh does not switch to "
         "another data source or a cache."
     )
@@ -278,7 +280,7 @@ def maybe_sim(
         )
         return SimResult(None, requested)
     try:
-        from nfl.sim_feed import resolve_sim_inputs
+        from nfl.sim_feed import resolve_sim_inputs, sim_pool
         from nfl.sim_inputs import SimInputError
     except ImportError:
         print(
@@ -316,7 +318,7 @@ def maybe_sim(
         return SimResult(None, used)
     try:
         result = fn(
-            [e.player for e in entries],
+            sim_pool([e.player for e in entries]),
             n=int(n),
             seed=int(seed),
             inputs=sim_inputs,
@@ -743,6 +745,63 @@ def _apply_csv(
     return entries
 
 
+def _injury_season_week(
+    line_rows: list[dict],
+    season: int | None,
+    week: int | None,
+) -> tuple[int, int]:
+    if season is not None and week is not None:
+        return int(season), int(week)
+    for row in line_rows:
+        if not isinstance(row, dict):
+            continue
+        raw_season = row.get("season")
+        raw_week = row.get("week")
+        if raw_season in (None, "") or raw_week in (None, ""):
+            continue
+        try:
+            return int(raw_season), int(raw_week)
+        except (TypeError, ValueError):
+            continue
+    raise PublishError("injuries need a season and week")
+
+
+def _csv_marks_injury(csv_players: list[Player] | None) -> bool:
+    for pl in csv_players or []:
+        if (pl.injury or "").strip():
+            return True
+    return False
+
+
+def _apply_entry_injuries(
+    entries: list[PublishEntry],
+    injury_rows: list[dict] | None,
+    *,
+    season: int,
+    week: int,
+    csv_players: list[Player] | None,
+) -> list[PublishEntry]:
+    players = apply_projection_injuries(
+        [entry.player for entry in entries],
+        injury_rows,
+        season=season,
+        week=week,
+        csv_players=csv_players,
+    )
+    by_pid = {pl.pid: pl for pl in players}
+    return [
+        PublishEntry(
+            player=by_pid[entry.player.pid],
+            gsis_id=entry.gsis_id,
+            player_id=entry.player_id,
+            game_id=entry.game_id,
+            fanduel_id=entry.fanduel_id,
+            salary=entry.salary,
+        )
+        for entry in entries
+    ]
+
+
 def build_entries(
     line_rows: list[dict],
     depth_rows: list[dict],
@@ -752,6 +811,9 @@ def build_entries(
     prop_by_pid: dict | None = None,
     csv_players: list[Player] | None = None,
     extra_id_rows: list[dict] | None = None,
+    injury_rows: list[dict] | None = None,
+    injury_season: int | None = None,
+    injury_week: int | None = None,
 ) -> list[PublishEntry]:
     """Score the slate with the existing week1_score path. No ILP."""
     slate = _team_lines(line_rows)
@@ -772,7 +834,17 @@ def build_entries(
         gsis, pid, gid = side[pl.pid]
         triples.append((pl, gsis, pid, gid))
     triples.extend(_defense_players(slate))
-    return _apply_csv(triples, csv_players)
+    entries = _apply_csv(triples, csv_players)
+    if injury_rows is not None or _csv_marks_injury(csv_players):
+        season, week = _injury_season_week(line_rows, injury_season, injury_week)
+        entries = _apply_entry_injuries(
+            entries,
+            injury_rows,
+            season=season,
+            week=week,
+            csv_players=csv_players,
+        )
+    return entries
 
 
 def _inputs(
@@ -797,10 +869,17 @@ def _inputs(
         tags.append("gs-depth")
     elif player.depth_rank is not None:
         tags.append("ourlads")
-    if player.target_share is not None:
+    inherited = False
+    if player.targets_source == "inherited":
+        inherited = True
+    elif player.target_share is not None:
         tags.append("gs-tgt" if player.targets_source == "gangstash" else "lineups-tgt")
-    if player.snap_share is not None:
+    if player.snaps_source == "inherited":
+        inherited = True
+    elif player.snap_share is not None:
         tags.append("gs-snap" if player.snaps_source == "gangstash" else "lineups-snap")
+    if inherited:
+        tags.append("inherited")
     if player.prop_fd is not None:
         tags.append("gs-props")
     if dst and player.implied_opp is not None:
@@ -831,6 +910,7 @@ def _inputs(
         ),
         "prop_factor": None if base is None else round(prop_factor(base, player.prop_fd), 4),
         "fanduel_id": entry.fanduel_id,
+        "injury": player.injury or None,
     }
     if sim_efficiency is not None:
         out["sim_efficiency"] = sim_efficiency
@@ -911,6 +991,8 @@ def projection_rows(
     for entry in entries:
         stats = sim_by_pid.get(entry.player.pid)
         if stats is None:
+            if is_pool_out(entry.player):
+                continue
             missing += 1
             continue
         rows.append(
@@ -1071,6 +1153,14 @@ def load_slate(args: argparse.Namespace, today: date) -> tuple[int, int, list[Pu
     depth_rows, _depth_meta = _load_depth(bool(args.refresh))
     target_rows, target_ids = _load_targets(season, bool(args.refresh))
     snap_rows, snap_ids = _load_snaps(season, bool(args.refresh))
+    from nfl.sim_feed import load_week_injuries
+
+    injury_rows, injury_meta = load_week_injuries(
+        season=season,
+        week=week,
+        refresh=bool(args.refresh),
+    )
+    _stale(injury_meta, "injuries")
     csv_players = load_fanduel_csv(args.csv) if args.csv else None
     entries = build_entries(
         line_rows,
@@ -1079,6 +1169,9 @@ def load_slate(args: argparse.Namespace, today: date) -> tuple[int, int, list[Pu
         snap_rows=snap_rows,
         csv_players=csv_players,
         extra_id_rows=list(target_ids) + list(snap_ids),
+        injury_rows=injury_rows,
+        injury_season=season,
+        injury_week=week,
     )
     try:
         by_pid, prop_meta = ingest_slate_props(
@@ -1104,6 +1197,20 @@ def load_slate(args: argparse.Namespace, today: date) -> tuple[int, int, list[Pu
         )
         for e in entries
     ]
+    # Props rescore from depth. Re-apply so an Out stays at 0 and the
+    # promoted player keeps the role, now including any prop tilt.
+    entries = _apply_entry_injuries(
+        entries,
+        injury_rows,
+        season=season,
+        week=week,
+        csv_players=csv_players,
+    )
+    n_out = sum(1 for entry in entries if is_pool_out(entry.player))
+    print(
+        f"injuries out {n_out}  rows {len(injury_rows)}",
+        file=sys.stderr,
+    )
     return season, week, entries
 
 

@@ -497,5 +497,58 @@ class SimGameResultsTest(unittest.TestCase):
         self.assertIn(fmt_points(summaries[0]["home_p90"]), text)
 
 
+class InjuryTagTest(unittest.TestCase):
+    def test_tags_q_and_d_and_hides_out(self) -> None:
+        def row(name, team, pos, mean, code):
+            return {
+                "model": "sim",
+                "player_name": name,
+                "team": team,
+                "opponent": "BUF",
+                "position": pos,
+                "mean": mean,
+                "p10": 1.0,
+                "p90": 20.0,
+                "salary": 6000,
+                "inputs": {"injury": code, "sim_efficiency": "data"},
+            }
+
+        rows = [
+            row("Out Receiver", "KC", "WR", 40.0, "O"),
+            row("Questionable Receiver", "KC", "WR", 18.0, "Q"),
+            row("Doubtful Receiver", "KC", "WR", 16.0, "D"),
+            row("Healthy Receiver", "KC", "WR", 12.0, ""),
+            row("Patrick Mahomes", "KC", "QB", 22.0, ""),
+            row("Josh Allen", "BUF", "QB", 21.0, ""),
+        ]
+        games = [
+            {
+                "game": "KC@BUF",
+                "away": "KC",
+                "home": "BUF",
+                "source": "sim",
+                "away_median": 22.0,
+                "away_p10": 12.0,
+                "away_p90": 32.0,
+                "home_median": 24.0,
+                "home_p10": 14.0,
+                "home_p90": 34.0,
+            }
+        ]
+        text = build_report(
+            rows,
+            games,
+            season=2026,
+            week=3,
+            run_at=RUN,
+            draws=100,
+            efficiency="data",
+        )
+        self.assertIn("Questionable Receiver (Q)", text)
+        self.assertIn("Doubtful Receiver (D)", text)
+        self.assertNotIn("Out Receiver", text)
+        self.assertIn("Healthy Receiver", text)
+
+
 if __name__ == "__main__":
     unittest.main()

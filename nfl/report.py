@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from nfl.injuries import injury_code
 from nfl.names import match_key
 
 REPORTS_DIR = Path(__file__).resolve().parent / "reports"
@@ -359,6 +360,32 @@ def _name(row: dict) -> str:
     return str(row.get("player_name") or row.get("name") or "").strip()
 
 
+# Listed with a tag. Out is tagged if it ever appears; top lists omit it.
+_TAG_CODES = frozenset({"Q", "D", "O", "IR"})
+# Never occupy a top-list or game-scorer slot.
+_HIDE_CODES = frozenset({"O", "IR", "NA", "SUSP"})
+
+
+def _injury_of(row: dict) -> str:
+    raw = row.get("injury")
+    inputs = row.get("inputs")
+    if not raw and isinstance(inputs, dict):
+        raw = inputs.get("injury")
+    return injury_code(str(raw or ""))
+
+
+def _display_name(row: dict) -> str:
+    name = _name(row)
+    code = _injury_of(row)
+    if name and code in _TAG_CODES:
+        return f"{name} ({code})"
+    return name
+
+
+def _listed(row: dict) -> bool:
+    return _injury_of(row) not in _HIDE_CODES
+
+
 def _team(row: dict) -> str:
     return str(row.get("team") or "").upper()
 
@@ -379,7 +406,11 @@ def projection_rows(rows: list[dict]) -> list[dict]:
 
 
 def _ranked(rows: list[dict], pos: str) -> list[dict]:
-    pool = [row for row in rows if _pos(row) == pos and _num(row.get("mean")) is not None]
+    pool = [
+        row
+        for row in rows
+        if _pos(row) == pos and _num(row.get("mean")) is not None and _listed(row)
+    ]
     pool.sort(key=lambda row: (-float(_num(row.get("mean")) or 0.0), _name(row), _team(row)))
     return pool
 
@@ -442,7 +473,11 @@ def _sim_games(games: list[dict]) -> bool:
 
 def _scorers(rows: list[dict], away: str, home: str) -> list[dict]:
     teams = {away.upper(), home.upper()}
-    pool = [row for row in rows if _team(row) in teams and _num(row.get("mean")) is not None]
+    pool = [
+        row
+        for row in rows
+        if _team(row) in teams and _num(row.get("mean")) is not None and _listed(row)
+    ]
     pool.sort(key=lambda row: (-float(_num(row.get("mean")) or 0.0), _name(row)))
     return pool[:3]
 
@@ -473,7 +508,7 @@ def _games_table(games: list[dict], rows: list[dict]) -> str:
                     fmt_points(median) if team else "",
                     fmt_band(low, high) if team else "",
                     str(index + 1) if scorer else "",
-                    _name(scorer) if scorer else "",
+                    _display_name(scorer) if scorer else "",
                     _team(scorer) if scorer else "",
                     _pos(scorer) if scorer else "",
                     fmt_points(scorer.get("mean")) if scorer else "",
@@ -491,7 +526,7 @@ def _position_table(title: str, rows: list[dict], limit: int) -> str:
         body.append(
             [
                 str(index),
-                _name(row),
+                _display_name(row),
                 _team(row),
                 _opp(row),
                 salary_cell(row),
