@@ -23,6 +23,8 @@ nightly publish still posts the board.
 snaps, and props. If it is unset the command exits 1 before posting.
 There is no other read source. `--refresh` (the default) does not
 fall back to a cache when the key is missing.
+`--report` writes `nfl/reports/<season>-w<week>-<date>.md` after a
+successful POST or `--dry-run` and prints that path.
 """
 
 from __future__ import annotations
@@ -108,6 +110,23 @@ class ProjectionsKeyMissing(PublishError):
 
 class StaleInputs(PublishError):
     """Game lines or depth are missing or from a stale cache."""
+
+
+@dataclass(frozen=True)
+class SimResult:
+    """Player draws, the efficiency mode that ran, and sim team scores.
+
+    ``by_pid, mode = maybe_sim(...)`` still unpacks. ``game_draws`` is
+    ``(game, away, home, away_pts, home_pts)`` per game per draw.
+    """
+
+    by_pid: dict | None
+    efficiency: str
+    game_draws: tuple = ()
+
+    def __iter__(self):
+        yield self.by_pid
+        yield self.efficiency
 
 
 @dataclass(frozen=True)
@@ -234,8 +253,8 @@ def maybe_sim(
     refresh: bool,
     week: int | None = None,
     sim_efficiency: str = "data",
-) -> tuple[dict | None, str]:
-    """``(pid → SimStats, effective efficiency mode)``.
+) -> SimResult:
+    """``(pid → SimStats, effective efficiency mode)``, plus game draws.
 
     Same call as the optimizer's `--projection-source sim` path:
     `resolve_sim_inputs` then `simulate_games(..., inputs=, efficiency=)`.
@@ -247,14 +266,14 @@ def maybe_sim(
     """
     requested = (sim_efficiency or "data").strip().lower()
     if n <= 0:
-        return None, requested
+        return SimResult(None, requested)
     fn = load_simulate_games()
     if fn is None:
         print(
             "sim unavailable (nfl.sim.simulate_games); publishing board only",
             file=sys.stderr,
         )
-        return None, requested
+        return SimResult(None, requested)
     try:
         from nfl.sim_feed import resolve_sim_inputs
         from nfl.sim_inputs import SimInputError
@@ -263,7 +282,7 @@ def maybe_sim(
             "sim inputs unavailable; publishing board only",
             file=sys.stderr,
         )
-        return None, requested
+        return SimResult(None, requested)
     try:
         sim_inputs, note = resolve_sim_inputs(
             path=None,
@@ -291,7 +310,7 @@ def maybe_sim(
             "sim inputs missing; sim fell back to board; publishing board only",
             file=sys.stderr,
         )
-        return None, used
+        return SimResult(None, used)
     try:
         result = fn(
             [e.player for e in entries],
@@ -305,15 +324,35 @@ def maybe_sim(
             f"sim failed ({e}); sim fell back to board; publishing board only",
             file=sys.stderr,
         )
-        return None, used
+        return SimResult(None, used)
     by_pid = getattr(result, "by_pid", None)
     if not isinstance(by_pid, dict):
         print(
             "sim fell back to board; publishing board only",
             file=sys.stderr,
         )
-        return None, used
-    return by_pid, used
+        return SimResult(None, used)
+    raw_draws = getattr(result, "game_draws", ()) or ()
+    return SimResult(by_pid, used, tuple(raw_draws))
+
+
+def sim_parts(sim: SimResult | tuple | dict | None) -> tuple[dict | None, str, tuple]:
+    """``(by_pid, efficiency, game_draws)`` from a ``SimResult`` or a 2-tuple."""
+    if isinstance(sim, SimResult):
+        return sim.by_pid, sim.efficiency, tuple(sim.game_draws or ())
+    if isinstance(sim, tuple) and len(sim) >= 2:
+        draws = sim[2] if len(sim) > 2 else ()
+        return sim[0], str(sim[1]), tuple(draws or ())
+    if isinstance(sim, dict):
+        return sim, "data", ()
+    if sim is None:
+        return None, "data", ()
+    by_pid = getattr(sim, "by_pid", None)
+    mode = getattr(sim, "efficiency", None) or "data"
+    draws = getattr(sim, "game_draws", ()) or ()
+    if not isinstance(by_pid, dict) and by_pid is not None:
+        return None, str(mode), ()
+    return by_pid, str(mode), tuple(draws)
 
 
 def _stale(meta: dict, label: str) -> None:
@@ -994,7 +1033,64 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Bypass same-day cache (default). --no-refresh reads cache.",
     )
     ap.add_argument("--out-dir", default=None)
+    ap.add_argument(
+        "--report",
+        action="store_true",
+        help="After a successful POST or --dry-run, write the Monte Carlo "
+        "report under nfl/reports/ and print its path",
+    )
     return ap.parse_args(argv)
+
+
+def emit_projection_report(
+    args: argparse.Namespace,
+    rows: list[dict],
+    game_draws: tuple,
+    *,
+    season: int,
+    week: int,
+    run_at: str,
+) -> Path:
+    """Write the markdown report and, when sim game draws exist, the sidecar."""
+    from nfl.report import (
+        efficiency_from_rows,
+        summarize_game_draws,
+        vegas_games_from_lines,
+        write_games_sidecar,
+        write_report,
+    )
+
+    summaries = summarize_game_draws(game_draws)
+    if summaries:
+        games: list[dict] = summaries
+        write_games_sidecar(season=season, week=week, run_at=run_at, games=summaries)
+    else:
+        games = []
+        try:
+            line_rows, _meta = fetch_game_lines(
+                season=int(season),
+                week=int(week),
+                refresh=False,
+            )
+            games = vegas_games_from_lines(line_rows)
+        except Exception as e:
+            print(f"report: game lines unavailable ({e})", file=sys.stderr)
+    sim_rows = [row for row in rows if row.get("model") == "sim"]
+    used = sim_rows or rows
+    has_sim = bool(sim_rows)
+    return write_report(
+        used,
+        games,
+        season=season,
+        week=week,
+        run_at=run_at,
+        draws=int(args.sim) if has_sim and args.sim else None,
+        efficiency=(
+            args.sim_efficiency
+            if has_sim and efficiency_from_rows(used) == "unknown"
+            else efficiency_from_rows(used)
+        ),
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1012,7 +1108,7 @@ def main(argv: list[str] | None = None) -> int:
     today = datetime.now(ET).date()
     try:
         season, week, entries = load_slate(args, today)
-        sim_by_pid, used_efficiency = maybe_sim(
+        sim = maybe_sim(
             entries,
             args.sim,
             args.sim_seed,
@@ -1021,6 +1117,7 @@ def main(argv: list[str] | None = None) -> int:
             week=week,
             sim_efficiency=args.sim_efficiency,
         )
+        sim_by_pid, used_efficiency, game_draws = sim_parts(sim)
     except StaleInputs as e:
         print(f"publish projections: {e}", file=sys.stderr)
         return 1
@@ -1061,6 +1158,20 @@ def main(argv: list[str] | None = None) -> int:
         stem = f"{season}-w{int(week):02d}-{stamp}"
         json_path, csv_path = write_local(rows, dest, stem)
         print(f"dry-run wrote {json_path} and {csv_path}; not posted", file=sys.stderr)
+        if args.report:
+            try:
+                path = emit_projection_report(
+                    args,
+                    rows,
+                    game_draws,
+                    season=season,
+                    week=week,
+                    run_at=run_at,
+                )
+            except Exception as e:
+                print(f"publish projections: {e}", file=sys.stderr)
+                return 1
+            print(path)
         return 0
     assert key is not None
     try:
@@ -1069,6 +1180,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"publish projections: {e}", file=sys.stderr)
         return 1
     print(f"posted inserted={inserted} updated={updated}", file=sys.stderr)
+    if args.report:
+        try:
+            path = emit_projection_report(
+                args,
+                rows,
+                game_draws,
+                season=season,
+                week=week,
+                run_at=run_at,
+            )
+        except Exception as e:
+            print(f"publish projections: {e}", file=sys.stderr)
+            return 1
+        print(path)
     return 0
 
 
