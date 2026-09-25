@@ -138,10 +138,12 @@ class BacktestReport:
     pool: str = "full"
     notes: tuple[str, ...] = ()
     show_hindsight: bool = False
+    efficiency: str = "placeholder"
 
     def to_text(self) -> str:
         lines = [
-            f"backtest season {self.season} week {self.week}  n {self.n}",
+            f"backtest season {self.season} week {self.week}  n {self.n}  "
+            f"sim efficiency: {self.efficiency}",
         ]
         if self.missing:
             lines.append("missing: " + ", ".join(self.missing))
@@ -762,7 +764,6 @@ def run_backtest(
     dnp = _questionable_dnps(players, indexed)
     notes = list(notes or ())
     notes.append(f"questionable DNP: {dnp} (projection kept)")
-    notes.append(f"sim efficiency: {efficiency}")
     model = build_efficiency(efficiency, sim_inputs, before_week=week)
     qb_pids = hindsight_qb_pids(players, indexed)
     if not indexed and "player_stats_weekly" not in noted:
@@ -816,6 +817,7 @@ def run_backtest(
             pool="starters",
             notes=tuple(notes or ()),
             show_hindsight=True,
+            efficiency=efficiency,
         )
     return BacktestReport(
         season=full_report.season,
@@ -830,6 +832,7 @@ def run_backtest(
         pool="full",
         notes=tuple(notes or ()),
         show_hindsight=True,
+        efficiency=efficiency,
     )
 
 

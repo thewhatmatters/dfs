@@ -14,7 +14,8 @@ Read key: GANGSTASH_API_KEY (existing /data and /props clients).
 `simulate_games` with the same gangstash `SimInputs` the optimizer
 builds for `--projection-source sim`. `mean` is that simulated mean.
 `--sim-efficiency` matches the optimizer (default `placeholder`).
-Missing sim publishes the board and says so.
+The run log prints that mode, and each sim row stores it on
+`inputs.sim_efficiency`. Missing sim publishes the board and says so.
 """
 
 from __future__ import annotations
@@ -580,7 +581,12 @@ def build_entries(
     return _apply_csv(triples, csv_players)
 
 
-def _inputs(player: Player, entry: PublishEntry) -> dict:
+def _inputs(
+    player: Player,
+    entry: PublishEntry,
+    *,
+    sim_efficiency: str | None = None,
+) -> dict:
     pos = (player.position or "").upper()
     dst = pos in {"D", "DEF"}
     base = None
@@ -605,7 +611,7 @@ def _inputs(player: Player, entry: PublishEntry) -> dict:
         tags.append("gs-props" if (player.prop_book or "") == "gangstash" else "odds-props")
     if dst and player.implied_opp is not None:
         tags.append("vegas-dst")
-    return {
+    out = {
         "sources": "/".join(tags) if tags else None,
         "lines_source": player.lines_source,
         "depth_source": player.depth_source,
@@ -632,6 +638,9 @@ def _inputs(player: Player, entry: PublishEntry) -> dict:
         "prop_factor": None if base is None else round(prop_factor(base, player.prop_fd), 4),
         "fanduel_id": entry.fanduel_id,
     }
+    if sim_efficiency is not None:
+        out["sim_efficiency"] = sim_efficiency
+    return out
 
 
 def _row(
@@ -647,6 +656,7 @@ def _row(
     p10: float | None,
     p50: float | None,
     p90: float | None,
+    sim_efficiency: str | None = None,
 ) -> dict:
     pl = entry.player
     return {
@@ -668,7 +678,7 @@ def _row(
         "p10": None if p10 is None else round(float(p10), 4),
         "p50": None if p50 is None else round(float(p50), 4),
         "p90": None if p90 is None else round(float(p90), 4),
-        "inputs": _inputs(pl, entry),
+        "inputs": _inputs(pl, entry, sim_efficiency=sim_efficiency),
     }
 
 
@@ -681,6 +691,7 @@ def projection_rows(
     run_at: str,
     model_version: str,
     sim_by_pid: dict | None = None,
+    sim_efficiency: str = "placeholder",
 ) -> list[dict]:
     rows: list[dict] = []
     for entry in entries:
@@ -721,6 +732,7 @@ def projection_rows(
                 p10=float(stats.p10),
                 p50=float(stats.p50),
                 p90=float(stats.p90),
+                sim_efficiency=sim_efficiency,
             )
         )
     if missing:
@@ -985,9 +997,11 @@ def main(argv: list[str] | None = None) -> int:
         run_at=run_at,
         model_version=version,
         sim_by_pid=sim_by_pid,
+        sim_efficiency=args.sim_efficiency,
     )
     print(
-        f"projections {season} week {week} {args.season_type} run_at={run_at} model_version={version}",
+        f"projections {season} week {week} {args.season_type} "
+        f"run_at={run_at} model_version={version} sim_efficiency={args.sim_efficiency}",
         file=sys.stderr,
     )
     print(summarize(rows), file=sys.stderr)

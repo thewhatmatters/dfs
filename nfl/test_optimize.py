@@ -1161,5 +1161,46 @@ class StackPremiumIlpTest(unittest.TestCase):
         self.assertEqual(lu.slots["QB"].name, "Goff")
 
 
+class SimEfficiencyLabelTest(unittest.TestCase):
+    def test_sim_summary_names_the_efficiency_mode(self) -> None:
+        from argparse import Namespace
+        from unittest.mock import patch
+
+        from nfl.optimize import _print_lineups
+        from nfl.solver import Lineup
+
+        lineup = Lineup(slots={}, method="pulp-cbc")
+        row = {
+            "method": "pulp-cbc",
+            "salary_remaining": 200,
+            "teams": 3,
+            "lineup_proj": 100.0,
+        }
+        data = Namespace(
+            objective="mean",
+            n_lineups=1,
+            sim=100,
+            sim_efficiency="data",
+            projection_source="board",
+        )
+        off = Namespace(
+            objective="mean",
+            n_lineups=1,
+            sim=0,
+            sim_efficiency="placeholder",
+            projection_source="board",
+        )
+        with patch("nfl.optimize.format_picker_table", return_value="picker"):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                _print_lineups([lineup], [row], data, {})
+            text = err.getvalue()
+            quiet = io.StringIO()
+            with redirect_stderr(quiet):
+                _print_lineups([lineup], [row], off, {})
+        self.assertIn("sim efficiency: data", text)
+        self.assertNotIn("sim efficiency:", quiet.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()
