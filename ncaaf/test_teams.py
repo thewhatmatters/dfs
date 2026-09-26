@@ -4,9 +4,24 @@ from __future__ import annotations
 
 import unittest
 
-from ncaaf.choke import line, lines_id
+from ncaaf.choke import depth_id, line, lines_id
+from ncaaf.depth import NAME_OVERRIDES
 from ncaaf.lines import parse_cfbd_games, parse_odds_games
-from ncaaf.teams import TEAMS, UnmappedTeam, require_mapped
+from ncaaf.ourlads import OURLADS_SLUG, require_slugs
+from ncaaf.teams import BY_CFBD, BY_ODDS, TEAMS, UnmappedTeam, require_mapped
+
+# Confirmed against one OurLads NCAA index fetch (slug → id present).
+OURLADS_NEW = {
+    "COLO": "colorado",
+    "MIZZ": "missouri",
+    "SCAR": "south-carolina",
+    "TCU": "tcu",
+    "UF": "florida",
+    "UGA": "georgia",
+    "USC": "usc",
+    "UTAH": "utah",
+    "WVU": "west-virginia",
+}
 
 # AWAY@HOME. FanDuel code -> (CFBD school, Odds API full name).
 SLATE_2026_09_26 = {
@@ -165,6 +180,50 @@ class Sep26SlateTeamsTest(unittest.TestCase):
             self.assertEqual(cfbd[away].away_fd, away)
             self.assertAlmostEqual(odds[home].implied_home, 27.5)
             self.assertAlmostEqual(cfbd[away].implied_away, 24.0)
+
+    def test_slate_codes_in_every_team_lookup(self):
+        """Every FanDuel-code table that can choke must cover the 28 codes."""
+        codes = set(SLATE_2026_09_26)
+        self.assertEqual(len(codes), 28)
+        tables = {
+            "TEAMS": set(TEAMS),
+            "OURLADS_SLUG": set(OURLADS_SLUG),
+            "BY_CFBD": {ref.fd for ref in BY_CFBD.values()},
+            "BY_ODDS": {ref.fd for ref in BY_ODDS.values()},
+        }
+        for name, keys in tables.items():
+            missing = sorted(codes - keys)
+            self.assertEqual(missing, [], name)
+        try:
+            slugs = require_slugs(codes)
+            refs = require_mapped(codes)
+        except UnmappedTeam as exc:
+            self.fail(
+                line(depth_id(exc), str(exc))
+                + " / "
+                + line(lines_id(exc), str(exc))
+            )
+        self.assertEqual(set(slugs), codes)
+        self.assertEqual(len(set(slugs.values())), 28)
+        self.assertEqual(len(set(OURLADS_SLUG.values())), len(OURLADS_SLUG))
+        self.assertEqual(set(refs), codes)
+        for code, slug in OURLADS_NEW.items():
+            self.assertEqual(OURLADS_SLUG[code], slug)
+        self.assertNotEqual(slugs["USC"], slugs["SCAR"])
+        self.assertNotEqual(slugs["UF"], slugs["UCF"])
+        self.assertNotEqual(slugs["MIZZ"], OURLADS_SLUG["MOST"])
+        self.assertNotEqual(slugs["OKST"], slugs["OU"])
+        self.assertNotEqual(slugs["TEX"], OURLADS_SLUG["TXST"])
+        self.assertNotEqual(slugs["TEX"], slugs["TXAM"])
+        self.assertEqual(OURLADS_SLUG["MOST"], "missouri-state")
+        self.assertEqual(OURLADS_SLUG["UCF"], "central-florida")
+        self.assertEqual(OURLADS_SLUG["TXST"], "texas-state")
+        self.assertEqual(OURLADS_SLUG["TXAM"], "texas-am")
+        # Sparse player aliases. Missing teams do not choke DEPTH_JOIN.
+        self.assertIsInstance(NAME_OVERRIDES, dict)
+        for (team, _key), nick in NAME_OVERRIDES.items():
+            self.assertIn(team, TEAMS)
+            self.assertTrue(nick)
 
 
 if __name__ == "__main__":
