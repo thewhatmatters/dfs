@@ -27,6 +27,10 @@ There is no other read source. `--refresh` (the default) does not
 fall back to a cache when the key is missing.
 `--report` writes `nfl/reports/<season>-w<week>-<date>.md` after a
 successful POST or `--dry-run` and prints that path.
+`--slate-csv PATH` limits that report to one FanDuel players-list
+(`auto` picks the newest dated file that is today or later in
+America/Chicago). It does not change the rows posted to gangstash.
+A missing or unusable CSV keeps the full report and exits 0.
 """
 
 from __future__ import annotations
@@ -1271,6 +1275,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="After a successful POST or --dry-run, write the Monte Carlo "
         "report under nfl/reports/ and print its path",
     )
+    ap.add_argument(
+        "--slate-csv",
+        default=None,
+        help="Restrict the report to games and players in this FanDuel "
+        "players-list. 'auto' picks the newest "
+        "nfl/data/FanDuel-NFL-*-players-list.csv dated today or later "
+        "(America/Chicago). Salaries come from that CSV. Stored "
+        "projections are unchanged. A missing or unusable file keeps "
+        "the full report.",
+    )
     return ap.parse_args(argv)
 
 
@@ -1286,6 +1300,7 @@ def emit_projection_report(
     """Write the markdown report and, when sim game draws exist, the sidecar."""
     from nfl.report import (
         efficiency_from_rows,
+        restrict_to_slate,
         summarize_game_draws,
         vegas_games_from_lines,
         write_games_sidecar,
@@ -1310,18 +1325,35 @@ def emit_projection_report(
     sim_rows = [row for row in rows if row.get("model") == "sim"]
     used = sim_rows or rows
     has_sim = bool(sim_rows)
+    report_rows = used
+    report_games = games
+    warnings = None
+    slate = getattr(args, "slate_csv", None)
+    if slate:
+        try:
+            report_rows, report_games, warnings = restrict_to_slate(
+                used, games, slate
+            )
+        except Exception as exc:
+            warnings = [
+                "warning: slate CSV failed (%s); showing the full week" % exc
+            ]
+            print(warnings[0], file=sys.stderr)
+            report_rows = used
+            report_games = games
     return write_report(
-        used,
-        games,
+        report_rows,
+        report_games,
         season=season,
         week=week,
         run_at=run_at,
         draws=int(args.sim) if has_sim and args.sim else None,
         efficiency=(
             args.sim_efficiency
-            if has_sim and efficiency_from_rows(used) == "unknown"
-            else efficiency_from_rows(used)
+            if has_sim and efficiency_from_rows(report_rows) == "unknown"
+            else efficiency_from_rows(report_rows)
         ),
+        warnings=warnings,
     )
 
 

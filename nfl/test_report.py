@@ -4,22 +4,31 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
 from nfl.report import (
+    BAD_DATE_WARNING,
+    NO_SLATE_WARNING,
     VEGAS_LABEL,
+    _scorers,
     build_report,
     efficiency_from_rows,
     fill_salaries,
     graph_table,
+    parse_args,
+    parse_players_list_filename,
     report_path,
+    resolve_auto_slate_csv,
     resolve_games,
+    restrict_to_slate,
     runs_match,
     summarize_game_draws,
     write_games_sidecar,
     write_report,
 )
+from nfl.teams import canon_team
 
 RUN = "2026-09-25T04:00:00+00:00"
 OFFICIAL = """+----------- [ WHAT THE RESEARCH COST ] ------------+
@@ -548,6 +557,352 @@ class InjuryTagTest(unittest.TestCase):
         self.assertIn("Doubtful Receiver (D)", text)
         self.assertNotIn("Out Receiver", text)
         self.assertIn("Healthy Receiver", text)
+
+
+def _players_csv(path: Path, rows: list[tuple]) -> None:
+    lines = ["Id,Position,Nickname,Salary,Team,Opponent,Game"]
+    for item in rows:
+        lines.append(",".join(str(part) for part in item))
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _game(away: str, home: str, median: float = 21.0) -> dict:
+    return {
+        "game": f"{away}@{home}",
+        "away": away,
+        "home": home,
+        "source": "sim",
+        "away_median": median,
+        "away_p10": 10.0,
+        "away_p90": 30.0,
+        "home_median": median + 3,
+        "home_p10": 12.0,
+        "home_p90": 34.0,
+    }
+
+
+def _report(rows: list[dict], games: list[dict], warnings=None) -> str:
+    return build_report(
+        rows,
+        games,
+        season=2026,
+        week=3,
+        run_at=RUN,
+        draws=100,
+        efficiency="data",
+        warnings=warnings,
+    )
+
+
+class TeamCanonTest(unittest.TestCase):
+    def test_aliases_collapse_to_fanduel_codes(self) -> None:
+        self.assertEqual(canon_team("jax"), "JAC")
+        self.assertEqual(canon_team("JAC"), "JAC")
+        self.assertEqual(canon_team("WSH"), "WAS")
+        self.assertEqual(canon_team("LA"), "LAR")
+        self.assertEqual(canon_team("OAK"), "LV")
+        self.assertEqual(canon_team("LAC"), "LAC")
+        self.assertEqual(canon_team("nope"), "NOPE")
+        self.assertEqual(canon_team(""), "")
+
+    def test_scorers_match_alias_to_game_code(self) -> None:
+        cases = (("JAX", "JAC"), ("LA", "LAR"), ("WSH", "WAS"), ("OAK", "LV"))
+        for stored, game_code in cases:
+            rows = [_row("Alias Player", stored, "NE", "QB", 19, 7000)]
+            found = _scorers(rows, "NE", game_code)
+            self.assertEqual([row["player_name"] for row in found], ["Alias Player"])
+            found_flip = _scorers(
+                [_row("Alias Player", game_code, "NE", "QB", 19, 7000)],
+                "NE",
+                stored,
+            )
+            self.assertEqual([row["player_name"] for row in found_flip], ["Alias Player"])
+
+    def test_fixture_report_is_unchanged_by_canon(self) -> None:
+        rows, games = _fixture()
+        after = _report(rows, games)
+
+        def raw(value: str) -> str:
+            return str(value or "").strip().upper()
+
+        with patch("nfl.report.canon_team", side_effect=raw):
+            before = _report(rows, games)
+        self.assertEqual(before, after)
+
+    def test_only_jacksonville_rows_differ(self) -> None:
+        rows = [
+            _row("Patrick Mahomes", "KC", "BUF", "QB", 30, 9000),
+            _row("Josh Allen", "BUF", "KC", "QB", 28, 8800),
+            _row("Trevor Lawrence", "JAX", "NE", "QB", 20, 7600),
+            _row("Travis Etienne", "JAX", "NE", "RB", 18, 7000),
+            _row("Isiah Pacheco", "KC", "BUF", "RB", 14, 6500),
+        ]
+        games = [_game("KC", "BUF", 24.0), _game("NE", "JAC", 17.0)]
+        after = _report(rows, games)
+
+        def raw(value: str) -> str:
+            return str(value or "").strip().upper()
+
+        with patch("nfl.report.canon_team", side_effect=raw):
+            before = _report(rows, games)
+        jac_rows = []
+        for row in rows:
+            copy = dict(row)
+            if copy["team"] == "JAX":
+                copy["team"] = "JAC"
+            jac_rows.append(copy)
+        self.assertEqual(after, _report(jac_rows, games))
+        self.assertNotIn("Trevor Lawrence", _fences(before)[0])
+        self.assertIn("Trevor Lawrence", _fences(after)[0])
+        self.assertIn("Travis Etienne", _fences(after)[0])
+        tokens = ("Trevor", "Etienne", "JAX", "JAC")
+
+        def stable(text: str) -> list[str]:
+            return [line for line in text.splitlines() if not any(tok in line for tok in tokens)]
+
+        self.assertEqual(stable(before), stable(after))
+        before_qb = next(
+            line for line in before.splitlines() if "Trevor Lawrence" in line and "@" not in line
+        )
+        after_qb = next(
+            line for line in after.splitlines() if "Trevor Lawrence" in line and "@" not in line
+        )
+        self.assertEqual(before_qb.replace("JAX", "JAC"), after_qb)
+
+    def test_csv_salary_matches_jacksonville_alias(self) -> None:
+        row = _row("Trevor Lawrence", "JAX", "NE", "QB", 20, None)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "players.csv"
+            _players_csv(
+                path,
+                [("1", "QB", "Trevor Lawrence", 7600, "JAC", "NE", "NE@JAC")],
+            )
+            filled = fill_salaries([row], path)
+        self.assertEqual(filled[0]["salary"], 7600)
+        self.assertNotIn("off_slate", filled[0])
+        self.assertIsNone(row["salary"])
+
+
+class SlateCsvTest(unittest.TestCase):
+    def _slate(self) -> tuple[list[dict], list[dict]]:
+        rows = [
+            _row("Patrick Mahomes", "KC", "BUF", "QB", 30, 1000),
+            _row("Josh Allen", "BUF", "KC", "QB", 28, 1000),
+            _row("Bijan Robinson", "ATL", "GB", "RB", 22, 1000),
+            _row("Trevor Lawrence", "JAX", "NE", "QB", 20, 1000),
+            _row("Travis Etienne Jr.", "JAX", "NE", "RB", 18, 1000),
+            _row("Jacksonville Jaguars", "JAX", "NE", "D", 8, 1000),
+            _row("Qb 0", "KC", "BUF", "QB", 40, 1000),
+            _row("Qb 1", "KC", "BUF", "QB", 16, 1000),
+            _row("Qb 2", "KC", "BUF", "QB", 15, 1000),
+            _row("Qb 3", "KC", "BUF", "QB", 14, 1000),
+            _row("Qb 4", "KC", "BUF", "QB", 13, 1000),
+        ]
+        games = [
+            _game("KC", "BUF", 24.0),
+            _game("ATL", "GB", 23.0),
+            _game("NE", "JAC", 17.0),
+        ]
+        return rows, games
+
+    def test_flag_defaults_off(self) -> None:
+        self.assertIsNone(parse_args([]).slate_csv)
+        self.assertEqual(parse_args(["--slate-csv", "auto"]).slate_csv, "auto")
+
+    def test_restricts_games_players_salaries_and_backfills(self) -> None:
+        rows, games = self._slate()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "slate.csv"
+            _players_csv(
+                path,
+                [
+                    ("1", "QB", "Patrick Mahomes", 9000, "KC", "BUF", "KC@BUF"),
+                    ("2", "QB", "Josh Allen", 8800, "BUF", "KC", "KC@BUF"),
+                    ("3", "QB", "C.J. Stroud", 7500, "HOU", "IND", "HOU@IND"),
+                    ("4", "WR", "Ja'Marr Chase", 8000, "CIN", "DET", "CIN@DET"),
+                    ("5", "RB", "Travis Etienne", 6400, "JAC", "NE", "NE@JAC"),
+                    ("6", "D", "Jaguars", 3800, "JAC", "NE", "NE@JAC"),
+                    ("7", "QB", "Trevor Lawrence", 7600, "JAC", "NE", "NE@JAC"),
+                    ("8", "QB", "Qb 1", 5000, "KC", "BUF", "KC@BUF"),
+                    ("9", "QB", "Qb 2", 5000, "KC", "BUF", "KC@BUF"),
+                    ("10", "QB", "Qb 3", 5000, "KC", "BUF", "KC@BUF"),
+                    ("11", "QB", "Qb 4", 5000, "KC", "BUF", "KC@BUF"),
+                    ("12", "WR", "Van Jefferson", 4500, "TEN", "NO", "TEN@NO"),
+                    ("13", "QB", "Kenny Pickett Sr.", 5000, "PHI", "DAL", "PHI@DAL"),
+                    ("14", "WR", "Robert Woods II", 5000, "PIT", "CLE", "PIT@CLE"),
+                    ("15", "WR", "Odell Beckham III", 5000, "MIA", "NYJ", "MIA@NYJ"),
+                ],
+            )
+            extra = [
+                _row("CJ Stroud", "HOU", "IND", "QB", 19, 1000),
+                _row("Jamarr Chase", "CIN", "DET", "WR", 21, 1000),
+                _row("Kenny Pickett", "PHI", "DAL", "QB", 12, 1000),
+                _row("Robert Woods", "PIT", "CLE", "WR", 11, 1000),
+                _row("Odell Beckham", "MIA", "NYJ", "WR", 10, 1000),
+            ]
+            snapshot = [dict(row) for row in rows + extra]
+            slate_games = games + [_game("TEN", "NO", 19.0)]
+            filtered, kept, notes = restrict_to_slate(
+                rows + extra, slate_games, str(path), today=date(2026, 9, 27)
+            )
+        self.assertEqual(rows + extra, snapshot)
+        self.assertEqual(notes, ["warning: slate game TEN@NO has no projections"])
+        labels = [f"{game['away']}@{game['home']}" for game in kept]
+        self.assertNotIn("ATL@GB", labels)
+        self.assertIn("KC@BUF", labels)
+        self.assertIn("NE@JAC", labels)
+        self.assertIn("TEN@NO", labels)
+        text = _report(filtered, kept, notes)
+        self.assertTrue(text.startswith("warning: slate game TEN@NO has no projections\n"))
+        names = {row["player_name"] for row in filtered}
+        self.assertNotIn("Bijan Robinson", names)
+        self.assertNotIn("Qb 0", names)
+        self.assertNotIn("Van Jefferson", names)
+        for name in (
+            "Patrick Mahomes",
+            "CJ Stroud",
+            "Jamarr Chase",
+            "Travis Etienne Jr.",
+            "Trevor Lawrence",
+            "Jacksonville Jaguars",
+            "Kenny Pickett",
+            "Robert Woods",
+            "Odell Beckham",
+            "Qb 1",
+        ):
+            self.assertIn(name, names)
+        self.assertNotIn("Bijan Robinson", text)
+        self.assertNotIn("Qb 0", text)
+        self.assertNotIn("Van Jefferson", text)
+        self.assertIn("Qb 1", text)
+        mahomes = next(line for line in text.splitlines() if "Patrick Mahomes" in line and "3.33" in line)
+        self.assertIn("9,000", mahomes)
+        self.assertNotIn("30.00", mahomes)
+        jax = next(line for line in text.splitlines() if "Jacksonville Jaguars" in line)
+        self.assertIn("3,800", jax)
+        self.assertIn("JAC", jax)
+        self.assertEqual(filtered[0]["salary"], 9000)
+        self.assertEqual(rows[0]["salary"], 1000)
+
+    def test_unusable_csv_falls_back_without_mutating_rows(self) -> None:
+        rows, games = self._slate()
+        snapshot = [dict(row) for row in rows]
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            missing = folder / "nope.csv"
+            empty = folder / "empty.csv"
+            empty.write_text("", encoding="utf-8")
+            header = folder / "header.csv"
+            header.write_text(
+                "Id,Position,Nickname,Salary,Team,Opponent,Game\n",
+                encoding="utf-8",
+            )
+            malformed = folder / "bad.csv"
+            malformed.write_text("hello\n", encoding="utf-8")
+            zero = folder / "zero.csv"
+            _players_csv(zero, [("1", "QB", "Van Jefferson", 4500, "TEN", "NO", "TEN@NO")])
+            cases = [
+                (str(missing), "slate CSV missing"),
+                (str(empty), "slate CSV empty"),
+                (str(header), "slate CSV empty"),
+                (str(malformed), "slate CSV malformed"),
+                (str(zero), "matched no projected players"),
+            ]
+            for spec, needle in cases:
+                got_rows, got_games, notes = restrict_to_slate(
+                    rows, games, spec, today=date(2026, 9, 27)
+                )
+                self.assertEqual(rows, snapshot)
+                self.assertIs(got_rows, rows)
+                self.assertIs(got_games, games)
+                self.assertEqual(len(notes), 1)
+                self.assertIn(needle, notes[0])
+                text = _report(got_rows, got_games, notes)
+                self.assertTrue(text.startswith("warning:"))
+                self.assertIn("Bijan Robinson", text)
+                self.assertIn("ATL@GB", text)
+
+    def test_filename_dates_and_auto_choice(self) -> None:
+        parsed = parse_players_list_filename(
+            "FanDuel-NFL-2026 CDT-09 CDT-27 CDT-134503-players-list.csv"
+        )
+        self.assertEqual(parsed, (date(2026, 9, 27), 134503))
+        self.assertIsNone(
+            parse_players_list_filename(
+                "FanDuel-NFL-2026 CDT-09 CDT-27 CDT-999-entries-upload-template.csv"
+            )
+        )
+        self.assertIsNone(
+            parse_players_list_filename(
+                "FanDuel-NFL-2026 CDT-13 CDT-40 CDT-1-players-list.csv"
+            )
+        )
+        today = date(2026, 9, 27)
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            older = "FanDuel-NFL-2026 CDT-09 CDT-24 CDT-111-players-list.csv"
+            same_low = "FanDuel-NFL-2026 CDT-09 CDT-27 CDT-100-players-list.csv"
+            same_high = "FanDuel-NFL-2026 CDT-09 CDT-27 CDT-500-players-list.csv"
+            future = "FanDuel-NFL-2026 CDT-10 CDT-04 CDT-50-players-list.csv"
+            template = "FanDuel-NFL-2026 CDT-10 CDT-11 CDT-999-entries-upload-template.csv"
+            bad = "FanDuel-NFL-not-a-date-players-list.csv"
+            for name in (older, same_low, same_high, future, template, bad):
+                (folder / name).write_text("x\n", encoding="utf-8")
+            path, warning = resolve_auto_slate_csv(folder, today)
+            self.assertIsNone(warning)
+            self.assertEqual(path.name, future)
+            (folder / future).unlink()
+            path, warning = resolve_auto_slate_csv(folder, today)
+            self.assertEqual(path.name, same_high)
+            for name in (same_low, same_high):
+                (folder / name).unlink()
+            path, warning = resolve_auto_slate_csv(folder, today)
+            self.assertIsNone(path)
+            self.assertEqual(warning, NO_SLATE_WARNING)
+            for name in (older, template):
+                (folder / name).unlink()
+            path, warning = resolve_auto_slate_csv(folder, today)
+            self.assertIsNone(path)
+            self.assertEqual(warning, BAD_DATE_WARNING)
+
+    def test_auto_filters_the_chosen_file_and_bad_auto_falls_back(self) -> None:
+        rows, games = self._slate()
+        today = date(2026, 9, 27)
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            older = folder / "FanDuel-NFL-2026 CDT-09 CDT-24 CDT-111-players-list.csv"
+            current = folder / "FanDuel-NFL-2026 CDT-09 CDT-27 CDT-222-players-list.csv"
+            future = folder / "FanDuel-NFL-2026 CDT-10 CDT-04 CDT-333-players-list.csv"
+            template = folder / "FanDuel-NFL-2026 CDT-10 CDT-04 CDT-999-entries-upload-template.csv"
+            _players_csv(older, [("1", "RB", "Bijan Robinson", 8000, "ATL", "GB", "ATL@GB")])
+            _players_csv(
+                current,
+                [("1", "QB", "Patrick Mahomes", 9100, "KC", "BUF", "KC@BUF")],
+            )
+            _players_csv(future, [("1", "QB", "Josh Allen", 9200, "BUF", "KC", "KC@BUF")])
+            template.write_text("entry_id\n", encoding="utf-8")
+            filtered, kept, notes = restrict_to_slate(
+                rows, games, "auto", today=today, data_dir=folder
+            )
+            self.assertEqual(notes, [])
+            text = _report(filtered, kept, notes)
+            self.assertIn("Josh Allen", text)
+            self.assertIn("9,200", text)
+            self.assertNotIn("Patrick Mahomes", text)
+            self.assertNotIn("Bijan Robinson", text)
+            self.assertNotIn("ATL@GB", text)
+            bad_dir = folder / "bad"
+            bad_dir.mkdir()
+            (bad_dir / "FanDuel-NFL-bogus-players-list.csv").write_text(
+                "Id,Position,Nickname,Salary,Team\n1,QB,Patrick Mahomes,9000,KC\n",
+                encoding="utf-8",
+            )
+            got_rows, got_games, notes = restrict_to_slate(
+                rows, games, "auto", today=today, data_dir=bad_dir
+            )
+            self.assertIs(got_rows, rows)
+            self.assertIs(got_games, games)
+            self.assertEqual(notes, [BAD_DATE_WARNING])
 
 
 if __name__ == "__main__":

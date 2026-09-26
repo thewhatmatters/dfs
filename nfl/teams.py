@@ -61,11 +61,13 @@ TEAMS: dict[str, TeamRef] = {
     )
 }
 
-# FanDuel uses JAC/WAS/LAR. ESPN/Odds use JAX/WSH. nflverse uses JAX and LA (Rams).
+# FanDuel uses JAC/WAS/LAR/LV. ESPN/Odds use JAX/WSH. nflverse uses JAX and LA (Rams).
+# OAK is the pre-relocation Raiders code.
 ALIASES: dict[str, str] = {
     "JAX": "JAC",
     "WSH": "WAS",
     "LA": "LAR",
+    "OAK": "LV",
 }
 
 
@@ -89,9 +91,24 @@ class UnmappedTeam(Exception):
     """FanDuel abbrev or provider name is not in TEAMS."""
 
 
-def require_fd(abbrev: str) -> TeamRef:
+def canon_team(abbrev: str) -> str:
+    """FanDuel abbrev for a team code.
+
+    JAX→JAC, WSH→WAS, LA→LAR, OAK→LV. Unknown codes come back uppercase
+    so report matching does not raise.
+    """
     key = (abbrev or "").strip().upper()
+    if not key:
+        return ""
     key = ALIASES.get(key, key)
+    ref = TEAMS.get(key)
+    if ref is None:
+        return key
+    return ref.fd
+
+
+def require_fd(abbrev: str) -> TeamRef:
+    key = canon_team(abbrev)
     ref = TEAMS.get(key)
     if ref is None:
         raise UnmappedTeam(

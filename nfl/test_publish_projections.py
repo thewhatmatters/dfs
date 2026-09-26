@@ -1150,5 +1150,136 @@ class SimModePublishTest(unittest.TestCase):
         self.assertIn("unknown sim mode", err.getvalue())
 
 
+def _without_run_at(rows):
+    cleaned = []
+    for row in rows or []:
+        copy = dict(row)
+        copy.pop("run_at", None)
+        cleaned.append(copy)
+    return cleaned
+
+
+class SlateCsvPublishTest(unittest.TestCase):
+    def _entries(self):
+        return build_entries(
+            [_line()],
+            [
+                _depth("Patrick Mahomes", "KC", "QB", 1, "00-0033873"),
+                _depth("Josh Allen", "BUF", "QB", 1, "00-0034857"),
+            ],
+        )
+
+    def _run(self, extra, slate_dir=None):
+        import tempfile
+        from contextlib import redirect_stdout
+        from pathlib import Path
+
+        from nfl.publish_projections import SimResult
+
+        entries = self._entries()
+        posted = {}
+
+        def capture(rows, key):
+            posted["rows"] = json.loads(json.dumps(rows))
+            return 2, 0
+
+        def load(_args, _today):
+            return 2026, 3, entries
+
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as reports:
+            out = io.StringIO()
+            err = io.StringIO()
+            patches = [
+                patch("nfl.publish_projections.projections_key", return_value="sekrit"),
+                patch("nfl.publish_projections.load_slate", load),
+                patch(
+                    "nfl.publish_projections.maybe_sim",
+                    return_value=SimResult(None, "data"),
+                ),
+                patch("nfl.publish_projections.model_version", return_value="abc1234"),
+                patch("nfl.publish_projections.post_projection_rows", capture),
+                patch("nfl.report.REPORTS_DIR", Path(reports)),
+            ]
+            if slate_dir is not None:
+                patches.append(patch("nfl.report.DATA_DIR", Path(slate_dir)))
+            from contextlib import ExitStack
+
+            with ExitStack() as stack:
+                for item in patches:
+                    stack.enter_context(item)
+                stack.enter_context(redirect_stdout(out))
+                stack.enter_context(redirect_stderr(err))
+                rc = main(["--report", "--sim", "0", "--out-dir", tmp, *extra])
+            written = list(Path(reports).glob("*.md"))
+            report = written[0].read_text(encoding="utf-8") if written else ""
+        return rc, posted.get("rows"), report, err.getvalue()
+
+    def test_unusable_slate_posts_the_full_week_and_exits_0(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        baseline_rc, baseline, baseline_report, _err = self._run([])
+        self.assertEqual(baseline_rc, 0)
+        self.assertTrue(baseline)
+        self.assertNotIn("warning:", baseline_report)
+        baseline_body = _without_run_at(baseline)
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            empty = folder / "empty.csv"
+            empty.write_text("", encoding="utf-8")
+            malformed = folder / "bad.csv"
+            malformed.write_text("nope\n", encoding="utf-8")
+            zero = folder / "zero.csv"
+            zero.write_text(
+                "Id,Position,Nickname,Salary,Team,Opponent,Game\n"
+                "9,QB,Van Jefferson,4500,TEN,NO,TEN@NO\n",
+                encoding="utf-8",
+            )
+            bad_auto = folder / "auto"
+            bad_auto.mkdir()
+            (bad_auto / "FanDuel-NFL-bogus-players-list.csv").write_text(
+                "Id,Position,Nickname,Salary,Team\n1,QB,X,1,KC\n",
+                encoding="utf-8",
+            )
+            specs = [
+                (["--slate-csv", str(folder / "missing.csv")], None),
+                (["--slate-csv", str(empty)], None),
+                (["--slate-csv", str(malformed)], None),
+                (["--slate-csv", str(zero)], None),
+                (["--slate-csv", "auto"], bad_auto),
+            ]
+            for extra, slate_dir in specs:
+                rc, posted, report, err = self._run(extra, slate_dir=slate_dir)
+                self.assertEqual(rc, 0, err)
+                self.assertEqual(_without_run_at(posted), baseline_body)
+                self.assertIn("warning:", report)
+                self.assertNotIn("publish projections:", err)
+
+    def test_slate_filter_does_not_change_posted_rows(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "slate.csv"
+            path.write_text(
+                "Id,Position,Nickname,Salary,Team,Opponent,Game\n"
+                "1,QB,Patrick Mahomes,9000,KC,BUF,KC@BUF\n",
+                encoding="utf-8",
+            )
+            base_rc, baseline, _base_report, _err = self._run([])
+            rc, posted, report, err = self._run(["--slate-csv", str(path)])
+        self.assertEqual(base_rc, 0)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(_without_run_at(posted), _without_run_at(baseline))
+        names = {row.get("player_name") for row in posted}
+        self.assertIn("Josh Allen", names)
+        self.assertIn("Patrick Mahomes", names)
+        mahomes = next(row for row in posted if row.get("player_name") == "Patrick Mahomes")
+        self.assertIsNone(mahomes.get("salary"))
+        self.assertIn("Patrick Mahomes", report)
+        self.assertNotIn("Josh Allen", report)
+        self.assertIn("9,000", report)
+
+
 if __name__ == "__main__":
     unittest.main()
