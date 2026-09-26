@@ -8,6 +8,13 @@ when ``run_at`` matches.
 
     python3 -m nfl.report --season 2026 --week 3
     python3 -m nfl.report --season 2026 --week 3 --csv nfl/data/players.csv
+    python3 -m nfl.report --season 2026 --week 3 --slate-csv auto
+
+``--slate-csv`` limits the games section and every top list to that
+FanDuel players-list. ``auto`` uses the newest
+``nfl/data/FanDuel-NFL-*-players-list.csv`` whose slate date is today
+or later in America/Chicago. Salaries in that report come from the CSV.
+A missing or unusable file keeps the full report and prints one warning.
 
 Game draws are ``GameSim.game_draws``: one
 ``(game, away, home, away_pts, home_pts)`` row per game per draw.
@@ -17,17 +24,21 @@ Missing draws fall back to gangstash ``game_lines`` implied totals.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
+import re
 import sys
 from collections import Counter
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from nfl.injuries import injury_code
 from nfl.names import match_key
+from nfl.teams import canon_team
 
 REPORTS_DIR = Path(__file__).resolve().parent / "reports"
+DATA_DIR = Path(__file__).resolve().parent / "data"
 CT = ZoneInfo("America/Chicago")
 ET = ZoneInfo("America/New_York")
 RUN_AT_TOLERANCE = timedelta(minutes=5)
@@ -387,11 +398,11 @@ def _listed(row: dict) -> bool:
 
 
 def _team(row: dict) -> str:
-    return str(row.get("team") or "").upper()
+    return canon_team(str(row.get("team") or ""))
 
 
 def _opp(row: dict) -> str:
-    return str(row.get("opponent") or row.get("opp") or "").upper()
+    return canon_team(str(row.get("opponent") or row.get("opp") or ""))
 
 
 def projection_rows(rows: list[dict]) -> list[dict]:
@@ -472,7 +483,8 @@ def _sim_games(games: list[dict]) -> bool:
 
 
 def _scorers(rows: list[dict], away: str, home: str) -> list[dict]:
-    teams = {away.upper(), home.upper()}
+    teams = {canon_team(away), canon_team(home)}
+    teams.discard("")
     pool = [
         row
         for row in rows
@@ -487,8 +499,8 @@ def _games_table(games: list[dict], rows: list[dict]) -> str:
     aligns = ["left", "left", "right", "right", "right", "left", "left", "left", "right", "right"]
     body: list[list[object]] = []
     for game in games:
-        away = str(game.get("away") or "")
-        home = str(game.get("home") or "")
+        away = canon_team(str(game.get("away") or ""))
+        home = canon_team(str(game.get("home") or ""))
         label = f"{away}@{home}" if away and home else str(game.get("game") or "")
         scorers = _scorers(rows, away, home)
         teams = (
@@ -551,6 +563,7 @@ def build_report(
     run_at: str | None,
     draws: int | None,
     efficiency: str | None,
+    warnings=None,
 ) -> str:
     """Render the nightly report. ``games`` is sim bands, raw draws, or vegas totals."""
     shown = projection_rows(list(rows or []))
@@ -559,15 +572,22 @@ def build_report(
     if not eff:
         eff = "unknown"
     draw_text = "unknown" if draws is None else str(int(draws))
-    lines = [
-        f"season {int(season)}",
-        f"week {int(week)}",
-        f"run {format_run_ct(run_at)}",
-        f"draws {draw_text}",
-        f"efficiency {eff}",
-        f"games {len(slate)}",
-        "",
-    ]
+    notes = [str(item) for item in (warnings or []) if str(item).strip()]
+    lines = []
+    if notes:
+        lines.extend(notes)
+        lines.append("")
+    lines.extend(
+        [
+            f"season {int(season)}",
+            f"week {int(week)}",
+            f"run {format_run_ct(run_at)}",
+            f"draws {draw_text}",
+            f"efficiency {eff}",
+            f"games {len(slate)}",
+            "",
+        ]
+    )
     if not _sim_games(slate):
         lines.append(VEGAS_LABEL)
         lines.append("")
@@ -599,6 +619,7 @@ def write_report(
     draws: int | None,
     efficiency: str | None,
     dest: Path | None = None,
+    warnings=None,
 ) -> Path:
     text = build_report(
         rows,
@@ -608,6 +629,7 @@ def write_report(
         run_at=run_at,
         draws=draws,
         efficiency=efficiency,
+        warnings=warnings,
     )
     path = report_path(season, week, run_at, dest)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -660,9 +682,9 @@ def load_games_sidecar(season: int, week: int, root: Path | None = None) -> dict
 
 
 def _game_pair(team: object, opponent: object) -> frozenset[str] | None:
-    away = str(team or "").strip().upper()
-    home = str(opponent or "").strip().upper()
-    if not away or not home:
+    away = canon_team(str(team or ""))
+    home = canon_team(str(opponent or ""))
+    if not away or not home or away == home:
         return None
     return frozenset((away, home))
 
@@ -678,7 +700,7 @@ def fill_salaries(rows: list[dict], csv_path: str | Path) -> list[dict]:
     index: dict[tuple[str, str, str], int] = {}
     games: set[frozenset[str]] = set()
     for player in load_fanduel_csv(csv_path):
-        index[(match_key(player.name), player.team.upper(), player.position.upper())] = int(
+        index[(match_key(player.name), canon_team(player.team), player.position.upper())] = int(
             player.salary
         )
         pair = _game_pair(player.team, player.opponent)
@@ -728,11 +750,278 @@ def resolve_games(rows: list[dict], *, season: int, week: int, refresh_lines: bo
     return vegas_games_from_lines(line_rows)
 
 
+# FanDuel-NFL-2026 CDT-09 CDT-27 CDT-134503-players-list.csv → 2026-09-27.
+_PLAYERS_LIST_NAME = re.compile(
+    r"^FanDuel-NFL-(\d{4})(?:\s+[A-Za-z]{2,5})?-(\d{2})(?:\s+[A-Za-z]{2,5})?-"
+    r"(\d{2})(?:(?:\s+[A-Za-z]{2,5})?-(\d+))?-players-list\.csv$",
+    re.IGNORECASE,
+)
+_DEF_POSITIONS = frozenset({"D", "DEF", "DST"})
+NO_SLATE_WARNING = (
+    "warning: no FanDuel players-list CSV dated today or later; showing the full week"
+)
+BAD_DATE_WARNING = (
+    "warning: FanDuel players-list filename has no usable slate date; "
+    "showing the full week"
+)
+
+
+def _note_missing(path: object) -> str:
+    return f"warning: slate CSV missing ({path}); showing the full week"
+
+
+def _note_empty(path: object) -> str:
+    return f"warning: slate CSV empty ({path}); showing the full week"
+
+
+def _note_malformed(path: object) -> str:
+    return f"warning: slate CSV malformed ({path}); showing the full week"
+
+
+def _note_zero(path: object) -> str:
+    return f"warning: slate CSV matched no projected players ({path}); showing the full week"
+
+
+def _note_game(label: str) -> str:
+    return f"warning: slate game {label} has no projections"
+
+
+def _note_failed(detail: object) -> str:
+    return f"warning: slate CSV failed ({detail}); showing the full week"
+
+
+def _emit_notes(notes: list[str]) -> None:
+    for note in notes:
+        print(note, file=sys.stderr)
+
+
+def parse_players_list_filename(name: str):
+    """Return ``(slate_date, stamp)`` or None.
+
+    ``FanDuel-NFL-2026 CDT-09 CDT-27 CDT-134503-players-list.csv`` is
+    2026-09-27 with stamp 134503. Entries-upload templates and other
+    names are None. An impossible month or day is None.
+    """
+    match = _PLAYERS_LIST_NAME.match(Path(str(name or "")).name)
+    if match is None:
+        return None
+    year, month, day, stamp = match.groups()
+    try:
+        slate_date = date(int(year), int(month), int(day))
+    except ValueError:
+        return None
+    token = 0 if stamp is None else int(stamp)
+    return slate_date, token
+
+
+def resolve_auto_slate_csv(data_dir, today: date):
+    """Newest players-list whose slate date is ``today`` or later.
+
+    Newest means the latest slate date, then the highest filename stamp.
+    Returns ``(path, warning)``. ``warning`` is set when nothing qualifies
+    and the report should stay unfiltered.
+    """
+    folder = Path(data_dir)
+    if not folder.is_dir():
+        return None, NO_SLATE_WARNING
+    eligible = []
+    saw_players_list = False
+    saw_dated = False
+    try:
+        names = list(folder.iterdir())
+    except OSError:
+        return None, NO_SLATE_WARNING
+    for path in names:
+        if not path.is_file():
+            continue
+        if not path.name.lower().endswith("-players-list.csv"):
+            continue
+        saw_players_list = True
+        parsed = parse_players_list_filename(path.name)
+        if parsed is None:
+            continue
+        saw_dated = True
+        slate_date, stamp = parsed
+        if slate_date < today:
+            continue
+        eligible.append((slate_date, stamp, path.name, path))
+    if eligible:
+        eligible.sort()
+        return eligible[-1][3], None
+    if saw_players_list and not saw_dated:
+        return None, BAD_DATE_WARNING
+    return None, NO_SLATE_WARNING
+
+
+def _split_matchup(text: object):
+    raw = str(text or "").strip()
+    if "@" not in raw:
+        return None
+    left, right = raw.split("@", 1)
+    pair = _game_pair(left, right)
+    if pair is None:
+        return None
+    away = canon_team(left)
+    home = canon_team(right)
+    return pair, f"{away}@{home}"
+
+
+def _score_pair(game: dict):
+    pair = _game_pair(game.get("away"), game.get("home"))
+    if pair is not None:
+        return pair
+    matchup = _split_matchup(game.get("game"))
+    if matchup is None:
+        return None
+    return matchup[0]
+
+
+def _index_slate(players):
+    """Name+team salaries, DEF-by-team salaries, and game pairs."""
+    skill = {}
+    defenses = {}
+    games = {}
+    for player in players:
+        team = canon_team(player.team)
+        pos = (player.position or "").upper()
+        if pos in _DEF_POSITIONS:
+            if team:
+                defenses[team] = int(player.salary)
+        elif team:
+            key = (match_key(player.name), team)
+            skill.setdefault(key, {})[pos] = int(player.salary)
+        matchup = _split_matchup(player.game)
+        if matchup is not None:
+            games.setdefault(matchup[0], matchup[1])
+        pair = _game_pair(player.team, player.opponent)
+        if pair is not None and pair not in games:
+            games[pair] = f"{canon_team(player.team)}@{canon_team(player.opponent)}"
+    return skill, defenses, games
+
+
+def _on_slate(row: dict, skill: dict, defenses: dict) -> bool:
+    team = _team(row)
+    if not team:
+        return False
+    if _pos(row) == "D":
+        return team in defenses
+    return (match_key(_name(row)), team) in skill
+
+
+def _slate_salary(row: dict, skill: dict, defenses: dict):
+    team = _team(row)
+    if _pos(row) == "D":
+        return defenses.get(team)
+    by_pos = skill.get((match_key(_name(row)), team))
+    if not by_pos:
+        return None
+    pos = _pos(row)
+    if pos in by_pos:
+        return by_pos[pos]
+    if len(by_pos) == 1:
+        return next(iter(by_pos.values()))
+    return None
+
+
+def _read_slate_players(path: Path):
+    from nfl.players import load_fanduel_csv
+
+    if not path.is_file():
+        return None, _note_missing(path)
+    try:
+        players = load_fanduel_csv(path)
+    except ValueError as exc:
+        text = str(exc)
+        if "empty CSV" in text:
+            return None, _note_empty(path)
+        return None, _note_malformed(path)
+    except (OSError, UnicodeError, csv.Error):
+        return None, _note_malformed(path)
+    except Exception as exc:
+        return None, _note_failed(exc)
+    if not players:
+        return None, _note_empty(path)
+    return players, None
+
+
+def restrict_to_slate(rows, games, spec, today=None, data_dir=None):
+    """Limit report rows and games to a FanDuel players-list.
+
+    Returns ``(rows, games, warnings)``. Any unusable CSV returns the
+    original rows and games plus one warning. Stored projection dicts
+    are not mutated. Salaries on the returned copies come from the CSV.
+    """
+    if today is None:
+        today = datetime.now(CT).date()
+    folder = DATA_DIR if data_dir is None else Path(data_dir)
+    text = str(spec or "").strip()
+    if not text:
+        notes = [_note_missing("")]
+        _emit_notes(notes)
+        return rows, games, notes
+    try:
+        if text.lower() == "auto":
+            path, warning = resolve_auto_slate_csv(folder, today)
+            if warning:
+                _emit_notes([warning])
+                return rows, games, [warning]
+        else:
+            path = Path(text)
+        players, warning = _read_slate_players(path)
+        if warning:
+            _emit_notes([warning])
+            return rows, games, [warning]
+        skill, defenses, csv_games = _index_slate(players)
+        shown = projection_rows(list(rows or []))
+        matched = []
+        for row in shown:
+            if not _on_slate(row, skill, defenses):
+                continue
+            copy = dict(row)
+            salary = _slate_salary(copy, skill, defenses)
+            if salary is not None:
+                copy["salary"] = salary
+            copy.pop("off_slate", None)
+            matched.append(copy)
+        if not matched:
+            notes = [_note_zero(path)]
+            _emit_notes(notes)
+            return rows, games, notes
+        covered = {_team(row) for row in matched}
+        notes = []
+        for pair, label in csv_games.items():
+            if pair.isdisjoint(covered):
+                notes.append(_note_game(label))
+        kept = []
+        for game in _coerce_games(games):
+            pair = _score_pair(game)
+            if pair is not None and pair in csv_games:
+                kept.append(game)
+        if notes:
+            _emit_notes(notes)
+        print(f"slate csv {path}", file=sys.stderr)
+        return matched, kept, notes
+    except Exception as exc:
+        notes = [_note_failed(exc)]
+        _emit_notes(notes)
+        return rows, games, notes
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--season", type=int, default=None)
     ap.add_argument("--week", type=int, default=None)
     ap.add_argument("--csv", default=None, help="FanDuel players list; fills null salaries")
+    ap.add_argument(
+        "--slate-csv",
+        default=None,
+        help="Restrict the report to games and players in this FanDuel "
+        "players-list. 'auto' picks the newest "
+        "nfl/data/FanDuel-NFL-*-players-list.csv dated today or later "
+        "(America/Chicago). Salaries come from that CSV. Stored "
+        "projections are unchanged. A missing or unusable file keeps "
+        "the full report.",
+    )
     return ap.parse_args(argv)
 
 
@@ -775,6 +1064,13 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as e:
         print(f"report: {e}", file=sys.stderr)
         return 1
+    warnings = []
+    if args.slate_csv:
+        try:
+            rows, games, warnings = restrict_to_slate(rows, games, args.slate_csv)
+        except Exception as exc:
+            warnings = [_note_failed(exc)]
+            print(warnings[0], file=sys.stderr)
     run_at = run_at_of(rows)
     path = write_report(
         rows,
@@ -785,6 +1081,7 @@ def main(argv: list[str] | None = None) -> int:
         draws=None,
         efficiency=efficiency_from_rows(rows),
         dest=None,
+        warnings=warnings,
     )
     print(path)
     return 0

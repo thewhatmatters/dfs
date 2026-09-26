@@ -1322,6 +1322,7 @@ class ScoringImportTest(unittest.TestCase):
             "import sys\n"
             "import nfl.optimize\n"
             "import nfl.publish_projections\n"
+            "import nfl.report\n"
             "import nfl.holdout\n"
             "bad = [name for name in sys.modules if name == 'numpy' or name.startswith('numpy.')"
             " or name == 'scipy' or name.startswith('scipy.') or name == 'nfl.calibration']\n"

@@ -27,6 +27,8 @@ reads the stored `model=sim` rows. It shows those sim scores when the
 sidecar `run_at` matches, and gangstash implied totals otherwise.
 `--csv` fills a null salary from a FanDuel players list. A player whose whole game has no rows in that file shows `off slate` in the salary cell. A missing player in a listed game still shows `—`.
 
+`--slate-csv PATH` (also on `python3 -m nfl.report`) limits the report's games section and every top list to games in that players-list and to players in it (normalized name + team; DEF by team). Top lists backfill from the next eligible player. Salaries and pts/$1k come from the CSV. `--slate-csv auto` uses the newest `nfl/data/FanDuel-NFL-*-players-list.csv` whose filename slate date is today or later in America/Chicago, and ignores entries-upload templates. A missing, empty, malformed, or unmatched file, or a bad filename date, keeps the unfiltered report, prints one warning, and still exits 0. Gangstash rows are the full week either way. Team codes are normalized in the report (JAX→JAC, WSH→WAS, LA→LAR, OAK→LV) so a JAC game score still lists Jacksonville players stored as JAX.
+
 ## Keys
 
 | env | role |
