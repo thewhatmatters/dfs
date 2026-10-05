@@ -17,9 +17,15 @@ builds for `--projection-source sim`. `mean` is that simulated mean.
 `--sim-efficiency` matches the optimizer (default `data`).
 `--sim-mode team` is opt-in. The default `off` keeps the current draws.
 The run log prints the effective mode after any fallback, and each sim
-row stores that mode on `inputs.sim_efficiency`. Missing sim inputs
+row stores that mode on `inputs.sim_efficiency`. A sim row also stores
+`inputs.anytime_td_prob` and `inputs.td_mean` when the draw has a
+scoring-TD count (rush + receiving; not passing TDs). Missing sim inputs
 fall back to placeholder and the board, and the log says so. The
 nightly publish still posts the board.
+
+`--sim-mode team` also upserts one row per game into
+``public.nfl_game_projections`` (PostgREST, service-role key). Those
+rows are not sent to ``/functions/v1/projections``.
 
 `GANGSTASH_API_KEY` is required to read game lines, depth, targets,
 snaps, props, and injuries. If it is unset the command exits 1 before posting.
@@ -41,7 +47,7 @@ import json
 import subprocess
 import sys
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -128,11 +134,14 @@ class SimResult:
 
     ``by_pid, mode = maybe_sim(...)`` still unpacks. ``game_draws`` is
     ``(game, away, home, away_pts, home_pts)`` per game per draw.
+    ``td_draws`` is ``pid → expected scoring TDs`` (rush + receiving)
+    for each of those same draws.
     """
 
     by_pid: dict | None
     efficiency: str
     game_draws: tuple = ()
+    td_draws: dict = field(default_factory=dict)
 
     def __iter__(self):
         yield self.by_pid
@@ -352,7 +361,10 @@ def maybe_sim(
         )
         return SimResult(None, used)
     raw_draws = getattr(result, "game_draws", ()) or ()
-    return SimResult(by_pid, used, tuple(raw_draws))
+    td_draws = getattr(result, "td_draws", None) or {}
+    if not isinstance(td_draws, dict):
+        td_draws = {}
+    return SimResult(by_pid, used, tuple(raw_draws), td_draws)
 
 
 def sim_parts(sim: SimResult | tuple | dict | None) -> tuple[dict | None, str, tuple]:
@@ -931,6 +943,19 @@ def _inputs(
     return out
 
 
+def _td_inputs(counts) -> dict:
+    """``anytime_td_prob`` and ``td_mean`` for one player's sim draws."""
+    if not counts:
+        return {}
+    from nfl.sim import anytime_td_summary
+
+    prob, mean = anytime_td_summary(counts)
+    return {
+        "anytime_td_prob": round(float(prob), 4),
+        "td_mean": round(float(mean), 4),
+    }
+
+
 def _row(
     entry: PublishEntry,
     *,
@@ -945,8 +970,11 @@ def _row(
     p50: float | None,
     p90: float | None,
     sim_efficiency: str | None = None,
+    td_counts=None,
 ) -> dict:
     pl = entry.player
+    inputs = _inputs(pl, entry, sim_efficiency=sim_efficiency)
+    inputs.update(_td_inputs(td_counts))
     return {
         "season": int(season),
         "week": int(week),
@@ -966,7 +994,7 @@ def _row(
         "p10": None if p10 is None else round(float(p10), 4),
         "p50": None if p50 is None else round(float(p50), 4),
         "p90": None if p90 is None else round(float(p90), 4),
-        "inputs": _inputs(pl, entry, sim_efficiency=sim_efficiency),
+        "inputs": inputs,
     }
 
 
@@ -980,6 +1008,7 @@ def projection_rows(
     model_version: str,
     sim_by_pid: dict | None = None,
     sim_efficiency: str = "data",
+    td_by_pid: dict | None = None,
 ) -> list[dict]:
     rows: list[dict] = []
     for entry in entries:
@@ -1001,6 +1030,7 @@ def projection_rows(
         )
     if not sim_by_pid:
         return rows
+    td_map = td_by_pid or {}
     missing = 0
     for entry in entries:
         stats = sim_by_pid.get(entry.player.pid)
@@ -1009,6 +1039,8 @@ def projection_rows(
                 continue
             missing += 1
             continue
+        pos = (entry.player.position or "").upper()
+        counts = None if pos in {"D", "DEF"} else td_map.get(entry.player.pid)
         rows.append(
             _row(
                 entry,
@@ -1023,6 +1055,7 @@ def projection_rows(
                 p50=float(stats.p50),
                 p90=float(stats.p90),
                 sim_efficiency=sim_efficiency,
+                td_counts=counts,
             )
         )
     if missing:
@@ -1060,6 +1093,85 @@ def write_local(rows: list[dict], dest_dir: Path, stem: str) -> tuple[Path, Path
             flat["inputs"] = json.dumps(row.get("inputs") or {}, separators=(",", ":"))
             writer.writerow(flat)
     return json_path, csv_path
+
+
+def _optional_game_lines(season: int, week: int) -> list[dict]:
+    """Consensus copy for game rows. A miss leaves the lines blank."""
+    try:
+        rows, meta = fetch_game_lines(
+            season=int(season),
+            week=int(week),
+            refresh=False,
+        )
+    except Exception as exc:
+        print(
+            "game projections: game_lines unavailable (%s)" % exc,
+            file=sys.stderr,
+        )
+        return []
+    if meta.get("cache_stale"):
+        print("game projections: game_lines cache is stale", file=sys.stderr)
+    return list(rows or [])
+
+
+def _game_projection_rows(
+    args: argparse.Namespace,
+    entries: list[PublishEntry],
+    game_draws: tuple,
+    *,
+    season: int,
+    week: int,
+    run_at: str,
+    model_version: str,
+) -> list[dict]:
+    """Team-mode game rows. Other sim modes keep the player post only."""
+    if not game_draws:
+        return []
+    if getattr(args, "sim_mode", "off") != "team":
+        print(
+            "game projections: skipped (pass --sim-mode team to write "
+            "nfl_game_projections)",
+            file=sys.stderr,
+        )
+        return []
+    from nfl.game_projections import build_game_projection_rows
+
+    return build_game_projection_rows(
+        game_draws,
+        season=season,
+        week=week,
+        season_type=args.season_type,
+        run_at=run_at,
+        model_version=model_version,
+        entries=entries,
+        line_rows=_optional_game_lines(season, week),
+    )
+
+
+def _post_game_rows(rows: list[dict]) -> int:
+    """Upsert game rows. Missing service-role key does not fail the player post."""
+    from nfl.game_projections import (
+        GameProjectionsError,
+        post_game_projection_rows,
+        service_role_key,
+    )
+
+    if not rows:
+        return 0
+    key = service_role_key()
+    if not key:
+        print(
+            "publish projections: GANGSTASH_SERVICE_ROLE_KEY is not set; "
+            "nfl_game_projections not posted",
+            file=sys.stderr,
+        )
+        return 0
+    try:
+        posted = post_game_projection_rows(rows, key=key)
+    except GameProjectionsError as exc:
+        raise PublishError(str(exc)) from exc
+    print("game projections posted %s" % posted, file=sys.stderr)
+    return 1
 
 
 def _has_qb(rows: list[dict]) -> bool:
@@ -1390,6 +1502,7 @@ def main(argv: list[str] | None = None) -> int:
             sim_mode=args.sim_mode,
         )
         sim_by_pid, used_efficiency, game_draws = sim_parts(sim)
+        td_draws = sim.td_draws if isinstance(sim, SimResult) else {}
     except StaleInputs as e:
         print(f"publish projections: {e}", file=sys.stderr)
         return 1
@@ -1417,6 +1530,16 @@ def main(argv: list[str] | None = None) -> int:
         model_version=version,
         sim_by_pid=sim_by_pid,
         sim_efficiency=used_efficiency,
+        td_by_pid=td_draws,
+    )
+    game_rows = _game_projection_rows(
+        args,
+        entries,
+        game_draws,
+        season=season,
+        week=week,
+        run_at=run_at,
+        model_version=version,
     )
     print(
         f"projections {season} week {week} {args.season_type} "
@@ -1431,6 +1554,11 @@ def main(argv: list[str] | None = None) -> int:
         stem = f"{season}-w{int(week):02d}-{stamp}"
         json_path, csv_path = write_local(rows, dest, stem)
         print(f"dry-run wrote {json_path} and {csv_path}; not posted", file=sys.stderr)
+        if game_rows:
+            from nfl.game_projections import write_game_projection_file
+
+            game_path = write_game_projection_file(game_rows, dest, stem)
+            print(f"dry-run wrote {game_path}; not posted", file=sys.stderr)
         if args.report:
             try:
                 path = emit_projection_report(
@@ -1453,6 +1581,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"publish projections: {e}", file=sys.stderr)
         return 1
     print(f"posted inserted={inserted} updated={updated}", file=sys.stderr)
+    try:
+        _post_game_rows(game_rows)
+    except PublishError as e:
+        print(f"publish projections: {e}", file=sys.stderr)
+        return 1
     if args.report:
         try:
             path = emit_projection_report(

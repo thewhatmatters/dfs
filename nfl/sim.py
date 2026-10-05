@@ -237,6 +237,9 @@ class GameSim:
     # One row per parsed game per world: (game, away, home, away_pts, home_pts).
     # Recorded after the total and spread draws. No extra RNG.
     game_draws: tuple[tuple[str, str, str, float, float], ...] = ()
+    # Expected scoring TDs (rush + receiving) per draw. Passing TDs are omitted.
+    # A player is absent when that path has no TD count (DEF, role-share skill).
+    td_draws: dict[str, tuple[float, ...]] = field(default_factory=dict)
 
     def lineup_stats(self, pids: list[str]) -> SimStats | None:
         cols = [self.draws[p] for p in pids if p in self.draws]
@@ -415,6 +418,7 @@ def simulate_games(
                 )
     rng = random.Random(int(seed))
     raw: dict[str, list[float]] = {p.pid: [] for p in players}
+    td_raw: dict[str, list] = {p.pid: [] for p in players}
     score_points = eff.points
     game_rows: list[tuple[str, str, str, float, float]] = []
     warned_games: set[str] = set()
@@ -442,6 +446,9 @@ def simulate_games(
                         _score_fallback(
                             pl, team_pts, opp_pts, group, index, score_damp=game_damp
                         )
+                    )
+                    td_raw[pl.pid].append(
+                        _fallback_scoring_tds(pl, team_pts, group, game_damp)
                     )
                 continue
             counts: dict[str, OpportunityCount] = {}
@@ -480,8 +487,12 @@ def simulate_games(
                             pl, team_pts, opp_pts, group, index, score_damp=game_damp
                         )
                     )
+                    td_raw[pl.pid].append(
+                        _fallback_scoring_tds(pl, team_pts, group, game_damp)
+                    )
                 else:
                     raw[pl.pid].append(score_points(rng, pl, opp_count))
+                    td_raw[pl.pid].append(_scoring_tds(eff, pl, opp_count))
     if team_on:
         # Bonuses and the points-allowed buckets are convex in a wider
         # score, so the raw team-mode mean sits off the default mean.
@@ -521,11 +532,17 @@ def simulate_games(
         else:
             src = "model"
         by_pid[pl.pid] = _stats(xs, n=n, source=src)
+    td_draws: dict[str, tuple[float, ...]] = {}
+    for pid, xs_td in td_raw.items():
+        if not xs_td or any(value is None for value in xs_td):
+            continue
+        td_draws[pid] = tuple(float(value) for value in xs_td)
     return GameSim(
         by_pid=by_pid,
         draws=draws,
         opportunity_teams=opportunity,
         game_draws=tuple(game_rows),
+        td_draws=td_draws,
     )
 
 
@@ -858,6 +875,46 @@ def _score_fallback(
     if starter.pid != player.pid:
         return 0.0
     return starter_qb_points(player, team_pts, index, score_damp=score_damp)
+
+
+def _scoring_tds(eff: EfficiencyModel, player: Player, opportunities: OpportunityCount) -> float:
+    """Rush + receiving TD expectation for this draw. Does not touch ``rng``."""
+    fn = getattr(eff, "scoring_tds", None)
+    if callable(fn):
+        return max(0.0, float(fn(player, opportunities)))
+    return max(0.0, float(PlaceholderEfficiency().scoring_tds(player, opportunities)))
+
+
+def _fallback_scoring_tds(
+    player: Player,
+    team_pts: float,
+    group: list[Player],
+    score_damp: Optional[float],
+) -> Optional[float]:
+    """Starter-QB rush TDs on the role-share path. None when there is no TD draw.
+
+    Passing TDs are not an anytime score. DEF return TDs are not drawn.
+    A non-QB role share is a point total, not a touchdown count.
+    """
+    if _is_dst(player):
+        return None
+    if is_inactive(player):
+        return 0.0
+    if (player.position or "").upper() != "QB":
+        return None
+    team = (player.team or "").upper()
+    mates = [p for p in group if (p.team or "").upper() == team] or [player]
+    starter = passing_qb(mates)
+    if starter is None or starter.pid != player.pid:
+        return 0.0
+    implied = float(player.implied_total or 0.0)
+    if score_damp is None:
+        scale = (float(team_pts) / implied) if implied > 0 else 1.0
+    else:
+        scale = production_scale(team_pts, implied, score_damp)
+    rush = starter_qb_rush_yards(player) * scale
+    rushes = (rush / QB_YPC) if QB_YPC else 0.0
+    return rushes * QB_RUSH_TD_RATE
 
 
 # pid plus every input of the product below. ``id(player)`` is reused after
@@ -2402,6 +2459,23 @@ def _percentile(sorted_xs: list[float], p: float) -> float:
     hi = min(lo + 1, n - 1)
     w = idx - lo
     return sorted_xs[lo] * (1.0 - w) + sorted_xs[hi] * w
+
+
+def anytime_td_summary(counts) -> Tuple[float, float]:
+    """``(anytime_td_prob, td_mean)`` from per-draw expected scoring TDs.
+
+    Each count is rush TDs plus receiving TDs in that world. The sim stores
+    that expectation, not an integer TD sample. ``anytime_td_prob`` is the
+    mean of ``1 - exp(-λ)`` (Poisson chance of at least one score).
+    ``td_mean`` is the mean of ``λ``. Passing TDs are not included.
+    """
+    xs = [max(0.0, float(value)) for value in counts]
+    n = len(xs)
+    if n <= 0:
+        raise ValueError("anytime TD summary needs at least one draw")
+    td_mean = sum(xs) / float(n)
+    prob = sum(1.0 - math.exp(-value) for value in xs) / float(n)
+    return prob, td_mean
 
 
 def _stats(draws: list[float], *, n: int, source: str) -> SimStats:

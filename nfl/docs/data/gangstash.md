@@ -11,7 +11,12 @@ x-api-key: $GANGSTASH_API_KEY
 
 The server also accepts `Authorization: Bearer`. This client sends
 `x-api-key` only. Never put the key in the URL. Never send a Supabase
-service-role key.
+service-role key on `/functions/v1` or `/data`.
+
+The one service-role call is the team-mode game-projection upsert
+(`POST /rest/v1/nfl_game_projections`, `GANGSTASH_SERVICE_ROLE_KEY`).
+That key is not `GANGSTASH_API_KEY` and is not sent to `/functions/v1`.
+See [`projections.md`](projections.md).
 
 Response: `{ "data": [ ... ], "truncated": bool }`. Each page is 1,000 rows.
 `truncated=true` means another page exists. The client follows `offset=1000`,
