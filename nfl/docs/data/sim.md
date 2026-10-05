@@ -227,6 +227,19 @@ python3 -m nfl.optimize --csv "nfl/data/<players-list>.csv" --sim \
 
 Fixture: `nfl/testdata/sim_layers.json` (DET offense/defense EPA sums, four weeks of swapping WR target shares, Gibbs target shares, no snaps).
 
+## What publish stores from the draws
+
+`python3 -m nfl.publish_projections --sim N --sim-mode team` writes both
+tables from one run. Player rows still go to `/functions/v1/projections`.
+Game rows go to `nfl_game_projections` (see
+[`projections.md`](projections.md)).
+
+Each skill draw also keeps an expected scoring-TD count: rush TDs plus
+receiving TDs. Passing TDs are not included. Publish stores that on the
+sim row's `inputs` as `td_mean` (mean of the counts) and `anytime_td_prob`
+(mean of `1 - exp(-λ)`, because the count is an expectation, not a sampled
+integer). DEF and role-share skill rows omit both.
+
 ## Seeds
 
 One `random.Random(seed)` for the slate. Games run in game-id order, players in pid order. Inside an opportunity team the order is: plays gaussian, target-share gammas (pid order, then the other bucket), rush-share gammas when snaps or carries exist, then one yards gaussian per receiving line (catchers, then the other bucket), then one team pass-yard gaussian around the anchor (skipped when the anchor is 0). Scoring then draws rush yards when that player has rushes. Share draws stay on the gamma sequence. Empty inputs add no draws beyond the total and the spread.

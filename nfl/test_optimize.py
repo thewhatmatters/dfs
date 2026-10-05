@@ -205,6 +205,8 @@ class NameJoinTest(unittest.TestCase):
     def test_jr_strip(self):
         self.assertEqual(match_key("Erick All Jr."), match_key("Erick All"))
         self.assertEqual(match_key("Marvin Harrison Jr."), "marvin harrison")
+        self.assertEqual(match_key("Patrick Mahomes II"), match_key("Patrick Mahomes"))
+        self.assertEqual(match_key("Patrick Mahomes III"), "patrick mahomes")
 
     def test_jac_jax_was_wsh(self):
         self.assertEqual(lookup_odds("Jacksonville Jaguars").fd, "JAC")
