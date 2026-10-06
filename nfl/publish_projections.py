@@ -18,14 +18,16 @@ builds for `--projection-source sim`. `mean` is that simulated mean.
 `--sim-mode team` is opt-in. The default `off` keeps the current draws.
 The run log prints the effective mode after any fallback, and each sim
 row stores that mode on `inputs.sim_efficiency`. A sim row also stores
-`inputs.anytime_td_prob` and `inputs.td_mean` when the draw has a
-scoring-TD count (rush + receiving; not passing TDs). Missing sim inputs
+rush+rec TD bins (`td_0`..`td_3plus`, `n_draws`, `td_mean`,
+`anytime_td_prob`) when the draw has a scoring-TD count. QBs also store
+`pass_td_mean` and `total_td_*`. Missing sim inputs
 fall back to placeholder and the board, and the log says so. The
 nightly publish still posts the board.
 
-`--sim-mode team` also upserts one row per game into
-``public.nfl_game_projections`` (PostgREST, service-role key). Those
-rows are not sent to ``/functions/v1/projections``.
+`--sim-mode team` also POSTs one row per game to the same
+``/functions/v1/projections`` endpoint, as a second request whose body
+is ``{"game_projections": [...]}``. Both requests use
+``GANGSTASH_PROJECTIONS_WRITER_KEY``. Player rows are sent first.
 
 `GANGSTASH_API_KEY` is required to read game lines, depth, targets,
 snaps, props, and injuries. If it is unset the command exits 1 before posting.
@@ -134,14 +136,13 @@ class SimResult:
 
     ``by_pid, mode = maybe_sim(...)`` still unpacks. ``game_draws`` is
     ``(game, away, home, away_pts, home_pts)`` per game per draw.
-    ``td_draws`` is ``pid → expected scoring TDs`` (rush + receiving)
-    for each of those same draws.
+    ``td_tallies`` is ``pid → TdTally`` (rush + receiving, plus QB passing).
     """
 
     by_pid: dict | None
     efficiency: str
     game_draws: tuple = ()
-    td_draws: dict = field(default_factory=dict)
+    td_tallies: dict = field(default_factory=dict)
 
     def __iter__(self):
         yield self.by_pid
@@ -233,6 +234,67 @@ def _post_chunk(url: str, chunk: list[dict], key: str) -> dict:
     payload, _hdrs = http_json_post(url, {"rows": chunk}, headers={"x-api-key": key})
     if not isinstance(payload, dict):
         raise PublishError("projections response is not an object")
+    return payload
+
+
+def _game_counts(payload: object) -> tuple[int, int, int]:
+    if not isinstance(payload, dict):
+        raise PublishError("game projections response is not an object")
+    missing = [
+        name
+        for name in ("game_inserted", "game_updated", "game_upserted")
+        if name not in payload
+    ]
+    if missing:
+        raise PublishError(
+            "game projections response missing %s (keys %s)"
+            % (", ".join(missing), sorted(payload))
+        )
+    return (
+        int(payload["game_inserted"]),
+        int(payload["game_updated"]),
+        int(payload["game_upserted"]),
+    )
+
+
+def post_game_projection_rows(
+    rows: list[dict],
+    *,
+    key: str,
+    poster=None,
+) -> tuple[int, int, int]:
+    """POST ``{"game_projections": ...}`` with the writer key.
+
+    Separate from the player ``rows`` request so a game-row 400 does not
+    block players that were already accepted.
+    """
+    if not rows:
+        return 0, 0, 0
+    if not key:
+        raise ProjectionsKeyMissing("GANGSTASH_PROJECTIONS_WRITER_KEY is not set")
+    send = poster or _post_game_chunk
+    try:
+        payload = send(PROJECTIONS_URL, rows, key)
+    except PublishError:
+        raise
+    except (HttpError, GangstashError) as e:
+        raise PublishError(_redact(str(e), key)) from e
+    except Exception as e:
+        raise PublishError(_redact(str(e), key)) from e
+    return _game_counts(payload)
+
+
+def _post_game_chunk(url: str, rows: list[dict], key: str) -> dict:
+    if "?" in url or key in url or "api_key=" in url or "apikey=" in url.lower():
+        raise PublishError("refusing to put the projections key in the URL")
+    payload, _hdrs = http_json_post(
+        url,
+        {"game_projections": rows},
+        headers={"x-api-key": key},
+        error_chars=4000,
+    )
+    if not isinstance(payload, dict):
+        raise PublishError("game projections response is not an object")
     return payload
 
 
@@ -361,10 +423,10 @@ def maybe_sim(
         )
         return SimResult(None, used)
     raw_draws = getattr(result, "game_draws", ()) or ()
-    td_draws = getattr(result, "td_draws", None) or {}
-    if not isinstance(td_draws, dict):
-        td_draws = {}
-    return SimResult(by_pid, used, tuple(raw_draws), td_draws)
+    td_tallies = getattr(result, "td_tallies", None) or {}
+    if not isinstance(td_tallies, dict):
+        td_tallies = {}
+    return SimResult(by_pid, used, tuple(raw_draws), td_tallies)
 
 
 def sim_parts(sim: SimResult | tuple | dict | None) -> tuple[dict | None, str, tuple]:
@@ -943,17 +1005,14 @@ def _inputs(
     return out
 
 
-def _td_inputs(counts) -> dict:
-    """``anytime_td_prob`` and ``td_mean`` for one player's sim draws."""
-    if not counts:
+def _td_inputs(tally) -> dict:
+    """TD bins from a ``TdTally``. Empty when this player has no TD draw."""
+    if tally is None:
         return {}
-    from nfl.sim import anytime_td_summary
-
-    prob, mean = anytime_td_summary(counts)
-    return {
-        "anytime_td_prob": round(float(prob), 4),
-        "td_mean": round(float(mean), 4),
-    }
+    fn = getattr(tally, "inputs", None)
+    if not callable(fn):
+        return {}
+    return dict(fn())
 
 
 def _row(
@@ -1129,8 +1188,8 @@ def _game_projection_rows(
         return []
     if getattr(args, "sim_mode", "off") != "team":
         print(
-            "game projections: skipped (pass --sim-mode team to write "
-            "nfl_game_projections)",
+            "game projections: skipped (pass --sim-mode team to post "
+            "game_projections)",
             file=sys.stderr,
         )
         return []
@@ -1148,29 +1207,21 @@ def _game_projection_rows(
     )
 
 
-def _post_game_rows(rows: list[dict]) -> int:
-    """Upsert game rows. Missing service-role key does not fail the player post."""
-    from nfl.game_projections import (
-        GameProjectionsError,
-        post_game_projection_rows,
-        service_role_key,
-    )
-
+def _post_game_rows(rows: list[dict], key: str) -> int:
+    """Second request. A rejection leaves the player rows already posted."""
     if not rows:
         return 0
-    key = service_role_key()
-    if not key:
-        print(
-            "publish projections: GANGSTASH_SERVICE_ROLE_KEY is not set; "
-            "nfl_game_projections not posted",
-            file=sys.stderr,
-        )
-        return 0
     try:
-        posted = post_game_projection_rows(rows, key=key)
-    except GameProjectionsError as exc:
-        raise PublishError(str(exc)) from exc
-    print("game projections posted %s" % posted, file=sys.stderr)
+        inserted, updated, upserted = post_game_projection_rows(rows, key=key)
+    except PublishError as exc:
+        raise PublishError(
+            "game_projections rejected (player rows already posted): %s" % exc
+        ) from exc
+    print(
+        "game projections inserted=%s updated=%s upserted=%s"
+        % (inserted, updated, upserted),
+        file=sys.stderr,
+    )
     return 1
 
 
@@ -1502,7 +1553,7 @@ def main(argv: list[str] | None = None) -> int:
             sim_mode=args.sim_mode,
         )
         sim_by_pid, used_efficiency, game_draws = sim_parts(sim)
-        td_draws = sim.td_draws if isinstance(sim, SimResult) else {}
+        td_tallies = sim.td_tallies if isinstance(sim, SimResult) else {}
     except StaleInputs as e:
         print(f"publish projections: {e}", file=sys.stderr)
         return 1
@@ -1530,7 +1581,7 @@ def main(argv: list[str] | None = None) -> int:
         model_version=version,
         sim_by_pid=sim_by_pid,
         sim_efficiency=used_efficiency,
-        td_by_pid=td_draws,
+        td_by_pid=td_tallies,
     )
     game_rows = _game_projection_rows(
         args,
@@ -1582,7 +1633,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     print(f"posted inserted={inserted} updated={updated}", file=sys.stderr)
     try:
-        _post_game_rows(game_rows)
+        _post_game_rows(game_rows, key)
     except PublishError as e:
         print(f"publish projections: {e}", file=sys.stderr)
         return 1

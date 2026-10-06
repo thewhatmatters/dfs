@@ -33,8 +33,6 @@ from nfl.http import HttpError, http_json
 
 ENDPOINT = "https://vmzgpslqoeuqmdchdekm.supabase.co/functions/v1/props"
 FUNCTIONS_BASE = "https://vmzgpslqoeuqmdchdekm.supabase.co/functions/v1"
-# Game projections only. Player rows stay on FUNCTIONS_BASE + "/projections".
-REST_BASE = "https://vmzgpslqoeuqmdchdekm.supabase.co/rest/v1"
 CACHE_DIR = Path(__file__).resolve().parent / "data" / "gangstash-props"
 DATA_CACHE_DIR = Path(__file__).resolve().parent / "data" / "gangstash-data"
 # /data pages are 1,000 rows. The server caps a result at 20,000.

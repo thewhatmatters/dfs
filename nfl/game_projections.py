@@ -1,15 +1,19 @@
-"""Upsert sim game rows to ``public.nfl_game_projections``.
+"""Build sim game rows for ``public.nfl_game_projections``.
 
-Player rows stay on ``POST /functions/v1/projections``. This table is
-PostgREST only, with the service-role key, conflict target
+Publish posts them as a second request to ``POST /functions/v1/projections``
+with ``GANGSTASH_PROJECTIONS_WRITER_KEY`` (``x-api-key``) and body
+``{"game_projections": [...]}``. Conflict target is
 ``season,week,season_type,run_at,model,game_id``. ``model`` is ``sim``.
 ``game_id`` is ``nfl_games.id`` (uuid).
+
+FanDuel codes ``JAC`` / ``LAR`` / ``WSH`` go out as ``JAX`` / ``LA`` / ``WAS``.
 
 Scores are the sim's ``game_draws`` (away/home points per draw). Means and
 percentiles use those raw points. Wins, covers, and totals use each draw
 rounded to the nearest integer, so an integer consensus line can push.
 ``consensus_home_line`` is the FanDuel home spread (negative when home is
 favored). Home covers when ``(home - away) + home_line > 0``.
+Optional consensus fields are omitted when the line is missing.
 """
 
 from __future__ import annotations
@@ -21,14 +25,11 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
-from nfl import env as envmod
-from nfl.gangstash import REST_BASE
 from nfl.gangstash_data import parse_game_line
-from nfl.http import HttpError, http_json_post
 
-GAME_PROJECTIONS_URL = REST_BASE + "/nfl_game_projections"
-ON_CONFLICT = "season,week,season_type,run_at,model,game_id"
 MODEL = "sim"
+# Writer expects the nflverse/gangstash codes, not FanDuel's.
+_WIRE_TEAM = {"JAC": "JAX", "LAR": "LA", "WSH": "WAS"}
 
 # Live columns except id and created_at (database defaults).
 GAME_ROW_FIELDS = (
@@ -72,17 +73,10 @@ _UUID = re.compile(
 _PUSH_EPS = 1e-6
 
 
-class GameProjectionsError(Exception):
-    """Game-projection upsert failed."""
-
-
-class GameProjectionsKeyMissing(GameProjectionsError):
-    """No GANGSTASH_SERVICE_ROLE_KEY."""
-
-
-def service_role_key() -> Optional[str]:
-    """Supabase service-role key for the game-projection upsert only."""
-    return envmod.get("GANGSTASH_SERVICE_ROLE_KEY")
+def wire_team(code: str) -> str:
+    """``JAC``→``JAX``, ``LAR``→``LA``, ``WSH``→``WAS``. Other codes stay."""
+    text = (code or "").strip().upper()
+    return _WIRE_TEAM.get(text, text)
 
 
 def _uuid(value: object) -> Optional[str]:
@@ -342,6 +336,16 @@ def build_game_projection_rows(
         away_p10, away_p50, away_p90 = _band(away_pts)
         home_line = meta.get("home_line")
         total = meta.get("total")
+        if total is not None and float(total) <= 0:
+            total = None
+        outcomes = _outcomes(away_pts, home_pts, home_line, total)
+        if outcomes["home_wins"] + outcomes["away_wins"] + outcomes["ties"] != n:
+            print(
+                "game projections: skip %s@%s (wins+ties != n_draws)"
+                % (away, home),
+                file=sys.stderr,
+            )
+            continue
         row = {
             "season": int(season),
             "week": int(week),
@@ -351,8 +355,8 @@ def build_game_projection_rows(
             "model": MODEL,
             "model_version": model_version,
             "n_draws": n,
-            "home_team": home,
-            "away_team": away,
+            "home_team": wire_team(home),
+            "away_team": wire_team(away),
             "home_mean": round(sum(home_pts) / float(n), 4),
             "home_p10": round(home_p10, 4),
             "home_p50": round(home_p50, 4),
@@ -361,72 +365,29 @@ def build_game_projection_rows(
             "away_p10": round(away_p10, 4),
             "away_p50": round(away_p50, 4),
             "away_p90": round(away_p90, 4),
+            "home_wins": outcomes["home_wins"],
+            "away_wins": outcomes["away_wins"],
+            "ties": outcomes["ties"],
+            "home_win_prob": outcomes["home_win_prob"],
+            "away_win_prob": outcomes["away_win_prob"],
             "consensus_home_line": _round(home_line, 4),
             "consensus_total": _round(total, 4),
+            "home_cover_prob": outcomes.get("home_cover_prob"),
+            "away_cover_prob": outcomes.get("away_cover_prob"),
+            "push_cover_prob": outcomes.get("push_cover_prob"),
+            "over_prob": outcomes.get("over_prob"),
+            "under_prob": outcomes.get("under_prob"),
+            "push_total_prob": outcomes.get("push_total_prob"),
         }
-        row.update(_outcomes(away_pts, home_pts, home_line, total))
-        rows.append({key: row.get(key) for key in GAME_ROW_FIELDS})
+        rows.append(
+            {key: row[key] for key in GAME_ROW_FIELDS if row.get(key) is not None}
+        )
     return rows
 
 
-def _redact(text: str, key: str) -> str:
-    if key and key in text:
-        return text.replace(key, "***")
-    return text
-
-
-def _post_games(url: str, rows: list, key: str):
-    if "?" in url and (
-        key in url or "api_key=" in url or "apikey=" in url.lower()
-    ):
-        raise GameProjectionsError("refusing to put the service-role key in the URL")
-    if "/functions/v1/projections" in url:
-        raise GameProjectionsError(
-            "refusing to post game rows to /functions/v1/projections"
-        )
-    payload, _hdrs = http_json_post(
-        url,
-        rows,
-        headers={
-            "apikey": key,
-            "Authorization": "Bearer " + key,
-            "Prefer": "resolution=merge-duplicates,return=representation",
-        },
-    )
-    return payload
-
-
 def write_game_projection_file(rows: list, dest_dir: Path, stem: str) -> Path:
-    """Dry-run JSON. Not a player-projection payload."""
+    """Dry-run JSON in the same shape as the second POST body."""
     dest_dir.mkdir(parents=True, exist_ok=True)
     path = dest_dir / f"{stem}-game-projections.json"
-    path.write_text(json.dumps({"rows": rows}), encoding="utf-8")
+    path.write_text(json.dumps({"game_projections": rows}), encoding="utf-8")
     return path
-
-
-def post_game_projection_rows(
-    rows: list,
-    *,
-    key: str,
-    poster=None,
-) -> int:
-    """Upsert game rows. The key stays in ``apikey`` and ``Authorization``."""
-    if not rows:
-        return 0
-    if not key:
-        raise GameProjectionsKeyMissing("GANGSTASH_SERVICE_ROLE_KEY is not set")
-    url = GAME_PROJECTIONS_URL + "?on_conflict=" + ON_CONFLICT
-    send = poster or _post_games
-    try:
-        payload = send(url, rows, key)
-    except GameProjectionsError:
-        raise
-    except HttpError as exc:
-        raise GameProjectionsError(_redact(str(exc), key)) from exc
-    except Exception as exc:
-        raise GameProjectionsError(_redact(str(exc), key)) from exc
-    if isinstance(payload, list):
-        return len(payload)
-    if isinstance(payload, dict) and payload.get("message"):
-        raise GameProjectionsError(_redact(str(payload.get("message")), key))
-    return len(rows)

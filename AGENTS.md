@@ -33,7 +33,7 @@ python3 -m nfl.depth --csv "nfl/data/<players-list>.csv"             # OurLads N
 # NFL player props: GANGSTASH_API_KEY (see nfl/docs/data/player-props.md).
 # NFL optimize defaults to gangstash lines, targets, snaps, and depth (GANGSTASH_API_KEY).
 # Nightly projections: python3 -m nfl.publish_projections --refresh --sim 10000
-# Team mode also upserts nfl_game_projections (GANGSTASH_SERVICE_ROLE_KEY):
+# Team mode also POSTs game_projections (same writer key, second request):
 # python3 -m nfl.publish_projections --refresh --sim 10000 --sim-mode team
 #   Write key GANGSTASH_PROJECTIONS_WRITER_KEY. See nfl/docs/data/projections.md.
 # NFL game lines are gangstash only. Other fallbacks: --targets-source=lineups --snaps-source=lineups --depth-source=ourlads
