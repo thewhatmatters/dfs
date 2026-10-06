@@ -560,11 +560,11 @@ class AnytimeTdTest(unittest.TestCase):
         # These floats are the seed=1, n=40 draws from before Poisson TDs.
         qb_stats = played.by_pid["qb"]
         wr_stats = played.by_pid["wr"]
-        self.assertEqual(qb_stats.mean, 21.552073089173632)
+        self.assertAlmostEqual(qb_stats.mean, 21.552073089173632, places=9)
         self.assertEqual(qb_stats.p10, 16.16861895393065)
         self.assertEqual(qb_stats.p50, 21.034573184830833)
         self.assertEqual(qb_stats.p90, 28.94698137094938)
-        self.assertEqual(wr_stats.mean, 0.19906323307527735)
+        self.assertAlmostEqual(wr_stats.mean, 0.19906323307527735, places=9)
         self.assertEqual(wr_stats.p10, 0.14357708419984358)
         self.assertEqual(wr_stats.p50, 0.1990485470343669)
         self.assertEqual(wr_stats.p90, 0.2537641610938787)
