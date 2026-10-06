@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import random
 import unittest
 from unittest.mock import patch
 
@@ -20,7 +21,7 @@ from nfl.publish_projections import (
     post_game_projection_rows,
     projection_rows,
 )
-from nfl.sim import TdTally, simulate_games
+from nfl.sim import TdTally, poisson_sample, simulate_games
 from nfl.sim_efficiency import (
     PASS_TD_RATE,
     OpportunityCount,
@@ -32,11 +33,22 @@ from nfl.sim_efficiency import (
 ATL_NO = "89c7243e-cb87-4fa4-b2c7-068be7c16a68"
 
 
-def _counted(*values):
+def _counted(*values, seed=0):
     tally = TdTally()
+    rng = random.Random(seed)
     for value in values:
-        tally.add(value)
+        tally.add(value, rng=rng)
     return tally
+
+
+class _SeqRng:
+    """Fixed uniforms so a Poisson sample is an exact integer."""
+
+    def __init__(self, values):
+        self._values = iter(values)
+
+    def random(self):
+        return next(self._values)
 
 
 def _draws():
@@ -280,9 +292,7 @@ class PublishWireTest(unittest.TestCase):
             p50 = 11.0
             p90 = 20.0
 
-        wr_tds = TdTally()
-        wr_tds.add(0.25)
-        wr_tds.add(0.25)
+        wr_tds = _counted(0.25, 0.25)
         result = SimResult(
             {"wr": Stats()},
             "data",
@@ -429,34 +439,76 @@ class PublishWireTest(unittest.TestCase):
 
 
 class AnytimeTdTest(unittest.TestCase):
+    def test_poisson_sample_is_knuth_on_the_given_rng(self) -> None:
+        # exp(-ln2) = 0.5. One uniform below that is 0; two steps that
+        # cross it are 1. A zero rate does not read the RNG.
+        self.assertEqual(poisson_sample(_SeqRng([0.4]), math.log(2.0)), 0)
+        self.assertEqual(poisson_sample(_SeqRng([0.9, 0.4]), math.log(2.0)), 1)
+        self.assertEqual(poisson_sample(_SeqRng([]), 0.0), 0)
+
     def test_bins_sum_to_n_and_anytime_matches_td_0(self) -> None:
+        # ln2, uniform 0.4 -> 0; ln2, uniforms 0.9 then 0.4 -> 1; 0 -> 0.
+        rate = math.log(2.0)
         tally = TdTally()
-        for value in (0.0, 0.2, 1.1, 1.6, 2.4, 3.2):
-            tally.add(value)
+        tally.add(rate, rng=_SeqRng([0.4]))
+        tally.add(rate, rng=_SeqRng([0.9, 0.4]))
+        tally.add(0.0, rng=_SeqRng([]))
         fields = tally.inputs()
         self.assertEqual(
             fields["td_0"] + fields["td_1"] + fields["td_2"] + fields["td_3plus"],
             fields["n_draws"],
         )
-        self.assertEqual(fields["n_draws"], 6)
+        self.assertEqual(fields["n_draws"], 3)
         self.assertEqual(fields["td_0"], 2)
         self.assertEqual(fields["td_1"], 1)
-        self.assertEqual(fields["td_2"], 2)
-        self.assertEqual(fields["td_3plus"], 1)
+        self.assertEqual(fields["td_2"], 0)
+        self.assertEqual(fields["td_3plus"], 0)
         self.assertAlmostEqual(
             fields["anytime_td_prob"],
             1.0 - fields["td_0"] / float(fields["n_draws"]),
         )
-        self.assertAlmostEqual(fields["td_mean"], round((0.0 + 0.2 + 1.1 + 1.6 + 2.4 + 3.2) / 6.0, 4))
+        self.assertAlmostEqual(fields["td_mean"], round((2.0 * rate) / 3.0, 4))
         self.assertNotIn("pass_td_mean", fields)
         self.assertNotIn("total_td_0", fields)
 
-    def test_qb_total_bins_include_drawn_passing_tds(self) -> None:
+    def test_constant_rate_anytime_near_one_minus_exp_mean(self) -> None:
+        # PR #32 stored mean(1 - exp(-λ)). For a constant λ that equals
+        # 1 - exp(-td_mean). Poisson counts should land on the same value
+        # up to Monte Carlo noise. td_mean stays the expectation.
+        rate = 0.599
+        n = 8000
         tally = TdTally()
-        tally.add(0.2, 1.6)
-        tally.add(0.0, 0.4)
-        tally.add(1.2, 2.2)
+        rng = random.Random(11)
+        for _ in range(n):
+            tally.add(rate, rng=rng)
         fields = tally.inputs()
+        self.assertEqual(
+            fields["td_0"] + fields["td_1"] + fields["td_2"] + fields["td_3plus"],
+            n,
+        )
+        self.assertEqual(fields["td_mean"], round(rate, 4))
+        self.assertAlmostEqual(
+            fields["anytime_td_prob"],
+            1.0 - fields["td_0"] / float(n),
+        )
+        self.assertAlmostEqual(
+            fields["anytime_td_prob"],
+            1.0 - math.exp(-rate),
+            delta=0.02,
+        )
+
+    def test_qb_total_is_rush_rec_sample_plus_pass_sample(self) -> None:
+        # Each rate is ln2. Uniforms pick rush+rec = 0 and pass = 1,
+        # so the total bin is 1. Means stay on the expectations.
+        rate = math.log(2.0)
+        tally = TdTally()
+        tally.add(rate, rate, _SeqRng([0.4, 0.9, 0.4]))
+        tally.add(0.0, 0.4, _SeqRng([0.1]))
+        fields = tally.inputs()
+        self.assertEqual(
+            fields["td_0"] + fields["td_1"] + fields["td_2"] + fields["td_3plus"],
+            fields["n_draws"],
+        )
         self.assertEqual(
             fields["total_td_0"]
             + fields["total_td_1"]
@@ -464,18 +516,12 @@ class AnytimeTdTest(unittest.TestCase):
             + fields["total_td_3plus"],
             fields["n_draws"],
         )
-        # rush+rec stays separate: 0.2→0, 0.0→0, 1.2→1
         self.assertEqual(fields["td_0"], 2)
-        self.assertEqual(fields["td_1"], 1)
-        # totals: 1.8→2, 0.4→0, 3.4→3+
         self.assertEqual(fields["total_td_0"], 1)
-        self.assertEqual(fields["total_td_2"], 1)
-        self.assertEqual(fields["total_td_3plus"], 1)
-        self.assertAlmostEqual(fields["pass_td_mean"], round((1.6 + 0.4 + 2.2) / 3.0, 4))
-        self.assertAlmostEqual(
-            fields["total_td_mean"],
-            round((0.2 + 1.6 + 0.0 + 0.4 + 1.2 + 2.2) / 3.0, 4),
-        )
+        self.assertEqual(fields["total_td_1"], 1)
+        self.assertAlmostEqual(fields["pass_td_mean"], round((rate + 0.4) / 2.0, 4))
+        self.assertAlmostEqual(fields["total_td_mean"], round((2.0 * rate + 0.4) / 2.0, 4))
+        self.assertAlmostEqual(fields["td_mean"], round(rate / 2.0, 4))
 
     def test_simulate_games_keeps_one_td_count_per_draw(self) -> None:
         qb = Player(
@@ -510,6 +556,19 @@ class AnytimeTdTest(unittest.TestCase):
         )
         played = simulate_games([qb, wr], n=40, seed=1)
         self.assertEqual(len(played.game_draws), 40)
+        # Side-RNG TD samples must not move the fantasy-point stream.
+        # These floats are the seed=1, n=40 draws from before Poisson TDs.
+        qb_stats = played.by_pid["qb"]
+        wr_stats = played.by_pid["wr"]
+        self.assertEqual(qb_stats.mean, 21.552073089173632)
+        self.assertEqual(qb_stats.p10, 16.16861895393065)
+        self.assertEqual(qb_stats.p50, 21.034573184830833)
+        self.assertEqual(qb_stats.p90, 28.94698137094938)
+        self.assertEqual(wr_stats.mean, 0.19906323307527735)
+        self.assertEqual(wr_stats.p10, 0.14357708419984358)
+        self.assertEqual(wr_stats.p50, 0.1990485470343669)
+        self.assertEqual(wr_stats.p90, 0.2537641610938787)
+        self.assertEqual(played.draws["qb"][0], 32.95480771291449)
         fields = played.td_tallies["qb"].inputs()
         self.assertEqual(fields["n_draws"], 40)
         self.assertEqual(

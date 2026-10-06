@@ -110,29 +110,33 @@ count. There is no `nfl_player_projections` column for them in this repo,
 and this job cannot migrate gangstash, so they stay on `inputs`.
 
 The sim's per-draw TD component is an expectation (targets × rate, or a
-scaled anchor), not a sampled integer. Each draw is rounded to the
-nearest integer (half away from zero, cap 3) and counted. A typical
-skill expectation is below 0.5, so most draws land in `td_0` and
-`anytime_td_prob` is the share of draws whose expectation rounds to at
-least 1.
+scaled anchor). Fantasy points still use that expectation. The histogram
+is a separate Poisson sample of it, on a second `random.Random` seeded
+with the sim seed. That generator is not the one that draws scores, so
+`mean` / `p10` / `p50` / `p90` do not move.
 
 | field | meaning |
 |-------|---------|
 | `anytime_td_prob` | `1 - td_0 / n_draws`. |
-| `td_mean` | Mean of the unrounded rush + receiving expectations. |
-| `td_0`, `td_1`, `td_2`, `td_3plus` | Draw counts after that rounding. They sum to `n_draws`. |
+| `td_mean` | Mean of the rush + receiving expectations (not the samples). |
+| `td_0`, `td_1`, `td_2`, `td_3plus` | Counts of Poisson samples of those expectations. They sum to `n_draws`. `3plus` is 3 or more. |
 | `n_draws` | Number of draws in the tally. |
 
-QBs also store the passing TDs the scorer actually used. In opportunity
-mode that is the sum of the team's receiving TD expectations that draw.
-On the fallback path it is the pass-TD anchor times the score scale.
-Non-QBs omit these. `td_*` stays rush + receiving either way.
+When a player's expectation barely moves, `anytime_td_prob` sits within
+Monte Carlo noise of `1 - exp(-td_mean)`.
+
+QBs also sample the passing TDs the scorer used. In opportunity mode
+that expectation is the sum of the team's receiving TD expectations
+that draw. On the fallback path it is the pass-TD anchor times the
+score scale. The pass sample is a second Poisson on the same side RNG.
+`total_td_*` counts rush+rec sample plus pass sample. Non-QBs omit
+these. `td_*` stays rush + receiving either way.
 
 | field | meaning |
 |-------|---------|
-| `pass_td_mean` | Mean of the unrounded passing-TD expectations. |
-| `total_td_mean` | Mean of rush + receiving + passing. |
-| `total_td_0`, `total_td_1`, `total_td_2`, `total_td_3plus` | Draw counts of that total, rounded the same way. They sum to `n_draws`. |
+| `pass_td_mean` | Mean of the passing-TD expectations (not the samples). |
+| `total_td_mean` | Mean of rush + receiving + passing expectations. |
+| `total_td_0`, `total_td_1`, `total_td_2`, `total_td_3plus` | Counts of the summed integer samples. They sum to `n_draws`. |
 
 DEF return TDs are not drawn, so a `D` row omits the block. A skill
 player who only has a role-share point total (no opportunity draw) also

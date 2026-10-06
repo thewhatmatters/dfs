@@ -235,25 +235,27 @@ tables from one run. Player rows go to `/functions/v1/projections` as
 `{"game_projections": [...]}` (see [`projections.md`](projections.md)).
 
 Each skill draw keeps an expected scoring-TD count: rush TDs plus
-receiving TDs. The sim does not sample an integer TD. Publish rounds
-that expectation to the nearest integer and counts draws in `td_0`,
-`td_1`, `td_2`, and `td_3plus` (those four sum to `n_draws`).
-`td_mean` is the mean of the unrounded expectations.
-`anytime_td_prob` is `1 - td_0 / n_draws`. A typical skill expectation
-is below 0.5, so most draws land in `td_0`.
+receiving TDs. Publish samples an integer from Poisson of that
+expectation on a second `random.Random` seeded with the sim seed. That
+generator does not advance the fantasy-point RNG. The samples are
+counted in `td_0`, `td_1`, `td_2`, and `td_3plus` (those four sum to
+`n_draws`). `td_mean` is the mean of the expectations, not the samples.
+`anytime_td_prob` is `1 - td_0 / n_draws`. For a near-constant
+expectation that is within Monte Carlo noise of `1 - exp(-td_mean)`.
 
-QBs also store the passing-TD expectation the scorer used that draw.
-In team / opportunity mode that is the sum of the team's drawn receiving
-TDs (rostered catchers plus the other bucket). On the fallback path it
-is the pass-TD anchor scaled by the drawn score. `pass_td_mean` is the
-average. `total_td_mean` averages rush + receiving + passing, and
-`total_td_0` .. `total_td_3plus` bin that sum the same way. Non-QBs omit
-`pass_td_mean` and every `total_td_*` field. DEF and role-share skill
-rows omit the TD block.
+QBs also sample Poisson of the passing-TD expectation the scorer used
+that draw, on the same side RNG. In team / opportunity mode that
+expectation is the sum of the team's drawn receiving TDs (rostered
+catchers plus the other bucket). On the fallback path it is the pass-TD
+anchor scaled by the drawn score. `pass_td_mean` is the mean of those
+expectations. `total_td_mean` is the mean of rush + receiving + passing
+expectations. `total_td_0` .. `total_td_3plus` count the rush+rec sample
+plus the pass sample. Non-QBs omit `pass_td_mean` and every `total_td_*`
+field. DEF and role-share skill rows omit the TD block.
 
 ## Seeds
 
-One `random.Random(seed)` for the slate. Games run in game-id order, players in pid order. Inside an opportunity team the order is: plays gaussian, target-share gammas (pid order, then the other bucket), rush-share gammas when snaps or carries exist, then one yards gaussian per receiving line (catchers, then the other bucket), then one team pass-yard gaussian around the anchor (skipped when the anchor is 0). Scoring then draws rush yards when that player has rushes. Share draws stay on the gamma sequence. Empty inputs add no draws beyond the total and the spread.
+One `random.Random(seed)` for the slate. A second `random.Random(seed)` samples the integer TDs and is not advanced by the score draws. Games run in game-id order, players in pid order. Inside an opportunity team the order is: plays gaussian, target-share gammas (pid order, then the other bucket), rush-share gammas when snaps or carries exist, then one yards gaussian per receiving line (catchers, then the other bucket), then one team pass-yard gaussian around the anchor (skipped when the anchor is 0). Scoring then draws rush yards when that player has rushes. Share draws stay on the gamma sequence. Empty inputs add no draws beyond the total and the spread.
 
 ## Backtest
 

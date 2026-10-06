@@ -417,6 +417,9 @@ def simulate_games(
                     prep, eff, float(damp), total_mu, spread_mu, away, home
                 )
     rng = random.Random(int(seed))
+    # Integer TD samples only. A second Random with the sim seed does not
+    # advance ``rng``, so fantasy points stay on the main stream.
+    td_rng = random.Random(int(seed))
     raw: dict[str, list[float]] = {p.pid: [] for p in players}
     td_tallies: dict[str, TdTally] = {}
     score_points = eff.points
@@ -457,6 +460,7 @@ def simulate_games(
                                 pl, team_pts, group, index, game_damp
                             ),
                         ),
+                        td_rng,
                     )
                 continue
             counts: dict[str, OpportunityCount] = {}
@@ -505,6 +509,7 @@ def simulate_games(
                                 pl, team_pts, group, index, game_damp
                             ),
                         ),
+                        td_rng,
                     )
                 else:
                     raw[pl.pid].append(score_points(rng, pl, opp_count))
@@ -513,6 +518,7 @@ def simulate_games(
                         pl.pid,
                         _scoring_tds(eff, pl, opp_count),
                         _qb_pass_td(pl, _scoring_pass_tds(eff, pl, opp_count)),
+                        td_rng,
                     )
     if team_on:
         # Bonuses and the points-allowed buckets are convex in a wider
@@ -2533,25 +2539,48 @@ def _percentile(sorted_xs: list[float], p: float) -> float:
     return sorted_xs[lo] * (1.0 - w) + sorted_xs[hi] * w
 
 
-def td_bin(value: float) -> int:
-    """Nearest integer of a drawn TD expectation, capped at the 3+ bin."""
-    k = int(math.floor(max(0.0, float(value)) + 0.5))
+def poisson_sample(rng, lam: float) -> int:
+    """Integer draw from Poisson(``lam``) on ``rng`` only.
+
+    ``lam <= 0`` returns 0 and does not consume ``rng``. Knuth's product
+    of uniforms. This is the TD side stream, not the fantasy-point RNG.
+    """
+    rate = float(lam)
+    if rate <= 0.0:
+        return 0
+    if rng is None:
+        raise ValueError("poisson TD sample needs the side RNG")
+    limit = math.exp(-rate)
+    count = 0
+    product = 1.0
+    while product > limit:
+        count += 1
+        product *= rng.random()
+    return count - 1
+
+
+def _count_bin(k: int) -> int:
+    """0, 1, 2, or 3+."""
+    if k <= 0:
+        return 0
     if k >= 3:
         return 3
-    return k
+    return int(k)
 
 
 class TdTally:
-    """Running TD counts. The draw values themselves are not stored.
+    """Running TD counts. The per-draw expectations are not stored.
 
-    ``td_*`` is rush plus receiving only. Each draw's expectation is rounded
-    to the nearest integer and counted in ``td_0`` .. ``td_3plus``.
-    ``td_mean`` is the mean of the unrounded expectations.
-    ``anytime_td_prob`` is ``1 - td_0 / n_draws``.
+    ``td_*`` is rush plus receiving only. Each draw samples
+    Poisson(that draw's rush+rec expectation) on the side RNG and counts
+    the integer in ``td_0`` .. ``td_3plus``. ``td_mean`` is the mean of
+    the expectations, not the samples. ``anytime_td_prob`` is
+    ``1 - td_0 / n_draws``.
 
-    A QB also records the passing-TD expectation the scorer used that draw
-    (the team's receiving TDs, or the pass-TD anchor on the fallback path).
-    ``total_*`` is rush + receiving + passing, binned the same way.
+    A QB also samples Poisson of the passing-TD expectation the scorer
+    used (the team's receiving TDs, or the pass-TD anchor on the fallback
+    path). ``total_td_*`` counts rush+rec sample plus pass sample.
+    ``pass_td_mean`` and ``total_td_mean`` are means of the expectations.
     Non-QBs omit ``pass_td_mean`` and every ``total_td_*`` field.
     """
 
@@ -2565,7 +2594,7 @@ class TdTally:
         self.qb = False
         self.dropped = False
 
-    def add(self, rush_rec, pass_td=None) -> None:
+    def add(self, rush_rec, pass_td=None, rng=None) -> None:
         if self.dropped:
             return
         if rush_rec is None:
@@ -2574,15 +2603,16 @@ class TdTally:
         rr = max(0.0, float(rush_rec))
         self.n += 1
         self.td_sum += rr
-        self.bins[td_bin(rr)] += 1
+        scored = poisson_sample(rng, rr)
+        self.bins[_count_bin(scored)] += 1
         if pass_td is None:
             return
         self.qb = True
         passing = max(0.0, float(pass_td))
         self.pass_sum += passing
-        total = rr + passing
-        self.total_sum += total
-        self.total_bins[td_bin(total)] += 1
+        self.total_sum += rr + passing
+        passed = poisson_sample(rng, passing)
+        self.total_bins[_count_bin(scored + passed)] += 1
 
     def inputs(self) -> dict:
         if self.dropped or self.n <= 0:
@@ -2608,12 +2638,12 @@ class TdTally:
         return out
 
 
-def _note_td(tallies: dict, pid: str, rush_rec, pass_td=None) -> None:
+def _note_td(tallies: dict, pid: str, rush_rec, pass_td=None, rng=None) -> None:
     tally = tallies.get(pid)
     if tally is None:
         tally = TdTally()
         tallies[pid] = tally
-    tally.add(rush_rec, pass_td)
+    tally.add(rush_rec, pass_td, rng)
 
 
 def _stats(draws: list[float], *, n: int, source: str) -> SimStats:
