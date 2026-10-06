@@ -237,9 +237,9 @@ class GameSim:
     # One row per parsed game per world: (game, away, home, away_pts, home_pts).
     # Recorded after the total and spread draws. No extra RNG.
     game_draws: tuple[tuple[str, str, str, float, float], ...] = ()
-    # Expected scoring TDs (rush + receiving) per draw. Passing TDs are omitted.
-    # A player is absent when that path has no TD count (DEF, role-share skill).
-    td_draws: dict[str, tuple[float, ...]] = field(default_factory=dict)
+    # Rush+rec (and, for QBs, pass) TD tallies. One object per player, updated
+    # in the draw loop. Absent when that path has no TD count (DEF, role-share skill).
+    td_tallies: dict[str, TdTally] = field(default_factory=dict)
 
     def lineup_stats(self, pids: list[str]) -> SimStats | None:
         cols = [self.draws[p] for p in pids if p in self.draws]
@@ -418,7 +418,7 @@ def simulate_games(
                 )
     rng = random.Random(int(seed))
     raw: dict[str, list[float]] = {p.pid: [] for p in players}
-    td_raw: dict[str, list] = {p.pid: [] for p in players}
+    td_tallies: dict[str, TdTally] = {}
     score_points = eff.points
     game_rows: list[tuple[str, str, str, float, float]] = []
     warned_games: set[str] = set()
@@ -447,8 +447,16 @@ def simulate_games(
                             pl, team_pts, opp_pts, group, index, score_damp=game_damp
                         )
                     )
-                    td_raw[pl.pid].append(
-                        _fallback_scoring_tds(pl, team_pts, group, game_damp)
+                    _note_td(
+                        td_tallies,
+                        pl.pid,
+                        _fallback_scoring_tds(pl, team_pts, group, game_damp),
+                        _qb_pass_td(
+                            pl,
+                            _fallback_pass_tds(
+                                pl, team_pts, group, index, game_damp
+                            ),
+                        ),
                     )
                 continue
             counts: dict[str, OpportunityCount] = {}
@@ -487,12 +495,25 @@ def simulate_games(
                             pl, team_pts, opp_pts, group, index, score_damp=game_damp
                         )
                     )
-                    td_raw[pl.pid].append(
-                        _fallback_scoring_tds(pl, team_pts, group, game_damp)
+                    _note_td(
+                        td_tallies,
+                        pl.pid,
+                        _fallback_scoring_tds(pl, team_pts, group, game_damp),
+                        _qb_pass_td(
+                            pl,
+                            _fallback_pass_tds(
+                                pl, team_pts, group, index, game_damp
+                            ),
+                        ),
                     )
                 else:
                     raw[pl.pid].append(score_points(rng, pl, opp_count))
-                    td_raw[pl.pid].append(_scoring_tds(eff, pl, opp_count))
+                    _note_td(
+                        td_tallies,
+                        pl.pid,
+                        _scoring_tds(eff, pl, opp_count),
+                        _qb_pass_td(pl, _scoring_pass_tds(eff, pl, opp_count)),
+                    )
     if team_on:
         # Bonuses and the points-allowed buckets are convex in a wider
         # score, so the raw team-mode mean sits off the default mean.
@@ -532,17 +553,17 @@ def simulate_games(
         else:
             src = "model"
         by_pid[pl.pid] = _stats(xs, n=n, source=src)
-    td_draws: dict[str, tuple[float, ...]] = {}
-    for pid, xs_td in td_raw.items():
-        if not xs_td or any(value is None for value in xs_td):
-            continue
-        td_draws[pid] = tuple(float(value) for value in xs_td)
+    kept_tds = {
+        pid: tally
+        for pid, tally in td_tallies.items()
+        if tally.inputs()
+    }
     return GameSim(
         by_pid=by_pid,
         draws=draws,
         opportunity_teams=opportunity,
         game_draws=tuple(game_rows),
-        td_draws=td_draws,
+        td_tallies=kept_tds,
     )
 
 
@@ -885,6 +906,23 @@ def _scoring_tds(eff: EfficiencyModel, player: Player, opportunities: Opportunit
     return max(0.0, float(PlaceholderEfficiency().scoring_tds(player, opportunities)))
 
 
+def _scoring_pass_tds(
+    eff: EfficiencyModel, player: Player, opportunities: OpportunityCount
+) -> float:
+    """Passing-TD expectation ``points`` uses. Does not touch ``rng``."""
+    fn = getattr(eff, "scoring_pass_tds", None)
+    if callable(fn):
+        return max(0.0, float(fn(player, opportunities)))
+    return max(0.0, float(PlaceholderEfficiency().scoring_pass_tds(player, opportunities)))
+
+
+def _qb_pass_td(player: Player, value: Optional[float]) -> Optional[float]:
+    """Pass the drawn passing-TD number through for QBs only."""
+    if (player.position or "").upper() != "QB":
+        return None
+    return value
+
+
 def _fallback_scoring_tds(
     player: Player,
     team_pts: float,
@@ -915,6 +953,40 @@ def _fallback_scoring_tds(
     rush = starter_qb_rush_yards(player) * scale
     rushes = (rush / QB_YPC) if QB_YPC else 0.0
     return rushes * QB_RUSH_TD_RATE
+
+
+def _fallback_pass_tds(
+    player: Player,
+    team_pts: float,
+    group: list[Player],
+    index: _HistoryIndex | None,
+    score_damp: Optional[float],
+) -> Optional[float]:
+    """Passing TDs ``starter_qb_points`` uses. None when this path has no TD draw.
+
+    Starter: ``pass_td_anchor * scale``. Backup QB: 0. Non-QB and DEF: None.
+    """
+    if _is_dst(player):
+        return None
+    if (player.position or "").upper() != "QB":
+        return None
+    if is_inactive(player):
+        return 0.0
+    team = (player.team or "").upper()
+    mates = [p for p in group if (p.team or "").upper() == team] or [player]
+    starter = passing_qb(mates)
+    if starter is None or starter.pid != player.pid:
+        return 0.0
+    implied = float(player.implied_total or 0.0)
+    if score_damp is None:
+        scale = (float(team_pts) / implied) if implied > 0 else 1.0
+    else:
+        scale = production_scale(team_pts, implied, score_damp)
+    offense = None
+    if index is not None:
+        offense = index.offense(team)
+    rate = neutral_pass_rate_of(offense)
+    return pass_td_anchor(implied, rate, player.prop_pass_tds) * scale
 
 
 # pid plus every input of the product below. ``id(player)`` is reused after
@@ -2461,21 +2533,87 @@ def _percentile(sorted_xs: list[float], p: float) -> float:
     return sorted_xs[lo] * (1.0 - w) + sorted_xs[hi] * w
 
 
-def anytime_td_summary(counts) -> Tuple[float, float]:
-    """``(anytime_td_prob, td_mean)`` from per-draw expected scoring TDs.
+def td_bin(value: float) -> int:
+    """Nearest integer of a drawn TD expectation, capped at the 3+ bin."""
+    k = int(math.floor(max(0.0, float(value)) + 0.5))
+    if k >= 3:
+        return 3
+    return k
 
-    Each count is rush TDs plus receiving TDs in that world. The sim stores
-    that expectation, not an integer TD sample. ``anytime_td_prob`` is the
-    mean of ``1 - exp(-λ)`` (Poisson chance of at least one score).
-    ``td_mean`` is the mean of ``λ``. Passing TDs are not included.
+
+class TdTally:
+    """Running TD counts. The draw values themselves are not stored.
+
+    ``td_*`` is rush plus receiving only. Each draw's expectation is rounded
+    to the nearest integer and counted in ``td_0`` .. ``td_3plus``.
+    ``td_mean`` is the mean of the unrounded expectations.
+    ``anytime_td_prob`` is ``1 - td_0 / n_draws``.
+
+    A QB also records the passing-TD expectation the scorer used that draw
+    (the team's receiving TDs, or the pass-TD anchor on the fallback path).
+    ``total_*`` is rush + receiving + passing, binned the same way.
+    Non-QBs omit ``pass_td_mean`` and every ``total_td_*`` field.
     """
-    xs = [max(0.0, float(value)) for value in counts]
-    n = len(xs)
-    if n <= 0:
-        raise ValueError("anytime TD summary needs at least one draw")
-    td_mean = sum(xs) / float(n)
-    prob = sum(1.0 - math.exp(-value) for value in xs) / float(n)
-    return prob, td_mean
+
+    def __init__(self) -> None:
+        self.n = 0
+        self.td_sum = 0.0
+        self.bins = [0, 0, 0, 0]
+        self.pass_sum = 0.0
+        self.total_sum = 0.0
+        self.total_bins = [0, 0, 0, 0]
+        self.qb = False
+        self.dropped = False
+
+    def add(self, rush_rec, pass_td=None) -> None:
+        if self.dropped:
+            return
+        if rush_rec is None:
+            self.dropped = True
+            return
+        rr = max(0.0, float(rush_rec))
+        self.n += 1
+        self.td_sum += rr
+        self.bins[td_bin(rr)] += 1
+        if pass_td is None:
+            return
+        self.qb = True
+        passing = max(0.0, float(pass_td))
+        self.pass_sum += passing
+        total = rr + passing
+        self.total_sum += total
+        self.total_bins[td_bin(total)] += 1
+
+    def inputs(self) -> dict:
+        if self.dropped or self.n <= 0:
+            return {}
+        n = self.n
+        out = {
+            "anytime_td_prob": (n - self.bins[0]) / float(n),
+            "td_mean": round(self.td_sum / float(n), 4),
+            "td_0": self.bins[0],
+            "td_1": self.bins[1],
+            "td_2": self.bins[2],
+            "td_3plus": self.bins[3],
+            "n_draws": n,
+        }
+        if not self.qb:
+            return out
+        out["pass_td_mean"] = round(self.pass_sum / float(n), 4)
+        out["total_td_mean"] = round(self.total_sum / float(n), 4)
+        out["total_td_0"] = self.total_bins[0]
+        out["total_td_1"] = self.total_bins[1]
+        out["total_td_2"] = self.total_bins[2]
+        out["total_td_3plus"] = self.total_bins[3]
+        return out
+
+
+def _note_td(tallies: dict, pid: str, rush_rec, pass_td=None) -> None:
+    tally = tallies.get(pid)
+    if tally is None:
+        tally = TdTally()
+        tallies[pid] = tally
+    tally.add(rush_rec, pass_td)
 
 
 def _stats(draws: list[float], *, n: int, source: str) -> SimStats:

@@ -269,6 +269,24 @@ class PlaceholderEfficiency:
             rec = float(opportunities.receiving.rec_td)
         return rushes * RUSH_TD_RATE + rec
 
+    def scoring_pass_tds(self, player: Player, opportunities: OpportunityCount) -> float:
+        """Passing TDs ``points`` uses for a QB. Zero for every other position.
+
+        With ``team_receiving``, this is the sum of those receiving TD
+        expectations (the same number the QB is scored on). Without that
+        list, attempts times the league pass-TD rate.
+        """
+        pos = (player.position or "WR").upper()
+        if pos != "QB":
+            return 0.0
+        att = max(0.0, opportunities.pass_attempts)
+        if opportunities.team_receiving is None:
+            return att * PASS_TD_RATE
+        return max(
+            0.0,
+            float(sum(line.rec_td for line in opportunities.team_receiving)),
+        )
+
 
 def shrink(observed: float, n: float, prior: float, prior_n: float) -> float:
     """Prior-count blend. ``n == 0`` returns ``prior``."""
@@ -1206,6 +1224,29 @@ class DataEfficiency:
         else:
             rec = float(opportunities.receiving.rec_td)
         return float(rush_td) + float(rec)
+
+    def scoring_pass_tds(self, player: Player, opportunities: OpportunityCount) -> float:
+        """Passing TDs ``points`` uses for a QB. Zero for every other position.
+
+        With ``team_receiving``, this is the sum of those receiving TD
+        expectations. Without that list, attempts times the shrunk pass-TD
+        rate times the TD multiplier, which is what ``points`` scores.
+        """
+        pos = (player.position or "WR").upper()
+        if pos != "QB":
+            return 0.0
+        att = max(0.0, opportunities.pass_attempts)
+        if opportunities.team_receiving is None:
+            rates = self.rates_for(player, pos)
+            pass_td = att * rates["pass_td_per_attempt"]
+            td_mult = self.td_multiplier(player.team, player.opponent)
+            if td_mult != 1.0:
+                pass_td *= td_mult
+            return max(0.0, float(pass_td))
+        return max(
+            0.0,
+            float(sum(line.rec_td for line in opportunities.team_receiving)),
+        )
 
     def points(
         self,

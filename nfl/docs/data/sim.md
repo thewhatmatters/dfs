@@ -230,15 +230,26 @@ Fixture: `nfl/testdata/sim_layers.json` (DET offense/defense EPA sums, four week
 ## What publish stores from the draws
 
 `python3 -m nfl.publish_projections --sim N --sim-mode team` writes both
-tables from one run. Player rows still go to `/functions/v1/projections`.
-Game rows go to `nfl_game_projections` (see
-[`projections.md`](projections.md)).
+tables from one run. Player rows go to `/functions/v1/projections` as
+`{"rows": [...]}`. Game rows are a second POST to that same URL as
+`{"game_projections": [...]}` (see [`projections.md`](projections.md)).
 
-Each skill draw also keeps an expected scoring-TD count: rush TDs plus
-receiving TDs. Passing TDs are not included. Publish stores that on the
-sim row's `inputs` as `td_mean` (mean of the counts) and `anytime_td_prob`
-(mean of `1 - exp(-λ)`, because the count is an expectation, not a sampled
-integer). DEF and role-share skill rows omit both.
+Each skill draw keeps an expected scoring-TD count: rush TDs plus
+receiving TDs. The sim does not sample an integer TD. Publish rounds
+that expectation to the nearest integer and counts draws in `td_0`,
+`td_1`, `td_2`, and `td_3plus` (those four sum to `n_draws`).
+`td_mean` is the mean of the unrounded expectations.
+`anytime_td_prob` is `1 - td_0 / n_draws`. A typical skill expectation
+is below 0.5, so most draws land in `td_0`.
+
+QBs also store the passing-TD expectation the scorer used that draw.
+In team / opportunity mode that is the sum of the team's drawn receiving
+TDs (rostered catchers plus the other bucket). On the fallback path it
+is the pass-TD anchor scaled by the drawn score. `pass_td_mean` is the
+average. `total_td_mean` averages rush + receiving + passing, and
+`total_td_0` .. `total_td_3plus` bin that sum the same way. Non-QBs omit
+`pass_td_mean` and every `total_td_*` field. DEF and role-share skill
+rows omit the TD block.
 
 ## Seeds
 

@@ -19,12 +19,12 @@ and prints one line. A sim-input cache marked stale exits non-zero.
 `--dry-run` writes `nfl/data/projections/` (gitignored) and does not POST.
 It does not need `GANGSTASH_PROJECTIONS_WRITER_KEY`.
 
-`--sim-mode team` uses the same run to upsert one row per game into
-`public.nfl_game_projections`. That write is PostgREST with
-`GANGSTASH_SERVICE_ROLE_KEY`. It is not sent to `/functions/v1/projections`
-(that function only writes `nfl_player_projections`). `--sim-mode off`
-still posts player rows and skips the game table. A dry run writes
-`<stem>-game-projections.json` next to the player file.
+`--sim-mode team` uses the same run to POST one row per game. That is a
+second request to `/functions/v1/projections` with the writer key and
+body `{"game_projections": [...]}`, after the player `rows` request, with
+the same `run_at`. `--sim-mode off` still posts player rows and skips
+the game request. A dry run writes `<stem>-game-projections.json` next
+to the player file.
 
 `--report` writes `nfl/reports/<season>-w<week>-<YYYY-MM-DD>.md` after a
 successful POST or `--dry-run` and prints that path. The same run writes
@@ -41,8 +41,7 @@ sidecar `run_at` matches, and gangstash implied totals otherwise.
 | env | role |
 |-----|------|
 | `GANGSTASH_API_KEY` | reads: game lines, depth, targets, snaps, props |
-| `GANGSTASH_PROJECTIONS_WRITER_KEY` | write only (`nfl_player_projections`) |
-| `GANGSTASH_SERVICE_ROLE_KEY` | write only (`nfl_game_projections` PostgREST). Not the read key. Never sent to `/functions/v1` |
+| `GANGSTASH_PROJECTIONS_WRITER_KEY` | write only. Player `rows` and team-mode `game_projections`, both on `/functions/v1/projections` |
 
 Write request:
 
@@ -50,6 +49,12 @@ Write request:
 POST https://vmzgpslqoeuqmdchdekm.supabase.co/functions/v1/projections
 x-api-key: $GANGSTASH_PROJECTIONS_WRITER_KEY
 {"rows": [ ... ]}
+```
+
+Team mode sends game rows in a second POST to that URL:
+
+```
+{"game_projections": [ ... ]}
 ```
 
 The key is the header only. A query-string key is not sent (the API returns
@@ -100,51 +105,78 @@ Board rows: `mean` = `week1_score`, `p10` / `p50` / `p90` null.
 Sim rows: `mean` / `p10` / `p50` / `p90` from the layered Monte Carlo.
 `mean` matches `apply_ilp_objective(..., projection_source="sim")`.
 
-Sim rows store two extra `inputs` fields when the draw has a scoring-TD
+Sim rows store extra `inputs` fields when the draw has a scoring-TD
 count. There is no `nfl_player_projections` column for them in this repo,
-and this job cannot migrate gangstash, so they stay on `inputs`:
+and this job cannot migrate gangstash, so they stay on `inputs`.
+
+The sim's per-draw TD component is an expectation (targets × rate, or a
+scaled anchor), not a sampled integer. Each draw is rounded to the
+nearest integer (half away from zero, cap 3) and counted. A typical
+skill expectation is below 0.5, so most draws land in `td_0` and
+`anytime_td_prob` is the share of draws whose expectation rounds to at
+least 1.
 
 | field | meaning |
 |-------|---------|
-| `anytime_td_prob` | Mean over draws of `1 - exp(-λ)`. `λ` is that draw's expected rush TDs plus receiving TDs. The sim does not sample an integer TD, so this is the Poisson chance of at least one score, averaged across worlds. |
-| `td_mean` | Mean of those same `λ` values. |
+| `anytime_td_prob` | `1 - td_0 / n_draws`. |
+| `td_mean` | Mean of the unrounded rush + receiving expectations. |
+| `td_0`, `td_1`, `td_2`, `td_3plus` | Draw counts after that rounding. They sum to `n_draws`. |
+| `n_draws` | Number of draws in the tally. |
 
-Passing TDs stay on the passer and are not an anytime score. DEF return
-TDs are not drawn, so a `D` row omits both fields. A skill player who
-only has a role-share point total (no opportunity draw) also omits them.
-Board rows omit them. Anytime TD props on the odds board stay unmapped;
-these two fields are sim-derived.
+QBs also store the passing TDs the scorer actually used. In opportunity
+mode that is the sum of the team's receiving TD expectations that draw.
+On the fallback path it is the pass-TD anchor times the score scale.
+Non-QBs omit these. `td_*` stays rush + receiving either way.
+
+| field | meaning |
+|-------|---------|
+| `pass_td_mean` | Mean of the unrounded passing-TD expectations. |
+| `total_td_mean` | Mean of rush + receiving + passing. |
+| `total_td_0`, `total_td_1`, `total_td_2`, `total_td_3plus` | Draw counts of that total, rounded the same way. They sum to `n_draws`. |
+
+DEF return TDs are not drawn, so a `D` row omits the block. A skill
+player who only has a role-share point total (no opportunity draw) also
+omits it. Board rows omit it. Anytime TD props on the odds board stay
+unmapped; these fields are sim-derived.
 
 ## Game rows (`nfl_game_projections`)
 
 Only `--sim-mode team`. One row per game in that sim, same `run_at` and
-`model_version` as the player rows. `model` is `sim`.
+`model_version` as the player rows. `model` is `sim`. The request goes
+out after the player rows, to the same URL, with the writer key:
 
 ```
-POST https://vmzgpslqoeuqmdchdekm.supabase.co/rest/v1/nfl_game_projections?on_conflict=season,week,season_type,run_at,model,game_id
-apikey: $GANGSTASH_SERVICE_ROLE_KEY
-Authorization: Bearer $GANGSTASH_SERVICE_ROLE_KEY
-Prefer: resolution=merge-duplicates,return=representation
+POST https://vmzgpslqoeuqmdchdekm.supabase.co/functions/v1/projections
+x-api-key: $GANGSTASH_PROJECTIONS_WRITER_KEY
+{"game_projections": [ ... ]}
 ```
 
-The body is a JSON array, not `{"rows": ...}`. `id` and `created_at` are
-left to the database defaults. `game_id` has to be an `nfl_games.id` uuid
-(week 4 ATL@NO is `89c7243e-cb87-4fa4-b2c7-068be7c16a68`). A non-uuid
-`game_lines.game_id` is skipped. The uuid is read from `game_id` when that
-value is a uuid, otherwise `nfl_game_id` / `game_uuid` / `id`.
+The response adds `game_inserted`, `game_updated`, and `game_upserted`.
+A 400 lists per-row errors with `source: "game_projections"`. That error
+is printed and the command exits non-zero. The player rows from the
+first request stay posted.
+
+`id` and `created_at` are left to the database defaults. `game_id` has
+to be an `nfl_games.id` uuid (week 4 ATL@NO is
+`89c7243e-cb87-4fa4-b2c7-068be7c16a68`). A non-uuid `game_lines.game_id`
+is skipped. The uuid is read from `game_id` when that value is a uuid,
+otherwise `nfl_game_id` / `game_uuid` / `id`.
+
+`season_type` is `REG` or `POST`. `home_wins + away_wins + ties` equals
+`n_draws`. `home_win_prob` and `away_win_prob` are in `[0, 1]`. Percentile
+bands are ordered `p10 <= p50 <= p90`. Team codes on the wire are
+`JAX`, `LA`, and `WAS` (`JAC`, `LAR`, and `WSH` are translated). Other
+codes are unchanged.
 
 `consensus_home_line` and `consensus_total` are copied from
 `nfl_game_lines` where `book=consensus` (home line negative when home is
 favored). A feed with no `book` column is already that board. Another
-book on the same game is ignored. Means and p10/p50/p90 use the raw
-simulated points. Wins, covers, and the total use each draw rounded to
-the nearest integer, so an integer line can push. Home covers when
-`(home - away) + consensus_home_line > 0`. Over is the rounded sum above
-`consensus_total`.
-
-A missing service-role key still posts the player rows and prints that
-the game table was not written. A rejected upsert exits non-zero after
-the player post.
+book on the same game is ignored. Those fields, and the cover / over
+probabilities, are omitted when the line is missing. Means and
+p10/p50/p90 use the raw simulated points. Wins, covers, and the total
+use each draw rounded to the nearest integer, so an integer line can
+push. Home covers when `(home - away) + consensus_home_line > 0`. Over
+is the rounded sum above `consensus_total`.
 
 ## Loud failures
 
@@ -156,7 +188,7 @@ Exit status is non-zero and stderr starts with `publish projections:`.
 - `GANGSTASH_API_KEY` missing: exit 1 immediately. The message names the key, the five read datasets (game lines, depth, targets, snaps, props), and that nothing is posted. There is no second read source, and `--refresh` does not use a cache in that case
 - read key present but the HTTP call fails, or a stale cache for lines, depth, targets, snaps, or props
 - sim inputs come back with a stale cache when `--sim` is set
-- `--sim-mode team` game upsert is rejected (`nfl_game_projections`). A missing `GANGSTASH_SERVICE_ROLE_KEY` does not fail the player post
+- `--sim-mode team` game request is rejected (`source: game_projections`). Player rows from the first request stay posted
 
 ## Read back
 
