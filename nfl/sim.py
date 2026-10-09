@@ -74,7 +74,7 @@ import sys
 from dataclasses import dataclass, field, replace
 from typing import Optional, Tuple
 
-from nfl.injuries import is_inactive
+from nfl.injuries import Availability, injury_code, is_inactive, is_ruled_out
 from nfl.names import match_key
 from nfl.players import Player
 from nfl.projections import (
@@ -348,6 +348,8 @@ def simulate_games(
     efficiency: EfficiencyModel | None = None,
     sim_mode: str = "off",
     score_damp: float | None = None,
+    availability_rule: str | None = None,
+    zero_doubtful: bool = True,
 ) -> GameSim:
     """n slate worlds. Players in a game share total+margin; games do not.
 
@@ -358,6 +360,12 @@ def simulate_games(
     ``sim_mode="off"`` (default) is that path. ``team`` draws a joint
     total and spread and scales production by the drawn team score.
     ``score_damp`` overrides the fitted damp; the fit CLI uses it.
+
+    ``availability_rule=None`` is the historical draw (same seed, same
+    players). ``legacy`` drops Out/IR/NA/SUSP and blanks Doubtful before
+    that draw. ``ruled-out`` keeps those players in the opportunity
+    prep so the next active player at the position inherits the share,
+    and does not score them.
     """
     mode = parse_sim_mode(sim_mode)
     damp = None
@@ -380,6 +388,24 @@ def simulate_games(
                 damp = float(chosen)
     if n <= 0:
         return GameSim(by_pid={}, draws={})
+    spec: Availability | None = None
+    active_rule = availability_rule
+    if availability_rule is not None:
+        spec = Availability(rule=availability_rule, zero_doubtful=zero_doubtful)
+        if spec.rule == "legacy":
+            from nfl.sim_feed import sim_pool
+
+            players = sim_pool(list(players), availability=spec)
+            spec = None
+            active_rule = None
+        elif not spec.zero_doubtful:
+            blanked: list[Player] = []
+            for pl in players:
+                if injury_code(pl.injury) == "D":
+                    blanked.append(replace(pl, injury=""))
+                else:
+                    blanked.append(pl)
+            players = blanked
     bundle = inputs or SimInputs()
     index = _HistoryIndex(bundle)
     eff = efficiency or PlaceholderEfficiency()
@@ -393,7 +419,9 @@ def simulate_games(
     for key, group in groups.items():
         for team in _teams_in(group):
             roster = [p for p in group if (p.team or "").upper() == team]
-            preps[(key, team)] = _prepare_opportunity(roster, index)
+            preps[(key, team)] = _prepare_opportunity(
+                roster, index, availability=spec
+            )
     opportunity = frozenset(
         team for (_key, team), prep in preps.items() if prep.catchers
     )
@@ -444,6 +472,9 @@ def simulate_games(
                 )
             if away is None or home is None:
                 for pl in group:
+                    if spec is not None and is_ruled_out(pl, spec):
+                        raw[pl.pid].append(0.0)
+                        continue
                     team_pts, opp_pts = _solo_world(rng, pl)
                     raw[pl.pid].append(
                         _score_fallback(
@@ -489,6 +520,9 @@ def simulate_games(
                     )
                 )
             for pl in group:
+                if spec is not None and is_ruled_out(pl, spec):
+                    raw[pl.pid].append(0.0)
+                    continue
                 opp_count = counts.get(pl.pid)
                 if opp_count is None:
                     team_pts, opp_pts = _player_world(
@@ -532,6 +566,8 @@ def simulate_games(
             inputs=inputs,
             efficiency=efficiency,
             sim_mode="off",
+            availability_rule=active_rule,
+            zero_doubtful=zero_doubtful,
         )
         dst_pids = {pl.pid for pl in players if _is_dst(pl)}
         for pid, xs in raw.items():
@@ -2030,7 +2066,49 @@ class _OppPrep:
         self.plays_mu = LEAGUE_PLAYS
 
 
-def _prepare_opportunity(team_players: list[Player], index: _HistoryIndex) -> _OppPrep:
+def _depth_key(player: Player) -> tuple:
+    rank = player.depth_rank if player.depth_rank is not None else 10**9
+    return (rank, -(player.salary or 0), player.pid)
+
+
+def _give_inactive_targets_to_next(
+    catchers: list[Player],
+    means: list[float],
+    inactive: list[Player],
+    inactive_means: list[float],
+) -> tuple[list[float], list[float]]:
+    """Move each inactive target share onto the next active catcher at that position.
+
+    Next is the best remaining depth at the position (lowest rank, then
+    salary, then pid). No active catcher at that position: the share
+    stays inactive so the caller can leave it in the unrostered bucket.
+    The sum of means is unchanged.
+    """
+    moved = list(means)
+    by_pos: dict[str, list[int]] = {}
+    for index, pl in enumerate(catchers):
+        by_pos.setdefault((pl.position or "").upper(), []).append(index)
+    next_index: dict[str, int] = {}
+    for pos, idxs in by_pos.items():
+        next_index[pos] = min(idxs, key=lambda i: _depth_key(catchers[i]))
+    leftover: list[float] = []
+    for pl, share in zip(inactive, inactive_means):
+        portion = float(share)
+        if portion <= 0.0:
+            continue
+        idx = next_index.get((pl.position or "").upper())
+        if idx is None:
+            leftover.append(portion)
+            continue
+        moved[idx] += portion
+    return moved, leftover
+
+
+def _prepare_opportunity(
+    team_players: list[Player],
+    index: _HistoryIndex,
+    availability: Availability | None = None,
+) -> _OppPrep:
     """Catchers, shares, and team rates. No RNG."""
     prep = _OppPrep()
     prep.players = team_players
@@ -2069,6 +2147,14 @@ def _prepare_opportunity(team_players: list[Player], index: _HistoryIndex) -> _O
         mean_target_share(index.target_weeks(pl), index.snap_weeks(pl))
         for pl in inactive
     ]
+    if (
+        availability is not None
+        and availability.rule == "ruled-out"
+        and inactive
+    ):
+        means, inactive_means = _give_inactive_targets_to_next(
+            list(catchers), means, inactive, inactive_means
+        )
     series = [
         _weekly_shares(index.target_weeks(pl), index.snap_weeks(pl))
         for pl in catchers

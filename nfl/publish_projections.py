@@ -16,6 +16,12 @@ Read key: GANGSTASH_API_KEY (existing /data and /props clients).
 builds for `--projection-source sim`. `mean` is that simulated mean.
 `--sim-efficiency` matches the optimizer (default `data`).
 `--sim-mode team` is opt-in. The default `off` keeps the current draws.
+`--availability-rule ruled-out` (default) projects 0 for Out, IR, NA, and
+Doubtful and gives that opportunity to the next active player at the
+position. `--availability-rule legacy` is the previous pool.
+`--no-zero-doubtful` keeps Doubtful projected. Practice (DNP, Limited,
+Full) and Questionable stay at full value. See
+`nfl/docs/data/projections.md`.
 The run log prints the effective mode after any fallback, and each sim
 row stores that mode on `inputs.sim_efficiency`. A sim row also stores
 rush+rec TD bins (`td_0`..`td_3plus`, `n_draws`, `td_mean`,
@@ -71,7 +77,7 @@ from nfl.gangstash_data import (
     fetch_targets,
 )
 from nfl.http import HttpError, http_json_post
-from nfl.injuries import apply_projection_injuries, is_pool_out
+from nfl.injuries import Availability, apply_projection_injuries, is_ruled_out
 from nfl.lines import TeamLine, implied_totals
 from nfl.names import match_key
 from nfl.ourlads import skill_pos
@@ -325,6 +331,26 @@ def missing_read_key_message(detail: str) -> str:
     )
 
 
+def _availability_from_args(args: argparse.Namespace) -> Availability:
+    return Availability(
+        rule=getattr(args, "availability_rule", "ruled-out"),
+        zero_doubtful=bool(getattr(args, "zero_doubtful", True)),
+    )
+
+
+def _accepts_keyword(fn: object, name: str) -> bool:
+    """True when ``fn`` can take ``name`` without a TypeError."""
+    import inspect
+
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if name in params:
+        return True
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def maybe_sim(
     entries: list[PublishEntry],
     n: int,
@@ -335,6 +361,7 @@ def maybe_sim(
     week: int | None = None,
     sim_efficiency: str = "data",
     sim_mode: str = "off",
+    availability: Availability | None = None,
 ) -> SimResult:
     """``(pid → SimStats, effective efficiency mode)``, plus game draws.
 
@@ -360,7 +387,7 @@ def maybe_sim(
         )
         return SimResult(None, requested)
     try:
-        from nfl.sim_feed import resolve_sim_inputs, sim_pool
+        from nfl.sim_feed import resolve_sim_inputs
         from nfl.sim_inputs import SimInputError
     except ImportError:
         print(
@@ -405,8 +432,17 @@ def maybe_sim(
         )
         if mode == "team":
             call["sim_mode"] = "team"
+        spec = availability if availability is not None else Availability()
+        roster = [e.player for e in entries]
+        if spec.rule == "legacy":
+            from nfl.sim_feed import sim_pool
+
+            roster = sim_pool(roster, availability=spec)
+        elif _accepts_keyword(fn, "availability_rule"):
+            call["availability_rule"] = spec.rule
+            call["zero_doubtful"] = spec.zero_doubtful
         result = fn(
-            sim_pool([e.player for e in entries]),
+            roster,
             **call,
         )
     except Exception as e:
@@ -868,6 +904,7 @@ def _apply_entry_injuries(
     season: int,
     week: int,
     csv_players: list[Player] | None,
+    availability: Availability | None = None,
 ) -> list[PublishEntry]:
     players = apply_projection_injuries(
         [entry.player for entry in entries],
@@ -875,6 +912,7 @@ def _apply_entry_injuries(
         season=season,
         week=week,
         csv_players=csv_players,
+        availability=availability,
     )
     by_pid = {pl.pid: pl for pl in players}
     return [
@@ -902,6 +940,7 @@ def build_entries(
     injury_rows: list[dict] | None = None,
     injury_season: int | None = None,
     injury_week: int | None = None,
+    availability: Availability | None = None,
 ) -> list[PublishEntry]:
     """Score the slate with the existing week1_score path. No ILP."""
     slate = _team_lines(line_rows)
@@ -931,6 +970,7 @@ def build_entries(
             season=season,
             week=week,
             csv_players=csv_players,
+            availability=availability,
         )
     return entries
 
@@ -1068,7 +1108,9 @@ def projection_rows(
     sim_by_pid: dict | None = None,
     sim_efficiency: str = "data",
     td_by_pid: dict | None = None,
+    availability: Availability | None = None,
 ) -> list[dict]:
+    spec = availability if availability is not None else Availability()
     rows: list[dict] = []
     for entry in entries:
         pl = entry.player
@@ -1092,10 +1134,10 @@ def projection_rows(
     td_map = td_by_pid or {}
     missing = 0
     for entry in entries:
+        if is_ruled_out(entry.player, spec):
+            continue
         stats = sim_by_pid.get(entry.player.pid)
         if stats is None:
-            if is_pool_out(entry.player):
-                continue
             missing += 1
             continue
         pos = (entry.player.position or "").upper()
@@ -1339,6 +1381,7 @@ def load_slate(args: argparse.Namespace, today: date) -> tuple[int, int, list[Pu
     )
     _stale(injury_meta, "injuries")
     csv_players = load_fanduel_csv(args.csv) if args.csv else None
+    spec = _availability_from_args(args)
     entries = build_entries(
         line_rows,
         depth_rows,
@@ -1349,6 +1392,7 @@ def load_slate(args: argparse.Namespace, today: date) -> tuple[int, int, list[Pu
         injury_rows=injury_rows,
         injury_season=season,
         injury_week=week,
+        availability=spec,
     )
     try:
         by_pid, prop_meta = ingest_slate_props(
@@ -1382,8 +1426,9 @@ def load_slate(args: argparse.Namespace, today: date) -> tuple[int, int, list[Pu
         season=season,
         week=week,
         csv_players=csv_players,
+        availability=spec,
     )
-    n_out = sum(1 for entry in entries if is_pool_out(entry.player))
+    n_out = sum(1 for entry in entries if is_ruled_out(entry.player, spec))
     print(
         f"injuries out {n_out}  rows {len(injury_rows)}",
         file=sys.stderr,
@@ -1437,6 +1482,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="After a successful POST or --dry-run, write the Monte Carlo "
         "report under nfl/reports/ and print its path",
+    )
+    ap.add_argument(
+        "--availability-rule",
+        choices=("ruled-out", "legacy"),
+        default="ruled-out",
+        help="ruled-out (default) projects 0 for Out, IR, NA, and Doubtful "
+        "and hands their opportunity to the next active player at that "
+        "position. legacy reproduces the previous pool for the same seed: "
+        "Doubtful stays projected, and Out/IR/NA are dropped before the draw.",
+    )
+    ap.add_argument(
+        "--zero-doubtful",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="With --availability-rule ruled-out, Doubtful projects 0 "
+        "(default). --no-zero-doubtful keeps Doubtful projected. "
+        "Ignored when the rule is legacy.",
     )
     ap.add_argument(
         "--slate-csv",
@@ -1529,6 +1591,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         args.sim_mode = parse_sim_mode(args.sim_mode)
+        spec = _availability_from_args(args)
     except ValueError as exc:
         print("publish projections: %s" % exc, file=sys.stderr)
         return 1
@@ -1551,6 +1614,7 @@ def main(argv: list[str] | None = None) -> int:
             week=week,
             sim_efficiency=args.sim_efficiency,
             sim_mode=args.sim_mode,
+            availability=spec,
         )
         sim_by_pid, used_efficiency, game_draws = sim_parts(sim)
         td_tallies = sim.td_tallies if isinstance(sim, SimResult) else {}
@@ -1582,6 +1646,7 @@ def main(argv: list[str] | None = None) -> int:
         sim_by_pid=sim_by_pid,
         sim_efficiency=used_efficiency,
         td_by_pid=td_tallies,
+        availability=spec,
     )
     game_rows = _game_projection_rows(
         args,

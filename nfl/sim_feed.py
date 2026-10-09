@@ -24,7 +24,7 @@ from nfl.gangstash_data import (
     parse_snap_row,
     parse_target_row,
 )
-from nfl.injuries import POOL_OUT_CODES, injury_code
+from nfl.injuries import POOL_OUT_CODES, Availability, injury_code, is_ruled_out
 from nfl.players import Player
 from nfl.sim_inputs import (
     SimInputs,
@@ -61,14 +61,36 @@ def load_week_injuries(
     return fetch_week_injuries(season=season, week=week, refresh=refresh)
 
 
-def sim_pool(players: list[Player]) -> list[Player]:
+def sim_pool(
+    players: list[Player],
+    availability: Availability | None = None,
+) -> list[Player]:
     """Players the nightly sim scores.
 
-    Out, IR, NA, and suspended players are omitted. Doubtful stays at
-    full value: the sim treats ``D`` as inactive, so the copy passed to
-    ``simulate_games`` has a blank injury. The published row still
-    carries ``D``. Questionable is unchanged.
+    The default rule omits anyone ``is_ruled_out`` (Out, IR, NA,
+    suspended, and Doubtful). ``legacy`` is the previous pool: those
+    Out/IR/NA/SUSP rows are omitted, and Doubtful stays at full value.
+    The sim treats ``D`` as inactive, so a Doubtful player who is still
+    projected is copied with a blank injury. Questionable and
+    practice-only designations are unchanged.
     """
+    spec = availability if availability is not None else Availability()
+    if spec.rule == "legacy":
+        return _legacy_sim_pool(players)
+    kept: list[Player] = []
+    for pl in players:
+        if is_ruled_out(pl, spec):
+            continue
+        # Doubtful flag off. Blank D so is_inactive does not zero them.
+        if injury_code(pl.injury) == "D":
+            kept.append(replace(pl, injury=""))
+            continue
+        kept.append(pl)
+    return kept
+
+
+def _legacy_sim_pool(players: list[Player]) -> list[Player]:
+    """Pre-2026-10-09 scoring pool. Bit-identical to the old ``sim_pool``."""
     kept: list[Player] = []
     for pl in players:
         code = injury_code(pl.injury)

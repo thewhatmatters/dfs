@@ -17,6 +17,7 @@ from nfl.http import HttpError, http_json
 from nfl.names import match_key
 from nfl.players import Player
 from nfl.projections import score_player
+from nfl.rules import FANDUEL_NFL
 from nfl.teams import UnmappedTeam, lookup_odds, require_fd
 
 ESPN_INJURIES = "https://site.web.api.espn.com/apis/site/v2/sports/football/nfl/injuries"
@@ -28,9 +29,29 @@ DROP_STATUSES = frozenset(
 # states. Q is questionable and stays the starter. NA matches the optimizer
 # pool filter (inactive, not a body part).
 INACTIVE_CODES = frozenset({"O", "D", "IR", "NA", "SUSP"})
-# Nightly projections. Out and IR leave the sim pool. Doubtful stays
-# at full value and is only flagged. Questionable is unchanged.
+# Historical nightly pool. Out and IR leave. Doubtful stays at full
+# value on ``--availability-rule legacy`` and is only flagged.
+# Questionable is unchanged. The default rule is ``Availability``.
 POOL_OUT_CODES = frozenset({"O", "IR", "NA", "SUSP"})
+# Practice participation is not a game status. These never zero a projection.
+PRACTICE_ONLY = frozenset(
+    {
+        "DNP",
+        "LP",
+        "FP",
+        "LIMITED",
+        "FULL",
+        "DID NOT PARTICIPATE",
+        "DID NOT PARTICIPATE IN PRACTICE",
+        "LIMITED PARTICIPATION",
+        "LIMITED PARTICIPATION IN PRACTICE",
+        "FULL PARTICIPATION",
+        "FULL PARTICIPATION IN PRACTICE",
+    }
+)
+AVAILABILITY_RULED_OUT = "ruled-out"
+AVAILABILITY_LEGACY = "legacy"
+AVAILABILITY_RULES = (AVAILABILITY_RULED_OUT, AVAILABILITY_LEGACY)
 _CODE_WORDS = {
     "o": "O",
     "out": "O",
@@ -44,7 +65,49 @@ _CODE_WORDS = {
     "susp": "SUSP",
     "suspension": "SUSP",
     "suspended": "SUSP",
+    "dnp": "DNP",
+    "did not participate": "DNP",
+    "did not participate in practice": "DNP",
+    "limited": "LIMITED",
+    "limited participation": "LIMITED",
+    "limited participation in practice": "LIMITED",
+    "full": "FULL",
+    "full participation": "FULL",
+    "full participation in practice": "FULL",
 }
+
+
+@dataclass(frozen=True)
+class Availability:
+    """Who projects 0 in the nightly sim and the published board.
+
+    ``ruled-out`` (default) zeros Out, IR, the house ``out_codes``
+    (IR/NA), and Doubtful, and the sim hands that player's opportunity
+    to the next active player at the position. ``legacy`` is the
+    pre-2026-10-09 pool: Doubtful stays at full value, and Out/IR/NA
+    are dropped before the draw instead of folded onto the next man.
+    ``zero_doubtful`` is ignored when the rule is ``legacy``.
+    Practice-only codes and Questionable are never ruled out.
+    """
+
+    rule: str = AVAILABILITY_RULED_OUT
+    zero_doubtful: bool = True
+
+    def __post_init__(self) -> None:
+        rule = (self.rule or "").strip().lower()
+        if rule not in AVAILABILITY_RULES:
+            raise ValueError(
+                "availability rule must be one of "
+                + ", ".join(AVAILABILITY_RULES)
+            )
+        object.__setattr__(self, "rule", rule)
+
+    def out_codes(self) -> frozenset[str]:
+        codes = set(POOL_OUT_CODES)
+        codes.update(str(code).strip().upper() for code in FANDUEL_NFL.out_codes)
+        if self.rule == AVAILABILITY_RULED_OUT and self.zero_doubtful:
+            codes.add("D")
+        return frozenset(codes)
 
 
 class InjuryError(Exception):
@@ -217,8 +280,24 @@ def is_inactive(player: Player) -> bool:
 
 
 def is_pool_out(player: Player) -> bool:
-    """Out, IR, NA, or suspended. Doubtful and Questionable stay."""
+    """Out, IR, NA, or suspended. Doubtful and Questionable stay.
+
+    This is the legacy nightly check. ``is_ruled_out`` is the default rule.
+    """
     return injury_code(player.injury) in POOL_OUT_CODES
+
+
+def is_ruled_out(player: Player, availability: Availability | None = None) -> bool:
+    """True when this player projects 0 under ``availability``.
+
+    Practice-only designations and Questionable never do. The default
+    rule also zeros Doubtful. ``legacy`` does not.
+    """
+    code = injury_code(player.injury)
+    if not code or code == "Q" or code in PRACTICE_ONLY:
+        return False
+    spec = availability if availability is not None else Availability()
+    return code in spec.out_codes()
 
 
 def stamp_injuries(players: list[Player], rows: list[InjuryRow]) -> list[Player]:
@@ -310,17 +389,25 @@ def _higher_share(own: float | None, other: float | None) -> float | None:
     return own if own >= other else other
 
 
-def promote_out_chart(players: list[Player]) -> list[Player]:
-    """Fill an Out/IR/NA/SUSP depth slot with the next player at that position.
+def promote_out_chart(
+    players: list[Player],
+    availability: Availability | None = None,
+) -> list[Player]:
+    """Fill a ruled-out depth slot with the next player at that position.
 
     Ranks are rewritten only inside a team and position that lost a
     charted player. A group with no removal keeps its ranks, including
-    gaps. The player who steps into an Out player's slot keeps
+    gaps. The player who steps into a ruled-out slot keeps
     ``max(own share, that slot's share)`` for targets and snaps. A
-    healthy player's share stays on that player. Doubtful and
-    Questionable keep their rank, share, and objective. An out player's
-    objective is 0.
+    healthy player's share stays on that player. Questionable and
+    practice-only players keep their rank, share, and objective. A
+    ruled-out player's objective is 0. The default rule includes
+    Doubtful. ``legacy`` leaves Doubtful on the chart.
     """
+    spec = availability if availability is not None else Availability()
+
+    def ruled_out(pl: Player) -> bool:
+        return is_ruled_out(pl, spec)
     groups: dict[tuple[str, str], list[Player]] = {}
     for pl in players:
         pos = (pl.position or "").upper()
@@ -337,13 +424,13 @@ def promote_out_chart(players: list[Player]) -> list[Player]:
                 pl.pid,
             )
         )
-        removed = [pl for pl in charted if is_pool_out(pl)]
+        removed = [pl for pl in charted if ruled_out(pl)]
         if not removed:
             for pl in group:
-                if is_pool_out(pl):
+                if ruled_out(pl):
                     updates[pl.pid] = _zero_out(pl)
             continue
-        healthy = [pl for pl in charted if not is_pool_out(pl)]
+        healthy = [pl for pl in charted if not ruled_out(pl)]
         for index, pl in enumerate(healthy):
             role = charted[index]
             rank = index + 1
@@ -353,7 +440,7 @@ def promote_out_chart(players: list[Player]) -> list[Player]:
             snap_source = pl.snaps_source
             # Only the vacated Out slot moves. The next player never
             # inherits a healthy teammate's larger share.
-            if role.pid != pl.pid and is_pool_out(role):
+            if role.pid != pl.pid and ruled_out(role):
                 if pl.target_share is None and role.target_share is not None:
                     tgt_source = "inherited"
                 if pl.snap_share is None and role.snap_share is not None:
@@ -378,7 +465,7 @@ def promote_out_chart(players: list[Player]) -> list[Player]:
             )
             updates[pl.pid] = replace(patched, objective=score_player(patched))
         for pl in group:
-            if is_pool_out(pl):
+            if ruled_out(pl):
                 updates[pl.pid] = _zero_out(pl)
     return [updates.get(pl.pid, pl) for pl in players]
 
@@ -443,18 +530,20 @@ def apply_projection_injuries(
     season: int,
     week: int,
     csv_players: list[Player] | None = None,
+    availability: Availability | None = None,
 ) -> list[Player]:
     """Stamp the week, honor a CSV O/IR, then promote the vacated role.
 
     ``rows`` are raw gangstash injury records. ``None`` skips that feed.
-    An empty list means the week had no injury rows.
+    An empty list means the week had no injury rows. ``availability``
+    chooses who is ruled out. The default includes Doubtful.
     """
     stamped = players
     if rows is not None:
         parsed = injury_rows_from_records(rows, season=season, week=week)
         stamped = stamp_injuries(players, parsed)
     overlaid = _overlay_csv_injury(stamped, csv_players)
-    return promote_out_chart(overlaid)
+    return promote_out_chart(overlaid, availability)
 
 
 def drop_keys(rows: list[InjuryRow]) -> set[tuple[str, str]]:

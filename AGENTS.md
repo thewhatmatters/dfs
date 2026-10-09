@@ -33,6 +33,9 @@ python3 -m nfl.depth --csv "nfl/data/<players-list>.csv"             # OurLads N
 # NFL player props: GANGSTASH_API_KEY (see nfl/docs/data/player-props.md).
 # NFL optimize defaults to gangstash lines, targets, snaps, and depth (GANGSTASH_API_KEY).
 # Nightly projections: python3 -m nfl.publish_projections --refresh --sim 10000
+# Availability (default ruled-out): Out/IR/NA and Doubtful project 0; next man inherits.
+#   --no-zero-doubtful keeps Doubtful. --availability-rule legacy is the previous pool.
+#   DNP/Limited/Full and Questionable stay projected. See nfl/docs/data/projections.md.
 # Team mode also POSTs game_projections (same writer key, second request):
 # python3 -m nfl.publish_projections --refresh --sim 10000 --sim-mode team
 #   Write key GANGSTASH_PROJECTIONS_WRITER_KEY. See nfl/docs/data/projections.md.
