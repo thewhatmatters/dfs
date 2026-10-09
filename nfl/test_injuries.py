@@ -10,7 +10,6 @@ from nfl.injuries import injury_code, injury_rows_from_records, stamp_injuries
 from nfl.players import Player
 from nfl.projections import depth_prior, usage_factor, week1_score
 from nfl.publish_projections import build_entries, projection_rows
-from nfl.sim import simulate_games
 from nfl.sim_feed import sim_pool
 from nfl.snaps import SnapWeekRow
 from nfl.targets import TargetWeekRow
@@ -296,7 +295,7 @@ class ProjectionInjuryTest(unittest.TestCase):
         kept = next(pl for pl in pool if pl.pid == q.pid)
         self.assertEqual(kept.injury, "Q")
 
-    def test_doubtful_stays_and_is_flagged(self) -> None:
+    def test_doubtful_is_zero_and_the_next_man_inherits(self) -> None:
         before = _by_pid(self._baseline())
         rows = [
             {
@@ -317,17 +316,14 @@ class ProjectionInjuryTest(unittest.TestCase):
         )
         after = _by_pid(entries)
         flagged = after["00-0036322"]
-        base = before["00-0036322"]
+        backup = after["00-0037001"]
         self.assertEqual(flagged.injury, "D")
-        self.assertEqual(flagged.depth_rank, base.depth_rank)
-        self.assertEqual(flagged.target_share, base.target_share)
-        self.assertEqual(flagged.objective, base.objective)
-        self.assertEqual(after["00-0037001"].depth_rank, 2)
-        pool = sim_pool([entry.player for entry in entries])
-        kept = next(pl for pl in pool if pl.pid == flagged.pid)
-        self.assertEqual(kept.injury, "")
-        sim = simulate_games(pool, n=40, seed=1)
-        self.assertGreater(sim.by_pid[flagged.pid].mean, 1.0)
+        self.assertEqual(flagged.objective, 0.0)
+        self.assertIsNone(flagged.depth_rank)
+        self.assertEqual(backup.depth_rank, 1)
+        self.assertEqual(backup.target_share, before["00-0036322"].target_share)
+        self.assertGreater(backup.objective, before["00-0037001"].objective)
+        self.assertNotIn(flagged.pid, {pl.pid for pl in sim_pool(list(after.values()))})
 
     def test_csv_o_indicator_is_honored(self) -> None:
         before = _by_pid(self._baseline())

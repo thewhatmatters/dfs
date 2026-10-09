@@ -91,6 +91,36 @@ Targets and snaps use every completed week the API returns for the season
 (no hardcoded week list). An empty targets or snaps board is usage factor
 1.0, not a failed job. Props are the usual ±20% tilt.
 
+## Availability
+
+Randy, 2026-10-09: a player who only missed practice can still play.
+Practice designations (DNP, Limited, Full) and Questionable keep their
+normal projection. Nothing in this pipeline was zeroing those rows; the
+injury feed's `practice_status` is not a game status.
+
+Out, IR, and the house out codes (`IR` / `NA` on `FANDUEL_NFL.out_codes`)
+project 0. Doubtful does too, unless `--no-zero-doubtful`. The vacated
+chart slot goes to the next player at that position (same handoff as
+before: they keep the higher of their own target/snap share and the
+vacated share). In the sim, that player's target share is added to the
+next active catcher at the same position, rush and snap weight stays
+inside the remaining running backs, and the next active QB inherits the
+starter role (`passing_qb`, the Mayfield → Jalon Daniels path). Team
+target and rush totals are unchanged; receiving yards still scale to the
+pass anchor.
+
+```
+python3 -m nfl.publish_projections --availability-rule ruled-out
+python3 -m nfl.publish_projections --no-zero-doubtful
+python3 -m nfl.publish_projections --availability-rule legacy
+```
+
+`ruled-out` is the default. `legacy` is the previous pool for the same
+seed: Doubtful stays at full value (the sim copy has a blank injury),
+and Out/IR/NA are dropped before the draw instead of folded onto the
+next man. `--zero-doubtful` is ignored on `legacy`. The optimizer's ILP
+and scoring are unchanged.
+
 `gsis_id` is sent whenever depth, targets, or snaps have it. The trigger
 fills `player_id` and team codes. DEF rows usually have no `gsis_id`; the
 summary counts those.

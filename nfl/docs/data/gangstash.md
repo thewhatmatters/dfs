@@ -183,8 +183,10 @@ player. `Q` keeps the pre-game projection. Nightly projections read this
 week feed (not `injury_snapshots`): `O` / `IR` / `NA` leave the sim at
 mean 0. Only that position group is renumbered. The player who fills an
 Out slot keeps the higher of their own target/snap share and the vacated
-share; a healthy teammate's share is not passed down. `D` stays
-at full value and is flagged; `Q` is unchanged. A FanDuel CSV `Injury
+share; a healthy teammate's share is not passed down. Who projects 0
+is `--availability-rule` in `nfl/docs/data/projections.md` (default:
+Out/IR/NA and Doubtful are 0; `Q` and practice-only statuses stay).
+A FanDuel CSV `Injury
 Indicator` of `O` / `IR` / `NA` is the same drop when a CSV is supplied.
 A failed injuries fetch on a CSV pool is not listed as missing. No-CSV
 mode has no indicator column, so a failed fetch is `missing: injuries`
