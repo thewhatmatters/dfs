@@ -33,11 +33,21 @@ python3 -m nfl.depth --csv "nfl/data/<players-list>.csv"             # OurLads N
 # NFL player props: GANGSTASH_API_KEY (see nfl/docs/data/player-props.md).
 # NFL optimize defaults to gangstash lines, targets, snaps, and depth (GANGSTASH_API_KEY).
 # Nightly projections: python3 -m nfl.publish_projections --refresh --sim 10000
+# Publish gate (before sim/POST): collector_runs freshness + team coverage.
+#   Age is the latest succeeded finished_at, not cache mtime and not updated_at/as_of.
+#   Defaults: lines/props/injuries 26h, depth charts 72h, dead `running` 30m.
+#   Collectors: bettingpros-odds, bettingpros-pbcs, nflverse-injuries,
+#   nflverse-depth-charts, nflverse-depth-charts-weekly (map in nfl/publish_gate.py).
+#   Latest load blocks on partial, failed, or running older than 30m.
+#   Lines, injuries, and depth must cover every team on that week's games (byes excluded).
+#   player_stats_weekly, player_usage, snaps, and targets must include the previous week.
+#   --allow-stale / --skip-gate publish anyway and log each failure in the report header.
+#   --gate-only checks and exits. Override hours with --lines-max-age-hours and the matching flags.
 # Availability (default ruled-out): Out/IR/NA and Doubtful project 0; next man inherits.
 #   --no-zero-doubtful keeps Doubtful. --availability-rule legacy is the previous pool.
 #   DNP/Limited/Full and Questionable stay projected. See nfl/docs/data/projections.md.
 # Team mode also POSTs game_projections (same writer key, second request):
-# python3 -m nfl.publish_projections --refresh --sim 10000 --sim-mode team
+# python3 -m nfl.publish_projections --refresh --sim 10000 --sim-mode team --report
 #   Write key GANGSTASH_PROJECTIONS_WRITER_KEY. See nfl/docs/data/projections.md.
 # NFL game lines are gangstash only. Other fallbacks: --targets-source=lineups --snaps-source=lineups --depth-source=ourlads
 # Legacy optional Lineups refresh: python3 -m nfl.targets --refresh && python3 -m nfl.snaps --refresh

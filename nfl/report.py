@@ -564,8 +564,13 @@ def build_report(
     draws: int | None,
     efficiency: str | None,
     warnings=None,
+    gate_header=None,
 ) -> str:
-    """Render the nightly report. ``games`` is sim bands, raw draws, or vegas totals."""
+    """Render the nightly report. ``games`` is sim bands, raw draws, or vegas totals.
+
+    ``gate_header`` is the publish-gate age and coverage lines. They sit in
+    the header, after the run fields.
+    """
     shown = projection_rows(list(rows or []))
     slate = _coerce_games(games)
     eff = efficiency if efficiency else efficiency_from_rows(shown)
@@ -573,6 +578,7 @@ def build_report(
         eff = "unknown"
     draw_text = "unknown" if draws is None else str(int(draws))
     notes = [str(item) for item in (warnings or []) if str(item).strip()]
+    gate_lines = [str(item) for item in (gate_header or []) if str(item).strip()]
     lines = []
     if notes:
         lines.extend(notes)
@@ -585,9 +591,10 @@ def build_report(
             f"draws {draw_text}",
             f"efficiency {eff}",
             f"games {len(slate)}",
-            "",
         ]
     )
+    lines.extend(gate_lines)
+    lines.append("")
     if not _sim_games(slate):
         lines.append(VEGAS_LABEL)
         lines.append("")
@@ -620,6 +627,7 @@ def write_report(
     efficiency: str | None,
     dest: Path | None = None,
     warnings=None,
+    gate_header=None,
 ) -> Path:
     text = build_report(
         rows,
@@ -630,6 +638,7 @@ def write_report(
         draws=draws,
         efficiency=efficiency,
         warnings=warnings,
+        gate_header=gate_header,
     )
     path = report_path(season, week, run_at, dest)
     path.parent.mkdir(parents=True, exist_ok=True)

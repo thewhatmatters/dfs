@@ -12,6 +12,7 @@ from unittest.mock import patch
 from nfl.backtest import players_from_depth_chart
 from nfl.players import Player
 from nfl.projections import week1_score
+from nfl.publish_gate import GateResult
 from nfl.publish_projections import (
     CHUNK_SIZE,
     PROJECTIONS_URL,
@@ -33,6 +34,10 @@ from nfl.publish_projections import (
 from nfl.sim import simulate_games
 from nfl.snaps import SnapWeekRow
 from nfl.targets import TargetWeekRow
+
+
+def _open_gate(*_args, **_kwargs):
+    return GateResult(ok=True, failures=(), header=())
 
 
 def _line(*, game_id="2026_03_KC_BUF") -> dict:
@@ -281,6 +286,8 @@ class PayloadTest(unittest.TestCase):
             return 2026, 3, entries
 
         with patch("nfl.publish_projections.load_slate", load), patch(
+            "nfl.publish_projections.enforce_publish_gate", _open_gate
+        ), patch(
             "nfl.publish_projections.maybe_sim", return_value=(sim, "data")
         ), patch(
             "nfl.publish_projections.model_version", return_value="abc1234"
@@ -594,6 +601,8 @@ class ExitTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, patch(
             "nfl.publish_projections.load_slate", load
         ), patch(
+            "nfl.publish_projections.enforce_publish_gate", _open_gate
+        ), patch(
             "nfl.sim_feed.resolve_sim_inputs",
             return_value=(
                 None,
@@ -662,6 +671,8 @@ class ExitTest(unittest.TestCase):
             return 2026, 3, entries
 
         with patch("nfl.publish_projections.load_slate", load), patch(
+            "nfl.publish_projections.enforce_publish_gate", _open_gate
+        ), patch(
             "nfl.publish_projections.post_projection_rows"
         ) as post, patch(
             "nfl.publish_projections.model_version", return_value="abc1234"
@@ -781,6 +792,8 @@ class ReportFlagTest(unittest.TestCase):
             out = io.StringIO()
             err = io.StringIO()
             with patch("nfl.publish_projections.load_slate", load), patch(
+                "nfl.publish_projections.enforce_publish_gate", _open_gate
+            ), patch(
                 "nfl.publish_projections.maybe_sim", return_value=result
             ), patch(
                 "nfl.publish_projections.model_version", return_value="abc1234"
@@ -809,6 +822,8 @@ class ReportFlagTest(unittest.TestCase):
         entries = self._entries()
         with patch("nfl.publish_projections.projections_key", return_value="sekrit"), patch(
             "nfl.publish_projections.load_slate", return_value=(2026, 3, entries)
+        ), patch(
+            "nfl.publish_projections.enforce_publish_gate", _open_gate
         ), patch(
             "nfl.publish_projections.maybe_sim", return_value=SimResult({}, "data")
         ), patch(
@@ -1192,6 +1207,7 @@ class SlateCsvPublishTest(unittest.TestCase):
             patches = [
                 patch("nfl.publish_projections.projections_key", return_value="sekrit"),
                 patch("nfl.publish_projections.load_slate", load),
+                patch("nfl.publish_projections.enforce_publish_gate", _open_gate),
                 patch(
                     "nfl.publish_projections.maybe_sim",
                     return_value=SimResult(None, "data"),
