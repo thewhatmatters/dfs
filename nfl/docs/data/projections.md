@@ -9,15 +9,69 @@ python3 -m nfl.publish_projections --refresh --sim 10000
 ```
 
 That is the nightly command. `--refresh` skips the same-day cache so a dead
-read cannot fall back onto an older file. `--sim 10000` also posts
+read cannot fall back onto an older file. A publish gate runs after the
+slate load and before the sim or any POST. `--sim 10000` also posts
 `model=sim`. Those rows use `resolve_sim_inputs` and `simulate_games`
 the same way `python3 -m nfl.optimize` does (`--projection-source sim`).
 `mean` is the simulated mean; `p10` / `p50` / `p90` are the same draws.
 If `simulate_games` does not import, the command still posts the board
 and prints one line. A sim-input cache marked stale exits non-zero.
 
+## Publish gate
+
+The gate refuses the run (exit 1, one stderr line per failure) when an
+input is stale or coverage is incomplete. It does not change scoring, the
+sim, or the optimizer. `--gate-only` runs the checks and exits without a
+sim or a POST, and it does not need the writer key.
+
+Freshness and load status come from `dataset=collector_runs`
+(`public.collector_runs`: `run_id`, `collector`, `started_at`,
+`finished_at`, `status`, `row_counts`, `error`, `host`, `git_sha`, `args`).
+`status` is `running`, `succeeded`, `partial`, or `failed`. A missing or
+unknown `status` blocks. Age is the latest `finished_at` among
+`status=succeeded` for that collector. The latest load is the newest row
+by `started_at`: `partial` and `failed` block, and `running` blocks when
+`started_at` is more than 30 minutes ago. `updated_at`, `as_of`, and the
+local cache file's mtime are not freshness. A same-day cache whose last
+succeeded depth run is four days old still blocks.
+
+Collector names (one map in `nfl/publish_gate.py`, `COLLECTORS`):
+
+| input | collector | default max age |
+|-------|-----------|-----------------|
+| lines | `bettingpros-odds` | 26h |
+| props | `bettingpros-pbcs` | 26h |
+| injuries | `nflverse-injuries` | 26h |
+| depth charts | `nflverse-depth-charts` and `nflverse-depth-charts-weekly` | 72h |
+
+Both depth collectors are checked. Team coverage uses the current
+`depth_charts` rows. `depth_charts_weekly` is freshness and load status
+only, because that dataset omits games that have not kicked off.
+
+Coverage is read from the data rows. Expected teams are the home and away
+clubs on that week's games, so a bye is not required. With no byes, all
+32 must be present. Each of those teams needs a line (spread and total),
+at least one injury row, and at least one depth-chart row. A load that
+misses teams names them and blocks (`injuries missing 9 teams: ARI, ...`).
+
+`player_stats_weekly`, `player_usage`, `snaps`, and `targets` must include
+the previous completed week. Week 1 has no previous week, so that check
+is skipped.
+
+Defaults are flags: `--lines-max-age-hours` (26), `--props-max-age-hours`
+(26), `--injuries-max-age-hours` (26), `--depth-max-age-hours` (72),
+`--running-max-minutes` (30).
+
+`--allow-stale` and `--skip-gate` publish anyway. Every failed check is
+printed as `GATE WARNING:` and copied into the report header. The header
+always lists each collector's age and the lines / injuries / depth
+coverage result.
+
+The older `cache_stale` stop still applies when a live read fails and an
+older cache file is the fallback. That is separate from this gate.
+
 `--dry-run` writes `nfl/data/projections/` (gitignored) and does not POST.
-It does not need `GANGSTASH_PROJECTIONS_WRITER_KEY`.
+It does not need `GANGSTASH_PROJECTIONS_WRITER_KEY`. The gate still runs.
 
 `--sim-mode team` uses the same run to POST one row per game. That is a
 second request to `/functions/v1/projections` with the writer key and

@@ -641,6 +641,31 @@ def fetch_game_lines(
     )
 
 
+def fetch_collector_runs(
+    *,
+    collector: str | None = None,
+    refresh: bool = False,
+    cache_day: date | None = None,
+) -> tuple[list[dict], dict]:
+    """`dataset=collector_runs`. Data Aggregator run log.
+
+    Columns: run_id, collector, started_at, finished_at, status
+    (``running`` / ``succeeded`` / ``partial`` / ``failed``), row_counts,
+    error, host, git_sha, args. Freshness for the publish gate is the
+    latest ``finished_at`` with ``status=succeeded``, not ``updated_at``
+    or ``as_of`` and not the cache file mtime.
+    """
+    params: dict[str, str] = {}
+    if collector:
+        params["collector"] = collector.strip()
+    return fetch_dataset(
+        dataset_id("collector_runs"),
+        params,
+        refresh=refresh,
+        cache_day=cache_day,
+    )
+
+
 @dataclass(frozen=True)
 class GangstashDepthSlot:
     team_fd: str
