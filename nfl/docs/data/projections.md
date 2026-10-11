@@ -42,7 +42,7 @@ Collector names (one map in `nfl/publish_gate.py`, `COLLECTORS`):
 | lines | `bettingpros-odds` | 26h |
 | props | `bettingpros-pbcs` | 26h |
 | injuries | `nflverse-injuries` | 26h |
-| depth charts | `nflverse-depth-charts` and `nflverse-depth-charts-weekly` | 72h |
+| depth charts | `nflverse-depth-charts` | 72h |
 
 Both depth collectors are checked. Team coverage uses the current
 `depth_charts` rows. `depth_charts_weekly` is freshness and load status

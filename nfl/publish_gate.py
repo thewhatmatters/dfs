@@ -27,7 +27,7 @@ COLLECTORS: dict[str, tuple[str, ...]] = {
     "lines": ("bettingpros-odds",),
     "props": ("bettingpros-pbcs",),
     "injuries": ("nflverse-injuries",),
-    "depth": ("nflverse-depth-charts", "nflverse-depth-charts-weekly"),
+    "depth": ("nflverse-depth-charts",),
 }
 
 # Week presence only. These feeds have no collector in COLLECTORS.

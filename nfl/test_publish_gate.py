@@ -177,10 +177,7 @@ class PublishGateTest(unittest.TestCase):
         self.assertEqual(COLLECTORS["lines"], ("bettingpros-odds",))
         self.assertEqual(COLLECTORS["props"], ("bettingpros-pbcs",))
         self.assertEqual(COLLECTORS["injuries"], ("nflverse-injuries",))
-        self.assertEqual(
-            COLLECTORS["depth"],
-            ("nflverse-depth-charts", "nflverse-depth-charts-weekly"),
-        )
+        self.assertEqual(COLLECTORS["depth"], ("nflverse-depth-charts",))
 
     def test_fresh_full_coverage_passes(self) -> None:
         result = _judge(_snapshot())
@@ -191,10 +188,6 @@ class PublishGateTest(unittest.TestCase):
         self.assertIn("props bettingpros-pbcs age 1.0h (limit 26h) latest succeeded", header)
         self.assertIn("injuries nflverse-injuries age 1.0h (limit 26h) latest succeeded", header)
         self.assertIn("depth nflverse-depth-charts age 1.0h (limit 72h) latest succeeded", header)
-        self.assertIn(
-            "depth nflverse-depth-charts-weekly age 1.0h (limit 72h) latest succeeded",
-            header,
-        )
         self.assertIn("coverage lines 32/32 teams", header)
         self.assertIn("coverage injuries 32/32 teams", header)
         self.assertIn("coverage depth 32/32 teams", header)
@@ -387,10 +380,9 @@ class PublishGateTest(unittest.TestCase):
         text = "\n".join(result.failures)
         self.assertIn("96.0h > 72h", text)
         self.assertIn("nflverse-depth-charts last succeeded", text)
-        self.assertIn("nflverse-depth-charts-weekly last succeeded", text)
         self.assertNotIn("cache", text)
         self.assertNotIn(str(cache), text)
-        self.assertEqual(len(result.failures), 2)
+        self.assertEqual(len(result.failures), 1)
 
     def test_previous_week_missing_blocks(self) -> None:
         rows = _week_rows(week=2)

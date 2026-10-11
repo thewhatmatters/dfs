@@ -37,7 +37,7 @@ python3 -m nfl.depth --csv "nfl/data/<players-list>.csv"             # OurLads N
 #   Age is the latest succeeded finished_at, not cache mtime and not updated_at/as_of.
 #   Defaults: lines/props/injuries 26h, depth charts 72h, dead `running` 30m.
 #   Collectors: bettingpros-odds, bettingpros-pbcs, nflverse-injuries,
-#   nflverse-depth-charts, nflverse-depth-charts-weekly (map in nfl/publish_gate.py).
+#   nflverse-depth-charts (map in nfl/publish_gate.py).
 #   Latest load blocks on partial, failed, or running older than 30m.
 #   Lines, injuries, and depth must cover every team on that week's games (byes excluded).
 #   player_stats_weekly, player_usage, snaps, and targets must include the previous week.
