@@ -14,6 +14,7 @@ from nfl.game_projections import (
     wire_team,
 )
 from nfl.players import Player
+from nfl.publish_gate import GateResult
 from nfl.publish_projections import (
     PROJECTIONS_URL,
     PublishEntry,
@@ -21,6 +22,10 @@ from nfl.publish_projections import (
     post_game_projection_rows,
     projection_rows,
 )
+
+
+def _open_publish_gate(*_args, **_kwargs):
+    return GateResult(ok=True, failures=(), header=())
 from nfl.sim import TdTally, poisson_sample, simulate_games
 from nfl.sim_efficiency import (
     PASS_TD_RATE,
@@ -305,6 +310,8 @@ class PublishWireTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             with patch("nfl.publish_projections.load_slate", load), patch(
+                "nfl.publish_projections.enforce_publish_gate", _open_publish_gate
+            ), patch(
                 "nfl.publish_projections.maybe_sim", return_value=result
             ), patch(
                 "nfl.publish_projections.model_version", return_value="abc1234"
@@ -337,6 +344,8 @@ class PublishWireTest(unittest.TestCase):
 
         with patch("nfl.publish_projections.projections_key", return_value="writer"), patch(
             "nfl.publish_projections.load_slate", load
+        ), patch(
+            "nfl.publish_projections.enforce_publish_gate", _open_publish_gate
         ), patch(
             "nfl.publish_projections.maybe_sim", return_value=result
         ), patch(
@@ -419,6 +428,8 @@ class PublishWireTest(unittest.TestCase):
         err = io.StringIO()
         with patch("nfl.publish_projections.projections_key", return_value="writer"), patch(
             "nfl.publish_projections.load_slate", load
+        ), patch(
+            "nfl.publish_projections.enforce_publish_gate", _open_publish_gate
         ), patch(
             "nfl.publish_projections.maybe_sim", return_value=result
         ), patch(

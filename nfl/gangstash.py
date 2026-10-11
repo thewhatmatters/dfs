@@ -115,6 +115,7 @@ DATASET_ENV = {
     "dst_weekly": "GANGSTASH_DST_WEEKLY_DATASET",
     "player_usage": "GANGSTASH_PLAYER_USAGE_DATASET",
     "props_closing": "GANGSTASH_PROPS_CLOSING_DATASET",
+    "collector_runs": "GANGSTASH_COLLECTOR_RUNS_DATASET",
 }
 
 

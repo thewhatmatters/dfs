@@ -39,8 +39,19 @@ is ``{"game_projections": [...]}``. Both requests use
 snaps, props, and injuries. If it is unset the command exits 1 before posting.
 There is no other read source. `--refresh` (the default) does not
 fall back to a cache when the key is missing.
+
+A publish gate runs before the sim and before any POST. It refuses
+(exit 1, one line per failure) when `collector_runs` says a collector
+is stale or its latest load is partial, failed, or a dead `running`
+process, or when lines, injuries, or depth miss a team that has a game
+this week. Age is the latest succeeded `finished_at`, not the cache
+file mtime and not `updated_at` / `as_of`. `--allow-stale` (alias
+`--skip-gate`) posts anyway and records every failure in the report
+header. `--gate-only` runs the checks and exits. See `nfl/publish_gate.py`.
+
 `--report` writes `nfl/reports/<season>-w<week>-<date>.md` after a
-successful POST or `--dry-run` and prints that path.
+successful POST or `--dry-run` and prints that path. The header lists
+each collector's age and the coverage result.
 `--slate-csv PATH` limits that report to one FanDuel players-list
 (`auto` picks the newest dated file that is today or later in
 America/Chicago). It does not change the rows posted to gangstash.
@@ -82,6 +93,11 @@ from nfl.lines import TeamLine, implied_totals
 from nfl.names import match_key
 from nfl.ourlads import skill_pos
 from nfl.players import Player, load_fanduel_csv
+from nfl.publish_gate import (
+    enforce_publish_gate,
+    gate_allows_stale,
+    gate_header_lines,
+)
 from nfl.projections import (
     implied_core,
     prop_factor,
@@ -1510,6 +1526,57 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "projections are unchanged. A missing or unusable file keeps "
         "the full report.",
     )
+    ap.add_argument(
+        "--allow-stale",
+        action="store_true",
+        help="Publish even when the gate fails. Each failed check is "
+        "logged and written into the report header.",
+    )
+    ap.add_argument(
+        "--skip-gate",
+        action="store_true",
+        help="Alias of --allow-stale.",
+    )
+    ap.add_argument(
+        "--gate-only",
+        action="store_true",
+        help="Run the publish gate and exit. Does not sim or POST.",
+    )
+    ap.add_argument(
+        "--lines-max-age-hours",
+        type=float,
+        default=26.0,
+        help="Block when the latest succeeded lines collector run is older "
+        "than this many hours (default 26).",
+    )
+    ap.add_argument(
+        "--props-max-age-hours",
+        type=float,
+        default=26.0,
+        help="Block when the latest succeeded props collector run is older "
+        "than this many hours (default 26).",
+    )
+    ap.add_argument(
+        "--injuries-max-age-hours",
+        type=float,
+        default=26.0,
+        help="Block when the latest succeeded injuries collector run is older "
+        "than this many hours (default 26).",
+    )
+    ap.add_argument(
+        "--depth-max-age-hours",
+        type=float,
+        default=72.0,
+        help="Block when the latest succeeded depth-chart collector run is "
+        "older than this many hours (default 72).",
+    )
+    ap.add_argument(
+        "--running-max-minutes",
+        type=float,
+        default=30.0,
+        help="Block when a collector's latest run is still 'running' and "
+        "started_at is older than this many minutes (default 30).",
+    )
     return ap.parse_args(argv)
 
 
@@ -1521,6 +1588,7 @@ def emit_projection_report(
     season: int,
     week: int,
     run_at: str,
+    gate_header: list[str] | None = None,
 ) -> Path:
     """Write the markdown report and, when sim game draws exist, the sidecar."""
     from nfl.report import (
@@ -1579,7 +1647,46 @@ def emit_projection_report(
             else efficiency_from_rows(report_rows)
         ),
         warnings=warnings,
+        gate_header=gate_header,
     )
+
+
+def _emit_gate(gate, *, allow: bool) -> int:
+    """Print one line per failed check. Return 1 when the gate blocks the post."""
+    if not gate.failures:
+        return 0
+    prefix = "publish projections: GATE WARNING: " if allow else "publish projections: "
+    for line in gate.failures:
+        print(f"{prefix}{line}", file=sys.stderr)
+    return 0 if allow else 1
+
+
+def _gate_only(args: argparse.Namespace, *, allow: bool) -> int:
+    """Resolve the week, judge the gate, exit. No sim and no POST."""
+    today = datetime.now(ET).date()
+    try:
+        season, week, _rows = resolve_nfl_week(
+            today,
+            refresh=bool(args.refresh),
+            season=args.season,
+            week=args.week,
+        )
+        gate = enforce_publish_gate(args, season, week)
+    except StaleInputs as e:
+        print(f"publish projections: {e}", file=sys.stderr)
+        return 1
+    except (GangstashDataKeyMissing, GangstashKeyMissing) as e:
+        print(
+            f"publish projections: {missing_read_key_message(str(e))}",
+            file=sys.stderr,
+        )
+        return 1
+    except (PublishError, GangstashDataError, UnmappedTeam) as e:
+        print(f"publish projections: {e}", file=sys.stderr)
+        return 1
+    for line in gate.header:
+        print(line)
+    return _emit_gate(gate, allow=allow)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1595,6 +1702,9 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print("publish projections: %s" % exc, file=sys.stderr)
         return 1
+    allow = gate_allows_stale(args)
+    if args.gate_only:
+        return _gate_only(args, allow=allow)
     key = None
     if not args.dry_run:
         try:
@@ -1605,6 +1715,27 @@ def main(argv: list[str] | None = None) -> int:
     today = datetime.now(ET).date()
     try:
         season, week, entries = load_slate(args, today)
+        gate = enforce_publish_gate(args, season, week)
+    except StaleInputs as e:
+        print(f"publish projections: {e}", file=sys.stderr)
+        return 1
+    except (GangstashDataKeyMissing, GangstashKeyMissing) as e:
+        print(
+            f"publish projections: {missing_read_key_message(str(e))}",
+            file=sys.stderr,
+        )
+        return 1
+    except (
+        PublishError,
+        GangstashDataError,
+        UnmappedTeam,
+    ) as e:
+        print(f"publish projections: {e}", file=sys.stderr)
+        return 1
+    if _emit_gate(gate, allow=allow):
+        return 1
+    gate_header = gate_header_lines(gate, allow=allow)
+    try:
         sim = maybe_sim(
             entries,
             args.sim,
@@ -1684,6 +1815,7 @@ def main(argv: list[str] | None = None) -> int:
                     season=season,
                     week=week,
                     run_at=run_at,
+                    gate_header=gate_header,
                 )
             except Exception as e:
                 print(f"publish projections: {e}", file=sys.stderr)
@@ -1711,6 +1843,7 @@ def main(argv: list[str] | None = None) -> int:
                 season=season,
                 week=week,
                 run_at=run_at,
+                gate_header=gate_header,
             )
         except Exception as e:
             print(f"publish projections: {e}", file=sys.stderr)

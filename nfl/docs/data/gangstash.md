@@ -86,6 +86,7 @@ python3 -m nfl.gangstash_data team-stats-weekly --season 2026 --week 1,2
 | `GANGSTASH_DST_WEEKLY_DATASET` | `dst_weekly` | `dataset=` value |
 | `GANGSTASH_PLAYER_USAGE_DATASET` | `player_usage` | `dataset=` value |
 | `GANGSTASH_PROPS_CLOSING_DATASET` | `props_closing` | `dataset=` value |
+| `GANGSTASH_COLLECTOR_RUNS_DATASET` | `collector_runs` | `dataset=` value. Publish-gate freshness |
 
 ## Queries this client sends
 
@@ -103,6 +104,7 @@ python3 -m nfl.gangstash_data team-stats-weekly --season 2026 --week 1,2
 | `player_usage` | `season` required; `week`, `team`, `gsis_id`, `position` optional | one row per player-week. The sim feed sends season and the prior-week list only |
 | `props_closing` | `season` required; `week`, `player`, `team`, `prop` optional | last pre-kickoff BettingPros line per player and prop. Starts 2026 week 3. The holdout turns pass/rush/rec yards, receptions, and TD lines into FanDuel points. An empty or unknown dataset is skipped |
 | `snaps` | `season` (required), `week` (single or `1,2`), optional `position` (`WR`/`TE`/`RB`), `team` (FD or nflverse; `JAC` and `JAX` both work) | 2026 weeks 1–2 are 2,994 rows (185 RB, 335 WR, 220 TE). `offense_pct` is a 0–1 fraction |
+| `collector_runs` | optional `collector` | Data Aggregator run log. Publish-gate age is the latest `finished_at` with `status=succeeded`. Latest row by `started_at` blocks on `partial`, `failed`, or `running` older than 30 minutes. Not `updated_at` / `as_of` |
 
 ## Response fields
 
