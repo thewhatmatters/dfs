@@ -165,7 +165,15 @@ def _snapshot(
         injury_rows=_injury_rows(playing if injury_teams is None else injury_teams),
         depth_rows=_depth_rows(playing if depth_teams is None else depth_teams),
         week_rows=_week_rows() if week_rows is None else week_rows,
+        prop_rows=_prop_rows(),
     )
+
+
+def _prop_rows(count: int = 3, week: int = WEEK) -> list[dict]:
+    return [
+        {"season": SEASON, "week": week, "player_name": f"P{i}", "prop": "rec_yds", "line": 40.5}
+        for i in range(count)
+    ]
 
 
 def _judge(snapshot: GateSnapshot, *, limits: GateLimits | None = None) -> GateResult:
@@ -373,6 +381,9 @@ class PublishGateTest(unittest.TestCase):
             ), patch(
                 "nfl.gangstash_data.fetch_targets",
                 return_value=(_week_rows()["targets"], {"cache_stale": False}),
+            ), patch(
+                "nfl.gangstash.fetch_props",
+                return_value=(_prop_rows(), {"cache_stale": False}),
             ):
                 snapshot = load_gate_snapshot(SEASON, WEEK, refresh=False)
             result = evaluate_gate(snapshot, now=NOW, week=WEEK)
@@ -407,6 +418,7 @@ class PublishGateTest(unittest.TestCase):
             injury_rows=injuries,
             depth_rows=depth,
             week_rows=None,
+            prop_rows=_prop_rows(week=1),
         )
         result = evaluate_gate(snapshot, now=NOW, week=1)
         self.assertTrue(result.ok, "\n".join(result.failures))
@@ -580,6 +592,129 @@ class PublishGateCliTest(unittest.TestCase):
         load.assert_not_called()
         self.assertIn(line, err.getvalue())
         self.assertIn("coverage injuries 23/32 teams missing", out.getvalue())
+
+# Week 6 2026: TNF SEA@DEN Thu Oct 15 7:15 PM CT -> practice day Wed Oct 14.
+W6 = 6
+TNF_KICKOFF = "2026-10-16T00:15:00Z"
+TUE = datetime(2026, 10, 13, 14, 30, tzinfo=timezone.utc)  # Tue 9:30 AM CT
+WED = datetime(2026, 10, 14, 23, 0, tzinfo=timezone.utc)   # Wed 6:00 PM CT
+THU = datetime(2026, 10, 15, 15, 0, tzinfo=timezone.utc)   # Thu 10:00 AM CT
+
+
+def _w6_snapshot(
+    now: datetime,
+    *,
+    injury_teams: list[str] | None = None,
+    props: list[dict] | None = None,
+    runs: list[dict] | None = None,
+) -> GateSnapshot:
+    teams = sorted(TEAMS)
+    games = _games(teams)
+    for index, row in enumerate(games):
+        row["week"] = W6
+        row["kickoff"] = TNF_KICKOFF if index == 0 else "2026-10-18T17:00:00Z"
+    injuries = _injury_rows(teams if injury_teams is None else injury_teams)
+    depth = _depth_rows(teams)
+    for row in injuries + depth:
+        row["week"] = W6
+    return GateSnapshot(
+        runs=_fresh_runs(now) if runs is None else runs,
+        games=games,
+        injury_rows=injuries,
+        depth_rows=depth,
+        week_rows=_week_rows(week=W6 - 1),
+        prop_rows=_prop_rows(week=W6) if props is None else props,
+    )
+
+
+class PracticeDayAndPropsTest(unittest.TestCase):
+    def test_injuries_missing_on_tuesday_warn_and_pass(self) -> None:
+        result = evaluate_gate(_w6_snapshot(TUE, injury_teams=[]), now=TUE, week=W6)
+        self.assertTrue(result.ok, "\n".join(result.failures))
+        self.assertEqual(len(result.warnings), 1)
+        self.assertIn("injuries missing 32 teams", result.warnings[0])
+        self.assertIn("injuries before practice day 2026-10-14; gaps warn", result.header)
+
+    def test_injuries_missing_on_wednesday_block(self) -> None:
+        result = evaluate_gate(_w6_snapshot(WED, injury_teams=[]), now=WED, week=W6)
+        self.assertFalse(result.ok)
+        self.assertIn("injuries missing 32 teams", "\n".join(result.failures))
+        self.assertEqual(result.warnings, ())
+
+    def test_injuries_missing_after_wednesday_block(self) -> None:
+        result = evaluate_gate(_w6_snapshot(THU, injury_teams=["KC"]), now=THU, week=W6)
+        self.assertFalse(result.ok)
+        self.assertIn("injuries missing 31 teams", "\n".join(result.failures))
+
+    def test_stale_injury_load_blocks_on_tuesday(self) -> None:
+        runs = _replace_collector(
+            _fresh_runs(TUE),
+            "nflverse-injuries",
+            [_succeeded("nflverse-injuries", TUE, age_hours=40.0)],
+        )
+        result = evaluate_gate(
+            _w6_snapshot(TUE, injury_teams=[], runs=runs), now=TUE, week=W6
+        )
+        self.assertFalse(result.ok)
+        self.assertIn("injuries stale", "\n".join(result.failures))
+
+    def test_failed_injury_load_blocks_on_tuesday(self) -> None:
+        runs = _fresh_runs(TUE) + [
+            _succeeded("nflverse-injuries", TUE, age_hours=0.1, run_id="bad", status="failed")
+        ]
+        result = evaluate_gate(_w6_snapshot(TUE, runs=runs), now=TUE, week=W6)
+        self.assertFalse(result.ok)
+        self.assertIn("injuries latest load failed", "\n".join(result.failures))
+
+    def test_no_kickoff_means_missing_injuries_block(self) -> None:
+        snapshot = _w6_snapshot(TUE, injury_teams=[])
+        for row in snapshot.games:
+            row.pop("kickoff")
+        result = evaluate_gate(snapshot, now=TUE, week=W6)
+        self.assertFalse(result.ok)
+
+    def test_zero_props_block_even_when_run_fresh(self) -> None:
+        result = evaluate_gate(_w6_snapshot(WED, props=[]), now=WED, week=W6)
+        self.assertFalse(result.ok)
+        self.assertIn("props: 0 player-prop rows for week 6", result.failures)
+
+    def test_props_for_other_week_count_as_zero(self) -> None:
+        result = evaluate_gate(
+            _w6_snapshot(WED, props=_prop_rows(week=5)), now=WED, week=W6
+        )
+        self.assertIn("props: 0 player-prop rows for week 6", result.failures)
+
+    def test_nonzero_props_pass(self) -> None:
+        result = evaluate_gate(_w6_snapshot(WED), now=WED, week=W6)
+        self.assertTrue(result.ok, "\n".join(result.failures))
+        self.assertIn("coverage props week 6 3 rows", result.header)
+
+    def test_legacy_flag_restores_old_rules(self) -> None:
+        legacy = GateLimits(legacy_gate=True)
+        tue = evaluate_gate(
+            _w6_snapshot(TUE, injury_teams=[]), now=TUE, week=W6, limits=legacy
+        )
+        self.assertFalse(tue.ok)
+        self.assertIn("injuries missing 32 teams", "\n".join(tue.failures))
+        self.assertEqual(tue.warnings, ())
+        zero = evaluate_gate(_w6_snapshot(WED, props=[]), now=WED, week=W6, limits=legacy)
+        self.assertTrue(zero.ok, "\n".join(zero.failures))
+
+    def test_legacy_flag_on_the_cli(self) -> None:
+        self.assertTrue(limits_from_args(parse_args(["--legacy-gate"])).legacy_gate)
+        self.assertFalse(limits_from_args(parse_args([])).legacy_gate)
+
+    def test_gate_only_prints_warning_and_exits_zero(self) -> None:
+        result = evaluate_gate(_w6_snapshot(TUE, injury_teams=[]), now=TUE, week=W6)
+        out, err = io.StringIO(), io.StringIO()
+        with patch(
+            "nfl.publish_projections.enforce_publish_gate", return_value=result
+        ), patch(
+            "nfl.publish_projections.resolve_nfl_week", return_value=(SEASON, W6, [])
+        ), redirect_stdout(out), redirect_stderr(err):
+            rc = main(["--gate-only", "--season", str(SEASON), "--week", str(W6)])
+        self.assertEqual(rc, 0)
+        self.assertIn("GATE WARNING: injuries missing 32 teams", err.getvalue())
 
 
 if __name__ == "__main__":

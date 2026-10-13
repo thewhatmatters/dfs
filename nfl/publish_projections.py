@@ -1538,6 +1538,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Alias of --allow-stale.",
     )
     ap.add_argument(
+        "--legacy-gate",
+        action="store_true",
+        help="Restore the earlier gate rules: missing injury coverage blocks "
+        "on every day (no pre-Wednesday warning) and zero player-prop rows "
+        "for the week pass.",
+    )
+    ap.add_argument(
         "--gate-only",
         action="store_true",
         help="Run the publish gate and exit. Does not sim or POST.",
@@ -1653,6 +1660,8 @@ def emit_projection_report(
 
 def _emit_gate(gate, *, allow: bool) -> int:
     """Print one line per failed check. Return 1 when the gate blocks the post."""
+    for line in getattr(gate, "warnings", ()) or ():
+        print(f"publish projections: GATE WARNING: {line}", file=sys.stderr)
     if not gate.failures:
         return 0
     prefix = "publish projections: GATE WARNING: " if allow else "publish projections: "
