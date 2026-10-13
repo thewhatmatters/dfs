@@ -45,11 +45,13 @@ Do not `--refresh-props` unless you mean to refetch.
 
 ## What gets scored
 
-Rows collapse to one player (Jr./Sr. stripped). A volume line is a ±20% tilt
-on the implied score, including 100/300 yardage bonuses when the line itself
-clears the threshold. Join is exact `match_key` against the FanDuel pool.
-Two slate players with the same key are left unmatched. Names that are only
-on the board are not a join failure.
+Rows collapse to one player. Join is `match_key` on both sides: the
+board `player_name` and the pool name. `match_key` strips Jr/Sr/II/III/IV/V,
+so a board name `Patrick Mahomes II` attaches Pass YDs (and the other
+mapped markets) to a pool name `Patrick Mahomes`. A volume line is a ±20%
+tilt on the implied score, including 100/300 yardage bonuses when the line
+itself clears the threshold. Two slate players with the same key are left
+unmatched. Names that are only on the board are not a join failure.
 
 Mapped `prop` strings (case, punctuation, and a trailing Over/Under ignored):
 

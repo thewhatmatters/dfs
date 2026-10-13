@@ -16,6 +16,7 @@ from nfl.gangstash import (
     fetch_props,
 )
 from nfl.http import HttpError
+from nfl.names import match_key
 from nfl.players import Player
 from nfl.props import attach_props, ingest_slate_props, prop_field, rows_to_props
 
@@ -274,6 +275,50 @@ class IngestTest(unittest.TestCase):
         self.assertEqual(by_id["s1"].prop_status, "unmatched")
         self.assertEqual(by_id["s2"].prop_status, "unmatched")
         self.assertIsNone(by_id["s1"].prop_fd)
+
+    def test_mahomes_ii_pass_yards_join_the_unsuffixed_name(self):
+        """Board 'Patrick Mahomes II' attaches Pass YDs to 'Patrick Mahomes'."""
+        self.assertEqual(match_key("Patrick Mahomes II"), match_key("Patrick Mahomes"))
+        payload = [
+            {
+                "player_name": "Patrick Mahomes II",
+                "prop": "Pass YDs",
+                "line": 275.5,
+                "scraped_at": "2026-10-05T18:00:00Z",
+            }
+        ]
+        by_key, _meta = rows_to_props(payload)
+        self.assertIn(match_key("Patrick Mahomes"), by_key)
+        self.assertAlmostEqual(by_key[match_key("Patrick Mahomes")].pass_yds or 0, 275.5)
+        pool = [
+            Player(
+                pid="mahomes",
+                name="Patrick Mahomes",
+                position="QB",
+                salary=8500,
+                team="KC",
+                opponent="JAX",
+                game="KC@JAX",
+                fppg=None,
+                injury="",
+                roster_position="",
+                implied_total=24.0,
+                depth_rank=1,
+            )
+        ]
+        with patch(
+            "nfl.props.fetch_props",
+            return_value=(
+                payload,
+                {"cache": None, "cache_stale": False, "truncated": False, "live": True},
+            ),
+        ):
+            by_pid, _stats = ingest_slate_props(pool, slate_day=date(2026, 10, 5))
+        self.assertIn("mahomes", by_pid)
+        self.assertAlmostEqual(by_pid["mahomes"].pass_yds or 0, 275.5)
+        attached = attach_props(pool, by_pid)
+        self.assertEqual(attached[0].prop_status, "props")
+        self.assertAlmostEqual(attached[0].prop_pass_yds or 0, 275.5)
 
 
 class CacheDirTest(unittest.TestCase):

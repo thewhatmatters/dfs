@@ -253,6 +253,40 @@ class PlaceholderEfficiency:
             ),
         )
 
+    def scoring_tds(self, player: Player, opportunities: OpportunityCount) -> float:
+        """Expected rush + receiving TDs in this draw.
+
+        Passing TDs stay on the passer and are not an anytime score.
+        The count matches the TD inputs of ``points`` and does not draw RNG.
+        """
+        pos = (player.position or "WR").upper()
+        rushes = max(0.0, opportunities.rushes)
+        if pos == "QB":
+            return rushes * QB_RUSH_TD_RATE
+        if opportunities.receiving is None:
+            rec = expected_receiving_line(pos, opportunities.targets).rec_td
+        else:
+            rec = float(opportunities.receiving.rec_td)
+        return rushes * RUSH_TD_RATE + rec
+
+    def scoring_pass_tds(self, player: Player, opportunities: OpportunityCount) -> float:
+        """Passing TDs ``points`` uses for a QB. Zero for every other position.
+
+        With ``team_receiving``, this is the sum of those receiving TD
+        expectations (the same number the QB is scored on). Without that
+        list, attempts times the league pass-TD rate.
+        """
+        pos = (player.position or "WR").upper()
+        if pos != "QB":
+            return 0.0
+        att = max(0.0, opportunities.pass_attempts)
+        if opportunities.team_receiving is None:
+            return att * PASS_TD_RATE
+        return max(
+            0.0,
+            float(sum(line.rec_td for line in opportunities.team_receiving)),
+        )
+
 
 def shrink(observed: float, n: float, prior: float, prior_n: float) -> float:
     """Prior-count blend. ``n == 0`` returns ``prior``."""
@@ -1130,13 +1164,11 @@ class DataEfficiency:
         one-week rate and the opponent adjustment cannot stack. Rates that
         are still the prior, with a multiplier of 1, keep ``rushes × rate``.
         """
+        tds = self._rush_td(player, pos, rushes, rates, opportunities)
         if opportunities.rush_yards is not None or opportunities.rush_tds is not None:
             yards = opportunities.rush_yards
             if yards is None:
                 yards = rushes * rates["yards_per_carry"]
-            tds = opportunities.rush_tds
-            if tds is None:
-                tds = rushes * rates["rush_td_per_carry"]
             return sample_yards(rng, yards), tds
         prior = position_rates(pos)
         return (
@@ -1149,12 +1181,71 @@ class DataEfficiency:
                     self.rush_multiplier(player.opponent),
                 ),
             ),
-            _clamped_mean(
-                rushes,
-                rates["rush_td_per_carry"],
-                prior["rush_td_per_carry"],
-                self.td_multiplier(player.team, player.opponent),
-            ),
+            tds,
+        )
+
+    def _rush_td(
+        self,
+        player: Player,
+        pos: str,
+        rushes: float,
+        rates: dict[str, float],
+        opportunities: OpportunityCount,
+    ) -> float:
+        """Rush-TD expectation from ``_rush_scoring``. No RNG."""
+        if opportunities.rush_yards is not None or opportunities.rush_tds is not None:
+            tds = opportunities.rush_tds
+            if tds is None:
+                tds = rushes * rates["rush_td_per_carry"]
+            return float(tds)
+        prior = position_rates(pos)
+        return _clamped_mean(
+            rushes,
+            rates["rush_td_per_carry"],
+            prior["rush_td_per_carry"],
+            self.td_multiplier(player.team, player.opponent),
+        )
+
+    def scoring_tds(self, player: Player, opportunities: OpportunityCount) -> float:
+        """Expected rush + receiving TDs. Passing TDs are not an anytime score."""
+        pos = (player.position or "WR").upper()
+        rates = self.rates_for(player, pos)
+        rushes = max(0.0, opportunities.rushes)
+        rush_td = self._rush_td(player, pos, rushes, rates, opportunities)
+        if pos == "QB":
+            return float(rush_td)
+        if opportunities.receiving is None:
+            same, _catch, _ypt, td_rate = self._line_params(player, pos)
+            targets = max(0.0, float(opportunities.targets))
+            if same:
+                rec = expected_receiving_line(pos, targets).rec_td
+            else:
+                rec = targets * td_rate
+        else:
+            rec = float(opportunities.receiving.rec_td)
+        return float(rush_td) + float(rec)
+
+    def scoring_pass_tds(self, player: Player, opportunities: OpportunityCount) -> float:
+        """Passing TDs ``points`` uses for a QB. Zero for every other position.
+
+        With ``team_receiving``, this is the sum of those receiving TD
+        expectations. Without that list, attempts times the shrunk pass-TD
+        rate times the TD multiplier, which is what ``points`` scores.
+        """
+        pos = (player.position or "WR").upper()
+        if pos != "QB":
+            return 0.0
+        att = max(0.0, opportunities.pass_attempts)
+        if opportunities.team_receiving is None:
+            rates = self.rates_for(player, pos)
+            pass_td = att * rates["pass_td_per_attempt"]
+            td_mult = self.td_multiplier(player.team, player.opponent)
+            if td_mult != 1.0:
+                pass_td *= td_mult
+            return max(0.0, float(pass_td))
+        return max(
+            0.0,
+            float(sum(line.rec_td for line in opportunities.team_receiving)),
         )
 
     def points(

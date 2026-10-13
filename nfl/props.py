@@ -2,8 +2,9 @@
 
 Volume lines (pass/rush/rec yards, receptions, pass TDs) are a ±20% tilt on
 implied, not an override. NFL scoring includes 100/300 bonuses when the *line*
-is ≥ threshold. Jr. name join via match_key. Missing props → model path
-(factor 1.0).
+is ≥ threshold. Name join is ``match_key`` on the board and on the pool
+(Jr/Sr/II/III/IV/V stripped), so ``Patrick Mahomes II`` attaches to
+``Patrick Mahomes``. Missing props → model path (factor 1.0).
 
 Game lines (spreads/totals) come from gangstash in nfl/lines.py. This module
 does not call The Odds API.
@@ -217,6 +218,9 @@ def props_for_week(
 
 def rows_to_props(rows: list[dict]) -> tuple[dict[str, PlayerProp], dict]:
     """Collapse board rows into one PlayerProp per match_key.
+
+    ``player_name`` is keyed with ``match_key`` (generational suffix stripped).
+    ``ingest_slate_props`` buckets the pool with the same key.
 
     Newer scraped_at wins for the same player and field. Same timestamp and a
     different line keeps the first value and records a conflict. Unknown prop

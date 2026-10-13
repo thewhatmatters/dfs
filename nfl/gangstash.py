@@ -26,9 +26,11 @@ Never send a Supabase service-role key.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import urllib.parse
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -42,6 +44,67 @@ DATA_CACHE_DIR = Path(__file__).resolve().parent / "data" / "gangstash-data"
 # /data pages are 1,000 rows. The server caps a result at 20,000.
 PAGE_SIZE = 1000
 MAX_ROWS = 20_000
+
+# Active only inside ``capture_pulls``. Fetches stay byte-identical either way.
+_PULLS: list[dict] | None = None
+
+
+@contextmanager
+def capture_pulls():
+    """Record each successful gangstash fetch for the holdout manifest."""
+    global _PULLS
+    previous = _PULLS
+    current: list[dict] = []
+    _PULLS = current
+    try:
+        yield current
+    finally:
+        _PULLS = previous
+
+
+def _record_pull(dataset: str, rows: list, meta: dict, params: dict | None) -> None:
+    if _PULLS is None:
+        return
+    try:
+        cache = meta.get("cache")
+        path = Path(cache) if cache else None
+        if path is not None and path.is_file():
+            raw = path.read_bytes()
+            digest = hashlib.sha256(raw).hexdigest()
+            pulled = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).isoformat()
+        else:
+            blob = json.dumps(rows, sort_keys=True, default=str).encode("utf-8")
+            digest = hashlib.sha256(blob).hexdigest()
+            pulled = datetime.now(timezone.utc).isoformat()
+        _PULLS.append(
+            {
+                "dataset": dataset,
+                "sha256": digest,
+                "n_rows": len(rows),
+                "pulled_at": pulled,
+                "cache": None if path is None else str(path),
+                "live": bool(meta.get("live")),
+                "params": {str(k): str(v) for k, v in sorted((params or {}).items())},
+            }
+        )
+    except Exception as exc:
+        _PULLS.append(
+            {
+                "dataset": dataset,
+                "sha256": None,
+                "n_rows": len(rows) if isinstance(rows, list) else None,
+                "pulled_at": None,
+                "cache": meta.get("cache"),
+                "live": bool(meta.get("live")),
+                "params": {},
+                "error": str(exc),
+            }
+        )
+
+
+def _return_rows(dataset: str, rows: list, meta: dict, params: dict | None = None):
+    _record_pull(dataset, rows, meta, params)
+    return rows, meta
 
 # Logical dataset → env override. Defaults are the live `dataset=` values.
 DATASET_ENV = {
@@ -333,12 +396,17 @@ def fetch_props(
     if not refresh and not filtered and today_path.is_file() and today_path.stat().st_size > 2:
         payload = _read_payload(today_path)
         _reject_truncated(payload, filtered=False)
-        return list(payload["data"]), client_meta(
-            payload,
-            cache=str(today_path),
-            cache_stale=False,
-            live=False,
-            dataset="props",
+        return _return_rows(
+            "props",
+            list(payload["data"]),
+            client_meta(
+                payload,
+                cache=str(today_path),
+                cache_stale=False,
+                live=False,
+                dataset="props",
+            ),
+            _prop_params(player_name, prop, season, week),
         )
 
     try:
@@ -358,12 +426,17 @@ def fetch_props(
             ) from None
         payload, path = cached
         _reject_truncated(payload, filtered=False)
-        return list(payload["data"]), client_meta(
-            payload,
-            cache=str(path),
-            cache_stale=path != today_path,
-            live=False,
-            dataset="props",
+        return _return_rows(
+            "props",
+            list(payload["data"]),
+            client_meta(
+                payload,
+                cache=str(path),
+                cache_stale=path != today_path,
+                live=False,
+                dataset="props",
+            ),
+            _prop_params(player_name, prop, season, week),
         )
     except GangstashError:
         if refresh or filtered:
@@ -373,12 +446,17 @@ def fetch_props(
             raise
         payload, path = cached
         _reject_truncated(payload, filtered=False)
-        return list(payload["data"]), client_meta(
-            payload,
-            cache=str(path),
-            cache_stale=True,
-            live=False,
-            dataset="props",
+        return _return_rows(
+            "props",
+            list(payload["data"]),
+            client_meta(
+                payload,
+                cache=str(path),
+                cache_stale=True,
+                live=False,
+                dataset="props",
+            ),
+            _prop_params(player_name, prop, season, week),
         )
 
     _reject_truncated(payload, filtered=filtered)
@@ -391,7 +469,25 @@ def fetch_props(
     )
     if not filtered:
         meta["cache"] = str(_write_cache(day, payload))
-    return list(payload["data"]), meta
+    return _return_rows(
+        "props",
+        list(payload["data"]),
+        meta,
+        _prop_params(player_name, prop, season, week),
+    )
+
+
+def _prop_params(player_name, prop, season, week) -> dict:
+    params = {}
+    if player_name:
+        params["player"] = player_name
+    if prop:
+        params["prop"] = prop
+    if season is not None:
+        params["season"] = str(int(season))
+    if week is not None:
+        params["week"] = str(int(week))
+    return params
 
 
 def dataset_id(logical: str) -> str:
@@ -544,12 +640,17 @@ def fetch_dataset(
     if not refresh and today_path.is_file() and today_path.stat().st_size > 2:
         payload = _read_payload(today_path)
         _reject_truncated(payload, filtered=False, label=name)
-        return list(payload["data"]), client_meta(
-            payload,
-            cache=str(today_path),
-            cache_stale=False,
-            live=False,
-            dataset=name,
+        return _return_rows(
+            name,
+            list(payload["data"]),
+            client_meta(
+                payload,
+                cache=str(today_path),
+                cache_stale=False,
+                live=False,
+                dataset=name,
+            ),
+            query,
         )
 
     try:
@@ -564,12 +665,17 @@ def fetch_dataset(
             ) from None
         payload, path = cached
         _reject_truncated(payload, filtered=False, label=name)
-        return list(payload["data"]), client_meta(
-            payload,
-            cache=str(path),
-            cache_stale=path != today_path,
-            live=False,
-            dataset=name,
+        return _return_rows(
+            name,
+            list(payload["data"]),
+            client_meta(
+                payload,
+                cache=str(path),
+                cache_stale=path != today_path,
+                live=False,
+                dataset=name,
+            ),
+            query,
         )
     except GangstashDataError:
         if refresh:
@@ -579,21 +685,31 @@ def fetch_dataset(
             raise
         payload, path = cached
         _reject_truncated(payload, filtered=False, label=name)
-        return list(payload["data"]), client_meta(
-            payload,
-            cache=str(path),
-            cache_stale=True,
-            live=False,
-            dataset=name,
+        return _return_rows(
+            name,
+            list(payload["data"]),
+            client_meta(
+                payload,
+                cache=str(path),
+                cache_stale=True,
+                live=False,
+                dataset=name,
+            ),
+            query,
         )
 
     _reject_truncated(payload, filtered=False, label=name)
     today_path.parent.mkdir(parents=True, exist_ok=True)
     today_path.write_text(json.dumps(payload), encoding="utf-8")
-    return list(payload["data"]), client_meta(
-        payload,
-        cache=str(today_path),
-        cache_stale=False,
-        live=True,
-        dataset=name,
+    return _return_rows(
+        name,
+        list(payload["data"]),
+        client_meta(
+            payload,
+            cache=str(today_path),
+            cache_stale=False,
+            live=True,
+            dataset=name,
+        ),
+        query,
     )

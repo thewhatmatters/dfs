@@ -44,6 +44,8 @@ spread_sigma = 10 × scale_game
 
 `1.15` is the per-play EPA standard deviation that leaves the sigmas at the old constants (`0.12` and `10`). Missing variance uses scale `1`.
 
+`--sim-mode team` (default `off`) replaces that draw with a bivariate normal on the total and the FanDuel home spread. The SDs and correlation are the 2024 regular-season closing-line residuals (272 games, sample SD, FanDuel spread sign): total SD `12.4874`, spread SD `12.6228`, correlation `-0.0832`. They are not scaled by EPA variance. Pass yards, pass TDs, pass attempts, and rush attempts are then multiplied by `1 + 0.6901 × (team points / implied − 1)`. `0.6901` is the 2024 week-1 bisection that matches the sim's mean QB–opp DEF correlation to the 2024 actual Pearson, `-0.4663`. A constant per team puts the mean of pass volume and of rush volume back on the unscaled anchor, because the margin script already moves the other way. After the draws, one additive constant per player puts that player's mean back on the default-mode mean. Correlations are unchanged by that constant. The default mode does not take this branch. If those constants are missing, or a game has no finite closing total and spread, that game keeps the default draw and the sim logs a warning. It does not raise.
+
 **Scoring variance for a team** is the mean of:
 
 - that team's **offense** EPA variance
@@ -225,9 +227,35 @@ python3 -m nfl.optimize --csv "nfl/data/<players-list>.csv" --sim \
 
 Fixture: `nfl/testdata/sim_layers.json` (DET offense/defense EPA sums, four weeks of swapping WR target shares, Gibbs target shares, no snaps).
 
+## What publish stores from the draws
+
+`python3 -m nfl.publish_projections --sim N --sim-mode team` writes both
+tables from one run. Player rows go to `/functions/v1/projections` as
+`{"rows": [...]}`. Game rows are a second POST to that same URL as
+`{"game_projections": [...]}` (see [`projections.md`](projections.md)).
+
+Each skill draw keeps an expected scoring-TD count: rush TDs plus
+receiving TDs. Publish samples an integer from Poisson of that
+expectation on a second `random.Random` seeded with the sim seed. That
+generator does not advance the fantasy-point RNG. The samples are
+counted in `td_0`, `td_1`, `td_2`, and `td_3plus` (those four sum to
+`n_draws`). `td_mean` is the mean of the expectations, not the samples.
+`anytime_td_prob` is `1 - td_0 / n_draws`. For a near-constant
+expectation that is within Monte Carlo noise of `1 - exp(-td_mean)`.
+
+QBs also sample Poisson of the passing-TD expectation the scorer used
+that draw, on the same side RNG. In team / opportunity mode that
+expectation is the sum of the team's drawn receiving TDs (rostered
+catchers plus the other bucket). On the fallback path it is the pass-TD
+anchor scaled by the drawn score. `pass_td_mean` is the mean of those
+expectations. `total_td_mean` is the mean of rush + receiving + passing
+expectations. `total_td_0` .. `total_td_3plus` count the rush+rec sample
+plus the pass sample. Non-QBs omit `pass_td_mean` and every `total_td_*`
+field. DEF and role-share skill rows omit the TD block.
+
 ## Seeds
 
-One `random.Random(seed)` for the slate. Games run in game-id order, players in pid order. Inside an opportunity team the order is: plays gaussian, target-share gammas (pid order, then the other bucket), rush-share gammas when snaps or carries exist, then one yards gaussian per receiving line (catchers, then the other bucket), then one team pass-yard gaussian around the anchor (skipped when the anchor is 0). Scoring then draws rush yards when that player has rushes. Share draws stay on the gamma sequence. Empty inputs add no draws beyond the total and the spread.
+One `random.Random(seed)` for the slate. A second `random.Random(seed)` samples the integer TDs and is not advanced by the score draws. Games run in game-id order, players in pid order. Inside an opportunity team the order is: plays gaussian, target-share gammas (pid order, then the other bucket), rush-share gammas when snaps or carries exist, then one yards gaussian per receiving line (catchers, then the other bucket), then one team pass-yard gaussian around the anchor (skipped when the anchor is 0). Scoring then draws rush yards when that player has rushes. Share draws stay on the gamma sequence. Empty inputs add no draws beyond the total and the spread.
 
 ## Backtest
 
@@ -242,12 +270,22 @@ The reader is `fetch_player_stats_weekly` (`dataset=player_stats_weekly&season=&
 
 ## Holdout
 
-`python3 -m nfl.holdout` repeats that backtest across weeks and seasons and only measures. It does not change the ILP or the sim. There is no CSV: the pool is the depth chart. Inputs are still weeks before the target. Week 1 stays empty unless `--seed-prior-season` loads the prior season's week 18 (default off).
+`python3 -m nfl.holdout` repeats that backtest across weeks and seasons and only measures. It does not change the ILP. `--sim-mode` defaults to `off` (the current draws). `team` is the opt-in joint total and spread. There is no CSV: the pool is the depth chart. Inputs are still weeks before the target. Week 1 stays empty unless `--seed-prior-season` loads the prior season's week 18 (default off).
 
 ```bash
 python3 -m nfl.holdout --season 2024 --weeks 1-18 --n 3000 --json-out results/holdout-2024.json
 python3 -m nfl.holdout --season 2025 --weeks 1-18 --n 3000 --json-out results/holdout-2025.json
 python3 -m nfl.holdout --season 2026 --weeks 2 --n 3000 --json-out results/holdout-2026-w2.json
+python3 -m nfl.holdout --season 2024 --weeks 1-18 --n 3000 --sim-mode team --json-out results/holdout-2024-team.json
 ```
 
 `--seasons 2024,2025` scores both. Each week runs the placeholder sim and the data sim. The text and the JSON report pooled starters and the full pool (mean error and MAE by position for board, sim-placeholder, and sim-data), calibration (share of actuals at or below the 10th through 90th percentile of that player's draws, and p10–p90 coverage), the SD of simulated game margin and total against the actual games and against closing-line residuals, Pearson correlations for QB–WR1, QB–TE1, QB–RB1, QB vs opposing DEF, QB vs opposing QB, and WR1–WR2, and the average weekly Spearman of projection vs actual. One week (the last requested week other than week 1) is rerun with opponent pass and rush multipliers, pace, red-zone TD rate, and depth-1 target/carry shares moved ±10%. `props_closing` is the prop baseline when that season has rows; 2024, 2025, and 2026 weeks 1–2 skip it.
+
+`--population pregame` (default) counts depth-chart starters even when the box score is zero or missing. A missing stats row scores 0 unless injuries list them Out or IR before their kickoff. Injury rows are read as gangstash sends them: `report_status`, `full_name`, `gsis_id` / `player_key`, and `date_modified` (`status` and `player_name` still work). A row with no `date_modified` is the weekly report and is pre-game. A timestamp is compared with that team's `depth_charts_weekly.kickoff_at` (closing `kickoff` is often null; `game_lines.commence_time` fills any team the chart missed). If no kickoff can be joined, the report says `kickoff missing` and those timestamped Out/IR rows stay in. A starter with no injury row at all stays as a zero and is counted as `kept-zero-no-injury-row`. Headline starter MAE and p10–p90 coverage are printed with that bucket and without it. Actuals match `gsis_id` first and the name second. `--population played` is the old name-only join, does not invent a zero, and does not skip duplicate draws. The duplicate-draw skip applies only to pregame. Monte Carlo SE and CI columns print four decimal places. The default report does not import NumPy or SciPy, so a machine without those libraries still prints the tables above.
+
+`--metrics`, more than one `--seeds` value, or `--draws-out` requests the scoring block. That path imports NumPy and SciPy and, if either is missing, exits with `choke HOLDOUT_METRICS:` and `pip3 install -r requirements.txt`. `--seeds 1,2,3` (at most five) reruns the sims and reports a Monte Carlo SE for starter MAE, rank correlation, coverage, game-total SD, and the correlation checks: mean across seeds, `sd(ddof=1)/sqrt(n)`, Student-t 95% half-width. The legacy one-seed tables stay the first seed. New JSON keys, only when metrics are on, are `scores` (PIT, p10–p90 and p25–p75 coverage, CRPS, Brier and log score, week-block bootstrap), `paired` (board vs placeholder vs data), `residual_correlations` (Fisher z on residuals; the old `correlations` block is unchanged), `mc_se`, and `draws`. With `--json-out results/holdout-2024.json` and metrics on, the run also writes `results/holdout-2024.draws.npz` (full draws, or q01–q99 when each row has more than 250 draws) and `results/holdout-2024.manifest.json` (git sha, dirty flag, seeds, draw count, sha256 and row count and pull time of every gangstash dataset, CLI args, Python/NumPy/SciPy versions). A JSON report without metrics still writes the manifest; NumPy and SciPy versions are null.
+
+```bash
+python3 -m nfl.holdout --season 2024 --weeks 1-18 --n 3000 --seeds 1,2,3 \
+  --population pregame --json-out results/holdout-2024.json
+```

@@ -11,7 +11,11 @@ x-api-key: $GANGSTASH_API_KEY
 
 The server also accepts `Authorization: Bearer`. This client sends
 `x-api-key` only. Never put the key in the URL. Never send a Supabase
-service-role key.
+service-role key on `/functions/v1` or `/data`.
+
+Team-mode game rows use the projections writer key on
+`POST /functions/v1/projections` (`{"game_projections": [...]}`), not a
+service-role key. See [`projections.md`](projections.md).
 
 Response: `{ "data": [ ... ], "truncated": bool, "meta": { ... } }`.
 `data` and `truncated` are unchanged. `meta` is data API v12: `dataset`,
@@ -106,7 +110,7 @@ python3 -m nfl.gangstash_data team-stats-weekly --season 2026 --week 1,2
 | `GANGSTASH_GAME_LINE_SNAPSHOTS_DATASET` | `game_line_snapshots` | `dataset=` value |
 | `GANGSTASH_PROPS_SNAPSHOTS_DATASET` | `props_snapshots` | `dataset=` value |
 | `GANGSTASH_INJURY_SNAPSHOTS_DATASET` | `injury_snapshots` | `dataset=` value |
-| `GANGSTASH_COLLECTOR_RUNS_DATASET` | `collector_runs` | `dataset=` value |
+| `GANGSTASH_COLLECTOR_RUNS_DATASET` | `collector_runs` | `dataset=` value. Publish-gate freshness |
 
 ## Queries this client sends
 
@@ -128,6 +132,7 @@ python3 -m nfl.gangstash_data team-stats-weekly --season 2026 --week 1,2
 | `injury_snapshots` | `season` required; same filters as `injuries` (`week`, `team`, `gsis_id`, `status`); optional `as_of` | append-only. Rows use `full_name` and `report_status`. `is_baseline=true` rows are seeded copies, not scrape times. Publish drops them before scoring and does not treat their timestamps as `observed_at` |
 | `collector_runs` | optional `collector`, `date_from`, `date_to` (inclusive UTC days of `started_at`) | `run_id`, `collector`, `started_at`, `finished_at`, `status`, `row_counts`, `git_sha`, `args`. `as_of`, `season`, and `week` are not sent. `as_of` on this dataset is a client error |
 | `snaps` | `season` (required), `week` (single or `1,2`), optional `position` (`WR`/`TE`/`RB`), `team` (FD or nflverse; `JAC` and `JAX` both work) | 2026 weeks 1–2 are 2,994 rows (185 RB, 335 WR, 220 TE). `offense_pct` is a 0–1 fraction |
+| `collector_runs` | optional `collector` | Data Aggregator run log. Publish-gate age is the latest `finished_at` with `status=succeeded`. Latest row by `started_at` blocks on `partial`, `failed`, or `running` older than 30 minutes. Not `updated_at` / `as_of` |
 
 ## Response fields
 
@@ -208,8 +213,10 @@ player. `Q` keeps the pre-game projection. Nightly projections read this
 week feed (not `injury_snapshots`): `O` / `IR` / `NA` leave the sim at
 mean 0. Only that position group is renumbered. The player who fills an
 Out slot keeps the higher of their own target/snap share and the vacated
-share; a healthy teammate's share is not passed down. `D` stays
-at full value and is flagged; `Q` is unchanged. A FanDuel CSV `Injury
+share; a healthy teammate's share is not passed down. Who projects 0
+is `--availability-rule` in `nfl/docs/data/projections.md` (default:
+Out/IR/NA and Doubtful are 0; `Q` and practice-only statuses stay).
+A FanDuel CSV `Injury
 Indicator` of `O` / `IR` / `NA` is the same drop when a CSV is supplied.
 A failed injuries fetch on a CSV pool is not listed as missing. No-CSV
 mode has no indicator column, so a failed fetch is `missing: injuries`

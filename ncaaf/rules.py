@@ -5,7 +5,7 @@ code seam the optimizer and tests share — change the doc and this file togethe
 """
 
 from dataclasses import dataclass, field
-from typing import FrozenSet
+from typing import Dict, FrozenSet, List, Tuple
 
 
 @dataclass(frozen=True)
@@ -15,7 +15,7 @@ class FanDuelNcaafClassic:
     salary_cap: int = 60_000
     # House rule (not FanDuel): spend at least this much. 0 disables.
     salary_floor: int = 58_000
-    roster: tuple[tuple[str, int, FrozenSet[str]], ...] = (
+    roster: Tuple[Tuple[str, int, FrozenSet[str]], ...] = (
         ("QB", 1, frozenset({"QB"})),
         ("RB", 2, frozenset({"RB"})),
         ("WR", 3, frozenset({"WR", "TE"})),
@@ -26,7 +26,7 @@ class FanDuelNcaafClassic:
     min_teams: int = 3
     max_per_team: int = 4
     # CFB official table has no yardage bonuses (unlike FanDuel NFL).
-    scoring: dict[str, float] = field(
+    scoring: Dict[str, float] = field(
         default_factory=lambda: {
             "pass_yd": 0.04,
             "pass_td": 4.0,
@@ -48,8 +48,8 @@ class FanDuelNcaafClassic:
     questionable_codes: FrozenSet[str] = frozenset({"Q", "D"})
 
     @property
-    def slot_names(self) -> list[str]:
-        names: list[str] = []
+    def slot_names(self) -> List[str]:
+        names: List[str] = []
         for slot, count, _elig in self.roster:
             if count == 1:
                 names.append(slot)
@@ -80,7 +80,7 @@ FANDUEL_NCAAF = FanDuelNcaafClassic()
 
 # FanDuel classic picker order (lobby: Select QB, RB, RB, WR, WR, WR, Super FLEX).
 # Internal keys stay unique (RB1/RB2/…) for the ILP.
-FANDUEL_PICKER_ORDER: tuple[tuple[str, str], ...] = (
+FANDUEL_PICKER_ORDER: Tuple[Tuple[str, str], ...] = (
     ("QB", "QB"),
     ("RB1", "RB"),
     ("RB2", "RB"),

@@ -39,6 +39,16 @@ The CLI flag is ``--sim-efficiency {placeholder,data}`` (default
 attempts on the implied script and redistributes the rush-yard budget.
 It does not also scale attempts.
 
+``--sim-mode team`` is opt-in (default ``off``). Team mode draws the total
+and the home spread from a bivariate normal fit on 2024 closing-line
+residuals, then scales that team's pass and rush volume and TDs by a
+damped function of drawn points / implied. A constant restores the
+mean of that product, and one additive constant per player puts the
+player's mean back on the default-mode mean. The default mode does not
+take that branch and keeps the same RNG sequence. Missing fitted
+constants, or a game with no closing total and spread, keep that
+default draw and log a warning. Team mode does not raise.
+
 Inputs are ``SimInputs`` (team stats, weekly targets, optional snaps).
 The sim does not call Gangstash. Empty inputs reproduce the role-share
 fallback and do not add RNG draws.
@@ -60,10 +70,11 @@ import hashlib
 import inspect
 import math
 import random
+import sys
 from dataclasses import dataclass, field, replace
 from typing import Optional, Tuple
 
-from nfl.injuries import is_inactive
+from nfl.injuries import Availability, injury_code, is_inactive, is_ruled_out
 from nfl.names import match_key
 from nfl.players import Player
 from nfl.projections import (
@@ -97,6 +108,13 @@ from nfl.sim_efficiency import (
     shrink,
 )
 from nfl.sim_inputs import CarryWeek, SimInputs, SnapWeek, TargetWeek, TeamStat
+from nfl.sim_team import (
+    TEAM_SCORE_DAMP,
+    draw_total_and_spread,
+    fitted_constants_ready,
+    parse_sim_mode,
+    production_scale,
+)
 
 DEFAULT_DRAWS = 10_000
 DEFAULT_SEED = 1
@@ -219,6 +237,9 @@ class GameSim:
     # One row per parsed game per world: (game, away, home, away_pts, home_pts).
     # Recorded after the total and spread draws. No extra RNG.
     game_draws: tuple[tuple[str, str, str, float, float], ...] = ()
+    # Rush+rec (and, for QBs, pass) TD tallies. One object per player, updated
+    # in the draw loop. Absent when that path has no TD count (DEF, role-share skill).
+    td_tallies: dict[str, TdTally] = field(default_factory=dict)
 
     def lineup_stats(self, pids: list[str]) -> SimStats | None:
         cols = [self.draws[p] for p in pids if p in self.draws]
@@ -325,15 +346,66 @@ def simulate_games(
     seed: int = DEFAULT_SEED,
     inputs: SimInputs | None = None,
     efficiency: EfficiencyModel | None = None,
+    sim_mode: str = "off",
+    score_damp: float | None = None,
+    availability_rule: str | None = None,
+    zero_doubtful: bool = True,
 ) -> GameSim:
     """n slate worlds. Players in a game share total+margin; games do not.
 
     ``inputs`` turns on EPA dispersion, scripted volume, and Dirichlet
     shares. ``None`` or an empty bundle keeps deterministic role shares
     and the fixed total/spread sigmas (same RNG steps as before).
+
+    ``sim_mode="off"`` (default) is that path. ``team`` draws a joint
+    total and spread and scales production by the drawn team score.
+    ``score_damp`` overrides the fitted damp; the fit CLI uses it.
+
+    ``availability_rule=None`` is the historical draw (same seed, same
+    players). ``legacy`` drops Out/IR/NA/SUSP and blanks Doubtful before
+    that draw. ``ruled-out`` keeps those players in the opportunity
+    prep so the next active player at the position inherits the share,
+    and does not score them.
     """
+    mode = parse_sim_mode(sim_mode)
+    damp = None
+    team_on = False
+    if mode == "team":
+        if not fitted_constants_ready():
+            _sim_warn(
+                "sim-mode team: fitted constants missing; using the default draw"
+            )
+            mode = "off"
+        else:
+            chosen = TEAM_SCORE_DAMP if score_damp is None else score_damp
+            if not _finite_number(chosen):
+                _sim_warn(
+                    "sim-mode team: fitted constants missing; using the default draw"
+                )
+                mode = "off"
+            else:
+                team_on = True
+                damp = float(chosen)
     if n <= 0:
         return GameSim(by_pid={}, draws={})
+    spec: Availability | None = None
+    active_rule = availability_rule
+    if availability_rule is not None:
+        spec = Availability(rule=availability_rule, zero_doubtful=zero_doubtful)
+        if spec.rule == "legacy":
+            from nfl.sim_feed import sim_pool
+
+            players = sim_pool(list(players), availability=spec)
+            spec = None
+            active_rule = None
+        elif not spec.zero_doubtful:
+            blanked: list[Player] = []
+            for pl in players:
+                if injury_code(pl.injury) == "D":
+                    blanked.append(replace(pl, injury=""))
+                else:
+                    blanked.append(pl)
+            players = blanked
     bundle = inputs or SimInputs()
     index = _HistoryIndex(bundle)
     eff = efficiency or PlaceholderEfficiency()
@@ -347,7 +419,9 @@ def simulate_games(
     for key, group in groups.items():
         for team in _teams_in(group):
             roster = [p for p in group if (p.team or "").upper() == team]
-            preps[(key, team)] = _prepare_opportunity(roster, index)
+            preps[(key, team)] = _prepare_opportunity(
+                roster, index, availability=spec
+            )
     opportunity = frozenset(
         team for (_key, team), prep in preps.items() if prep.catchers
     )
@@ -360,27 +434,80 @@ def simulate_games(
             if preps[(key, team)].catchers
         ]
         slate.append((key, group, team_preps))
+    scale_bias: dict[tuple[str, str], tuple[float, float]] = {}
+    if team_on and damp is not None:
+        for key, group, team_preps in slate:
+            if not _has_closing_lines(group):
+                continue
+            total_mu, spread_mu, away, home = _vegas(group)
+            for prep in team_preps:
+                scale_bias[(key, prep.team)] = _volume_scale_bias(
+                    prep, eff, float(damp), total_mu, spread_mu, away, home
+                )
     rng = random.Random(int(seed))
+    # Integer TD samples only. A second Random with the sim seed does not
+    # advance ``rng``, so fantasy points stay on the main stream.
+    td_rng = random.Random(int(seed))
     raw: dict[str, list[float]] = {p.pid: [] for p in players}
+    td_tallies: dict[str, TdTally] = {}
     score_points = eff.points
     game_rows: list[tuple[str, str, str, float, float]] = []
+    warned_games: set[str] = set()
     for _ in range(n):
         for key, group, team_preps in slate:
-            home_pts, away_pts, away, home = _draw_game(rng, group, index)
+            use_team = team_on and _has_closing_lines(group)
+            if team_on and not use_team and key not in warned_games:
+                warned_games.add(key)
+                _sim_warn(
+                    "sim-mode team: %s has no spread/total; "
+                    "using the default draw for that game" % key
+                )
+            home_pts, away_pts, away, home = _draw_game(
+                rng, group, index, sim_mode="team" if use_team else "off"
+            )
+            game_damp = damp if use_team and away is not None and home is not None else None
             if away is not None and home is not None:
                 game_rows.append(
                     (key, away, home, float(away_pts), float(home_pts))
                 )
             if away is None or home is None:
                 for pl in group:
+                    if spec is not None and is_ruled_out(pl, spec):
+                        raw[pl.pid].append(0.0)
+                        continue
                     team_pts, opp_pts = _solo_world(rng, pl)
                     raw[pl.pid].append(
-                        _score_fallback(pl, team_pts, opp_pts, group, index)
+                        _score_fallback(
+                            pl, team_pts, opp_pts, group, index, score_damp=game_damp
+                        )
+                    )
+                    _note_td(
+                        td_tallies,
+                        pl.pid,
+                        _fallback_scoring_tds(pl, team_pts, group, game_damp),
+                        _qb_pass_td(
+                            pl,
+                            _fallback_pass_tds(
+                                pl, team_pts, group, index, game_damp
+                            ),
+                        ),
+                        td_rng,
                     )
                 continue
             counts: dict[str, OpportunityCount] = {}
             for prep in team_preps:
                 margin = _team_margin(prep.team, home_pts, away_pts, away, home)
+                extra = {}
+                if game_damp is not None:
+                    extra["team_pts"] = _team_points(
+                        prep.team, home_pts, away_pts, away, home
+                    )
+                    extra["score_damp"] = game_damp
+                    pass_bias, rush_bias = scale_bias.get(
+                        (key, prep.team), (1.0, 1.0)
+                    )
+                    extra["pass_scale_bias"] = pass_bias
+                    extra["rush_scale_bias"] = rush_bias
                 counts.update(
                     _draw_team_opportunities(
                         rng,
@@ -389,19 +516,73 @@ def simulate_games(
                         index,
                         eff,
                         prep,
+                        **extra,
                     )
                 )
             for pl in group:
+                if spec is not None and is_ruled_out(pl, spec):
+                    raw[pl.pid].append(0.0)
+                    continue
                 opp_count = counts.get(pl.pid)
                 if opp_count is None:
                     team_pts, opp_pts = _player_world(
                         pl, home_pts, away_pts, away, home
                     )
                     raw[pl.pid].append(
-                        _score_fallback(pl, team_pts, opp_pts, group, index)
+                        _score_fallback(
+                            pl, team_pts, opp_pts, group, index, score_damp=game_damp
+                        )
+                    )
+                    _note_td(
+                        td_tallies,
+                        pl.pid,
+                        _fallback_scoring_tds(pl, team_pts, group, game_damp),
+                        _qb_pass_td(
+                            pl,
+                            _fallback_pass_tds(
+                                pl, team_pts, group, index, game_damp
+                            ),
+                        ),
+                        td_rng,
                     )
                 else:
                     raw[pl.pid].append(score_points(rng, pl, opp_count))
+                    _note_td(
+                        td_tallies,
+                        pl.pid,
+                        _scoring_tds(eff, pl, opp_count),
+                        _qb_pass_td(pl, _scoring_pass_tds(eff, pl, opp_count)),
+                        td_rng,
+                    )
+    if team_on:
+        # Bonuses and the points-allowed buckets are convex in a wider
+        # score, so the raw team-mode mean sits off the default mean.
+        # A per-player constant puts the mean back. Correlations do not
+        # move. Skill scores stay at 0 or above; a DEF may be negative.
+        baseline = simulate_games(
+            players,
+            n=n,
+            seed=seed,
+            inputs=inputs,
+            efficiency=efficiency,
+            sim_mode="off",
+            availability_rule=active_rule,
+            zero_doubtful=zero_doubtful,
+        )
+        dst_pids = {pl.pid for pl in players if _is_dst(pl)}
+        for pid, xs in raw.items():
+            if not xs or pid not in baseline.by_pid:
+                continue
+            # Same summation order as ``_stats`` (sorted). An unsorted sum
+            # can differ by one ulp and would nudge an otherwise identical draw.
+            alt_mean = sum(sorted(xs)) / float(len(xs))
+            shift = alt_mean - float(baseline.by_pid[pid].mean)
+            if abs(shift) < 1e-9:
+                continue
+            if pid in dst_pids:
+                raw[pid] = [value - shift for value in xs]
+            else:
+                raw[pid] = [max(0.0, value - shift) for value in xs]
     draws = {pid: tuple(xs) for pid, xs in raw.items()}
     layered = _layered_pids(groups, opportunity, index)
     by_pid: dict[str, SimStats] = {}
@@ -414,11 +595,17 @@ def simulate_games(
         else:
             src = "model"
         by_pid[pl.pid] = _stats(xs, n=n, source=src)
+    kept_tds = {
+        pid: tally
+        for pid, tally in td_tallies.items()
+        if tally.inputs()
+    }
     return GameSim(
         by_pid=by_pid,
         draws=draws,
         opportunity_teams=opportunity,
         game_draws=tuple(game_rows),
+        td_tallies=kept_tds,
     )
 
 
@@ -490,6 +677,35 @@ def _gauss_floor(rng: random.Random, mu: float, sigma: float, floor: float) -> f
     return max(floor, rng.gauss(mu, sigma))
 
 
+def _sim_warn(message: str) -> None:
+    print("warning: %s" % message, file=sys.stderr)
+
+
+def _finite_number(value: object) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    number = float(value)
+    return number == number and number != float("inf") and number != float("-inf")
+
+
+def _has_closing_lines(group: list[Player]) -> bool:
+    """True when the game has a finite closing total and a finite spread.
+
+    Spread ``0`` is a pick'em and counts. A missing field does not. Team
+    mode needs both; otherwise that game keeps the default draw.
+    """
+    total = None
+    spread = None
+    for player in group:
+        if total is None and _finite_number(player.total):
+            total = float(player.total)
+        if spread is None and _finite_number(player.spread):
+            spread = float(player.spread)
+        if total is not None and spread is not None:
+            return True
+    return False
+
+
 def _game_key(player: Player) -> str:
     game = (player.game or "").strip()
     return game if game else f"solo:{player.pid}"
@@ -553,26 +769,32 @@ def _draw_game(
     rng: random.Random,
     group: list[Player],
     index: _HistoryIndex | None = None,
+    sim_mode: str = "off",
 ) -> tuple[float, float, str | None, str | None]:
     total_mu, spread_home_mu, away, home = _vegas(group)
     if away is None or home is None:
         # Unparsed tag: independent team totals. No RNG here.
         return (0.0, 0.0, None, None)
-    home_var = away_var = None
-    if index is not None and away and home:
-        home_var = index.scoring_var(home, away)
-        away_var = index.scoring_var(away, home)
-    total_sigma, spread_sigma = game_sigmas(total_mu, home_var, away_var)
-    total_d = _gauss_floor(
-        rng,
-        total_mu,
-        total_sigma,
-        2.0 * TEAM_POINTS_FLOOR,
-    )
-    if spread_sigma <= 0:
-        spread_d = spread_home_mu
+    if sim_mode == "team":
+        total_d, spread_d = draw_total_and_spread(rng, total_mu, spread_home_mu)
+        if total_d < 2.0 * TEAM_POINTS_FLOOR:
+            total_d = 2.0 * TEAM_POINTS_FLOOR
     else:
-        spread_d = rng.gauss(spread_home_mu, spread_sigma)
+        home_var = away_var = None
+        if index is not None and away and home:
+            home_var = index.scoring_var(home, away)
+            away_var = index.scoring_var(away, home)
+        total_sigma, spread_sigma = game_sigmas(total_mu, home_var, away_var)
+        total_d = _gauss_floor(
+            rng,
+            total_mu,
+            total_sigma,
+            2.0 * TEAM_POINTS_FLOOR,
+        )
+        if spread_sigma <= 0:
+            spread_d = spread_home_mu
+        else:
+            spread_d = rng.gauss(spread_home_mu, spread_sigma)
     home_pts = max(TEAM_POINTS_FLOOR, (total_d - spread_d) / 2.0)
     away_pts = max(TEAM_POINTS_FLOOR, (total_d + spread_d) / 2.0)
     return home_pts, away_pts, away, home
@@ -656,14 +878,19 @@ def starter_qb_points(
     player: Player,
     team_pts: float,
     index: _HistoryIndex | None = None,
+    score_damp: float | None = None,
 ) -> float:
     """FanDuel points for the passing QB when catcher history is missing.
 
     Anchors use the neutral pass rate (not the drawn margin) and scale by
     ``team_pts / implied``, so the score stays linear in team points.
+    Team mode passes ``score_damp`` and shrinks that ratio toward 1.
     """
     implied = float(player.implied_total or 0.0)
-    scale = (float(team_pts) / implied) if implied > 0 else 1.0
+    if score_damp is None:
+        scale = (float(team_pts) / implied) if implied > 0 else 1.0
+    else:
+        scale = production_scale(team_pts, implied, score_damp)
     offense = None
     if index is not None:
         offense = index.offense((player.team or "").upper())
@@ -691,24 +918,117 @@ def _score_fallback(
     opp_pts: float,
     group: list[Player],
     index: _HistoryIndex | None,
+    score_damp: float | None = None,
 ) -> float:
     """Role share, except the passing QB (anchors) and his backups (0).
 
     O, D, IR, and NA score 0. They are already out of the target and rush
     shares, so a fallback must not put a role-share stub back on them.
+    ``score_damp`` is team mode only. ``None`` is the default path.
     """
     if is_inactive(player) and not _is_dst(player):
         return 0.0
     if (player.position or "").upper() != "QB":
-        return _score_world(player, team_pts, opp_pts)
+        return _score_world(player, team_pts, opp_pts, score_damp=score_damp)
     team = (player.team or "").upper()
     mates = [p for p in group if (p.team or "").upper() == team] or [player]
     starter = passing_qb(mates)
     if starter is None:
-        return _score_world(player, team_pts, opp_pts)
+        return _score_world(player, team_pts, opp_pts, score_damp=score_damp)
     if starter.pid != player.pid:
         return 0.0
-    return starter_qb_points(player, team_pts, index)
+    return starter_qb_points(player, team_pts, index, score_damp=score_damp)
+
+
+def _scoring_tds(eff: EfficiencyModel, player: Player, opportunities: OpportunityCount) -> float:
+    """Rush + receiving TD expectation for this draw. Does not touch ``rng``."""
+    fn = getattr(eff, "scoring_tds", None)
+    if callable(fn):
+        return max(0.0, float(fn(player, opportunities)))
+    return max(0.0, float(PlaceholderEfficiency().scoring_tds(player, opportunities)))
+
+
+def _scoring_pass_tds(
+    eff: EfficiencyModel, player: Player, opportunities: OpportunityCount
+) -> float:
+    """Passing-TD expectation ``points`` uses. Does not touch ``rng``."""
+    fn = getattr(eff, "scoring_pass_tds", None)
+    if callable(fn):
+        return max(0.0, float(fn(player, opportunities)))
+    return max(0.0, float(PlaceholderEfficiency().scoring_pass_tds(player, opportunities)))
+
+
+def _qb_pass_td(player: Player, value: Optional[float]) -> Optional[float]:
+    """Pass the drawn passing-TD number through for QBs only."""
+    if (player.position or "").upper() != "QB":
+        return None
+    return value
+
+
+def _fallback_scoring_tds(
+    player: Player,
+    team_pts: float,
+    group: list[Player],
+    score_damp: Optional[float],
+) -> Optional[float]:
+    """Starter-QB rush TDs on the role-share path. None when there is no TD draw.
+
+    Passing TDs are not an anytime score. DEF return TDs are not drawn.
+    A non-QB role share is a point total, not a touchdown count.
+    """
+    if _is_dst(player):
+        return None
+    if is_inactive(player):
+        return 0.0
+    if (player.position or "").upper() != "QB":
+        return None
+    team = (player.team or "").upper()
+    mates = [p for p in group if (p.team or "").upper() == team] or [player]
+    starter = passing_qb(mates)
+    if starter is None or starter.pid != player.pid:
+        return 0.0
+    implied = float(player.implied_total or 0.0)
+    if score_damp is None:
+        scale = (float(team_pts) / implied) if implied > 0 else 1.0
+    else:
+        scale = production_scale(team_pts, implied, score_damp)
+    rush = starter_qb_rush_yards(player) * scale
+    rushes = (rush / QB_YPC) if QB_YPC else 0.0
+    return rushes * QB_RUSH_TD_RATE
+
+
+def _fallback_pass_tds(
+    player: Player,
+    team_pts: float,
+    group: list[Player],
+    index: _HistoryIndex | None,
+    score_damp: Optional[float],
+) -> Optional[float]:
+    """Passing TDs ``starter_qb_points`` uses. None when this path has no TD draw.
+
+    Starter: ``pass_td_anchor * scale``. Backup QB: 0. Non-QB and DEF: None.
+    """
+    if _is_dst(player):
+        return None
+    if (player.position or "").upper() != "QB":
+        return None
+    if is_inactive(player):
+        return 0.0
+    team = (player.team or "").upper()
+    mates = [p for p in group if (p.team or "").upper() == team] or [player]
+    starter = passing_qb(mates)
+    if starter is None or starter.pid != player.pid:
+        return 0.0
+    implied = float(player.implied_total or 0.0)
+    if score_damp is None:
+        scale = (float(team_pts) / implied) if implied > 0 else 1.0
+    else:
+        scale = production_scale(team_pts, implied, score_damp)
+    offense = None
+    if index is not None:
+        offense = index.offense(team)
+    rate = neutral_pass_rate_of(offense)
+    return pass_td_anchor(implied, rate, player.prop_pass_tds) * scale
 
 
 # pid plus every input of the product below. ``id(player)`` is reused after
@@ -748,15 +1068,38 @@ def _role_coef(player: Player) -> float:
     return coef
 
 
-def _score_world(player: Player, team_pts: float, opp_pts: float) -> float:
+def _score_world(
+    player: Player,
+    team_pts: float,
+    opp_pts: float,
+    score_damp: float | None = None,
+) -> float:
     if _is_dst(player):
         return dst_pa_points(opp_pts) + DST_SACK_TO_PRIOR
-    pts = float(team_pts) * _role_coef(player)
+    if score_damp is None:
+        pts = float(team_pts) * _role_coef(player)
+        if has_volume_props(player):
+            pts *= prop_factor(model_point(player), player.prop_fd)
+            implied = float(player.implied_total or 0.0)
+            scale = (float(team_pts) / implied) if implied > 0 else 1.0
+            drawn: dict[str, float] = {}
+            for attr, key in YARD_FIELDS:
+                line = getattr(player, attr)
+                if line is not None:
+                    drawn[key] = float(line) * scale
+            pts += yardage_bonuses(drawn)
+        return max(0.0, pts)
+    implied = float(player.implied_total or 0.0)
+    if implied > 0:
+        scale = production_scale(team_pts, implied, score_damp)
+        effective = implied * scale
+    else:
+        scale = 1.0
+        effective = float(team_pts)
+    pts = effective * _role_coef(player)
     if has_volume_props(player):
         pts *= prop_factor(model_point(player), player.prop_fd)
-        implied = float(player.implied_total or 0.0)
-        scale = (float(team_pts) / implied) if implied > 0 else 1.0
-        drawn: dict[str, float] = {}
+        drawn = {}
         for attr, key in YARD_FIELDS:
             line = getattr(player, attr)
             if line is not None:
@@ -1356,6 +1699,20 @@ def _team_margin(
     return 0.0
 
 
+def _team_points(
+    team: str,
+    home_pts: float,
+    away_pts: float,
+    away: str | None,
+    home: str | None,
+) -> float:
+    if home and team == home:
+        return float(home_pts)
+    if away and team == away:
+        return float(away_pts)
+    return 0.0
+
+
 def _layered_pids(
     groups: dict[str, list[Player]],
     opportunity: frozenset[str],
@@ -1709,7 +2066,49 @@ class _OppPrep:
         self.plays_mu = LEAGUE_PLAYS
 
 
-def _prepare_opportunity(team_players: list[Player], index: _HistoryIndex) -> _OppPrep:
+def _depth_key(player: Player) -> tuple:
+    rank = player.depth_rank if player.depth_rank is not None else 10**9
+    return (rank, -(player.salary or 0), player.pid)
+
+
+def _give_inactive_targets_to_next(
+    catchers: list[Player],
+    means: list[float],
+    inactive: list[Player],
+    inactive_means: list[float],
+) -> tuple[list[float], list[float]]:
+    """Move each inactive target share onto the next active catcher at that position.
+
+    Next is the best remaining depth at the position (lowest rank, then
+    salary, then pid). No active catcher at that position: the share
+    stays inactive so the caller can leave it in the unrostered bucket.
+    The sum of means is unchanged.
+    """
+    moved = list(means)
+    by_pos: dict[str, list[int]] = {}
+    for index, pl in enumerate(catchers):
+        by_pos.setdefault((pl.position or "").upper(), []).append(index)
+    next_index: dict[str, int] = {}
+    for pos, idxs in by_pos.items():
+        next_index[pos] = min(idxs, key=lambda i: _depth_key(catchers[i]))
+    leftover: list[float] = []
+    for pl, share in zip(inactive, inactive_means):
+        portion = float(share)
+        if portion <= 0.0:
+            continue
+        idx = next_index.get((pl.position or "").upper())
+        if idx is None:
+            leftover.append(portion)
+            continue
+        moved[idx] += portion
+    return moved, leftover
+
+
+def _prepare_opportunity(
+    team_players: list[Player],
+    index: _HistoryIndex,
+    availability: Availability | None = None,
+) -> _OppPrep:
     """Catchers, shares, and team rates. No RNG."""
     prep = _OppPrep()
     prep.players = team_players
@@ -1748,6 +2147,14 @@ def _prepare_opportunity(team_players: list[Player], index: _HistoryIndex) -> _O
         mean_target_share(index.target_weeks(pl), index.snap_weeks(pl))
         for pl in inactive
     ]
+    if (
+        availability is not None
+        and availability.rule == "ruled-out"
+        and inactive
+    ):
+        means, inactive_means = _give_inactive_targets_to_next(
+            list(catchers), means, inactive, inactive_means
+        )
     series = [
         _weekly_shares(index.target_weeks(pl), index.snap_weeks(pl))
         for pl in catchers
@@ -1775,6 +2182,65 @@ def _prepare_opportunity(team_players: list[Player], index: _HistoryIndex) -> _O
     return prep
 
 
+def _volume_scale_bias(
+    prep: _OppPrep,
+    eff: EfficiencyModel,
+    damp: float,
+    total_mu: float,
+    spread_mu: float,
+    away: str | None,
+    home: str | None,
+    n: int = 2000,
+) -> tuple[float, float]:
+    """Constants that put E[anchor × score scale] back on E[anchor].
+
+    A private RNG, so the slate draw stream does not move. ``(pass, rush)``.
+    The pass constant covers the yard anchor, the TD anchor, and pass
+    attempts. The rush constant covers rush attempts. Both are 1 when the
+    damp is 0 or the anchor mean is 0.
+    """
+    implied = float(prep.implied)
+    if implied <= 0.0 or float(damp) == 0.0 or away is None or home is None:
+        return 1.0, 1.0
+    team = prep.team
+    starter = prep.starter
+    yard_prop = starter.prop_pass_yds if starter is not None else None
+    td_prop = starter.prop_pass_tds if starter is not None else None
+    offense = prep.offense
+    probe = random.Random(1)
+    pass_num = pass_den = rush_num = rush_den = 0.0
+    for _ in range(int(n)):
+        total_d, spread_d = draw_total_and_spread(probe, total_mu, spread_mu)
+        if total_d < 2.0 * TEAM_POINTS_FLOOR:
+            total_d = 2.0 * TEAM_POINTS_FLOOR
+        home_pts = max(TEAM_POINTS_FLOOR, (total_d - spread_d) / 2.0)
+        away_pts = max(TEAM_POINTS_FLOOR, (total_d + spread_d) / 2.0)
+        if team == home:
+            team_pts = home_pts
+            margin = home_pts - away_pts
+        else:
+            team_pts = away_pts
+            margin = away_pts - home_pts
+        plays = _gauss_floor(probe, prep.plays_mu, PLAYS_SIGMA, PLAYS_FLOOR)
+        rush_rate = scripted_rush_rate(offense, margin)
+        pass_rate = 1.0 - rush_rate
+        yard_anchor = pass_yard_anchor(implied, pass_rate, yard_prop)
+        td_anchor = pass_td_anchor(implied, pass_rate, td_prop)
+        rush_attempts = team_rush_attempts(plays, rush_rate, implied)
+        yard_anchor, rush_attempts, td_anchor = _tilt_anchors(
+            eff, team, prep.opponent, yard_anchor, rush_attempts, td_anchor
+        )
+        scale = production_scale(team_pts, implied, damp)
+        pass_level = yard_anchor + td_anchor
+        pass_num += pass_level
+        pass_den += pass_level * scale
+        rush_num += rush_attempts
+        rush_den += rush_attempts * scale
+    pass_bias = 1.0 if pass_den <= 0.0 else pass_num / pass_den
+    rush_bias = 1.0 if rush_den <= 0.0 else rush_num / rush_den
+    return pass_bias, rush_bias
+
+
 def _draw_team_opportunities(
     rng: random.Random,
     team_players: list[Player],
@@ -1782,6 +2248,10 @@ def _draw_team_opportunities(
     index: _HistoryIndex,
     eff: EfficiencyModel,
     prep: _OppPrep | None = None,
+    team_pts: float | None = None,
+    score_damp: float | None = None,
+    pass_scale_bias: float = 1.0,
+    rush_scale_bias: float = 1.0,
 ) -> dict[str, OpportunityCount]:
     """Plays, script, anchors, joint shares. Empty if no target history.
 
@@ -1789,7 +2259,8 @@ def _draw_team_opportunities(
     pid order (plus an "other" bucket), then rush-share gammas in pid
     order when some RB has snaps or carries, then receiving-line yards
     (catchers, then the other bucket), then one team pass-yard gaussian
-    around the implied-total anchor (skipped when that anchor is 0).
+    around the anchor (implied total by default; the damped team score
+    in team mode; skipped when that anchor is 0).
     Only ``passing_qb`` gets pass attempts and QB rushes; other QBs are
     explicit zeros. Every roster RB gets a rush count so a bellcow does
     not absorb the backup's carries.
@@ -1817,6 +2288,21 @@ def _draw_team_opportunities(
     yard_anchor, rush_attempts, td_anchor = _tilt_anchors(
         eff, team, opponent, yard_anchor, rush_attempts, td_anchor
     )
+    if score_damp is not None and team_pts is not None and implied > 0:
+        # Own drawn score, shrunk toward the implied total. Teammates move
+        # together. The opposing DEF is the points-allowed bucket of these
+        # same points, so the QB moves against that DEF.
+        # Pass and rush each get a constant (pass_scale_bias / rush_scale_bias)
+        # so the mean of anchor × scale stays on the unscaled anchor. The
+        # margin script already moves volume the other way from the score,
+        # and without the constant that product shifts QB/WR down and RBs up.
+        scale = production_scale(team_pts, implied, score_damp)
+        pass_scale = scale * float(pass_scale_bias)
+        rush_scale = scale * float(rush_scale_bias)
+        yard_anchor *= pass_scale
+        td_anchor *= pass_scale
+        pass_attempts *= pass_scale
+        rush_attempts *= rush_scale
     team_targets = pass_attempts * prep.tpa
     drawn = draw_simplex(rng, prep.simplex_means, prep.kappa)
     target_share = {pl.pid: drawn[i] for i, pl in enumerate(catchers)}
@@ -2137,6 +2623,113 @@ def _percentile(sorted_xs: list[float], p: float) -> float:
     hi = min(lo + 1, n - 1)
     w = idx - lo
     return sorted_xs[lo] * (1.0 - w) + sorted_xs[hi] * w
+
+
+def poisson_sample(rng, lam: float) -> int:
+    """Integer draw from Poisson(``lam``) on ``rng`` only.
+
+    ``lam <= 0`` returns 0 and does not consume ``rng``. Knuth's product
+    of uniforms. This is the TD side stream, not the fantasy-point RNG.
+    """
+    rate = float(lam)
+    if rate <= 0.0:
+        return 0
+    if rng is None:
+        raise ValueError("poisson TD sample needs the side RNG")
+    limit = math.exp(-rate)
+    count = 0
+    product = 1.0
+    while product > limit:
+        count += 1
+        product *= rng.random()
+    return count - 1
+
+
+def _count_bin(k: int) -> int:
+    """0, 1, 2, or 3+."""
+    if k <= 0:
+        return 0
+    if k >= 3:
+        return 3
+    return int(k)
+
+
+class TdTally:
+    """Running TD counts. The per-draw expectations are not stored.
+
+    ``td_*`` is rush plus receiving only. Each draw samples
+    Poisson(that draw's rush+rec expectation) on the side RNG and counts
+    the integer in ``td_0`` .. ``td_3plus``. ``td_mean`` is the mean of
+    the expectations, not the samples. ``anytime_td_prob`` is
+    ``1 - td_0 / n_draws``.
+
+    A QB also samples Poisson of the passing-TD expectation the scorer
+    used (the team's receiving TDs, or the pass-TD anchor on the fallback
+    path). ``total_td_*`` counts rush+rec sample plus pass sample.
+    ``pass_td_mean`` and ``total_td_mean`` are means of the expectations.
+    Non-QBs omit ``pass_td_mean`` and every ``total_td_*`` field.
+    """
+
+    def __init__(self) -> None:
+        self.n = 0
+        self.td_sum = 0.0
+        self.bins = [0, 0, 0, 0]
+        self.pass_sum = 0.0
+        self.total_sum = 0.0
+        self.total_bins = [0, 0, 0, 0]
+        self.qb = False
+        self.dropped = False
+
+    def add(self, rush_rec, pass_td=None, rng=None) -> None:
+        if self.dropped:
+            return
+        if rush_rec is None:
+            self.dropped = True
+            return
+        rr = max(0.0, float(rush_rec))
+        self.n += 1
+        self.td_sum += rr
+        scored = poisson_sample(rng, rr)
+        self.bins[_count_bin(scored)] += 1
+        if pass_td is None:
+            return
+        self.qb = True
+        passing = max(0.0, float(pass_td))
+        self.pass_sum += passing
+        self.total_sum += rr + passing
+        passed = poisson_sample(rng, passing)
+        self.total_bins[_count_bin(scored + passed)] += 1
+
+    def inputs(self) -> dict:
+        if self.dropped or self.n <= 0:
+            return {}
+        n = self.n
+        out = {
+            "anytime_td_prob": (n - self.bins[0]) / float(n),
+            "td_mean": round(self.td_sum / float(n), 4),
+            "td_0": self.bins[0],
+            "td_1": self.bins[1],
+            "td_2": self.bins[2],
+            "td_3plus": self.bins[3],
+            "n_draws": n,
+        }
+        if not self.qb:
+            return out
+        out["pass_td_mean"] = round(self.pass_sum / float(n), 4)
+        out["total_td_mean"] = round(self.total_sum / float(n), 4)
+        out["total_td_0"] = self.total_bins[0]
+        out["total_td_1"] = self.total_bins[1]
+        out["total_td_2"] = self.total_bins[2]
+        out["total_td_3plus"] = self.total_bins[3]
+        return out
+
+
+def _note_td(tallies: dict, pid: str, rush_rec, pass_td=None, rng=None) -> None:
+    tally = tallies.get(pid)
+    if tally is None:
+        tally = TdTally()
+        tallies[pid] = tally
+    tally.add(rush_rec, pass_td, rng)
 
 
 def _stats(draws: list[float], *, n: int, source: str) -> SimStats:

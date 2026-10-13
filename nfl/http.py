@@ -66,6 +66,7 @@ def http_json_post(
     headers: dict[str, str] | None = None,
     *,
     timeout: int = 60,
+    error_chars: int = 300,
 ) -> tuple[Any, dict[str, str]]:
     """POST a JSON body. Do not put secrets in `url` or `body`."""
     data = json.dumps(body).encode("utf-8")
@@ -87,7 +88,7 @@ def http_json_post(
             "or run Python's Install Certificates.command"
         ) from e
     except urllib.error.HTTPError as e:
-        payload = e.read().decode("utf-8", errors="replace")[:300]
+        payload = e.read().decode("utf-8", errors="replace")[: int(error_chars)]
         if e.code in {401, 403}:
             raise HttpAuthError(f"HTTP {e.code} (key rejected). {payload}") from e
         raise HttpError(f"HTTP {e.code}: {payload}") from e

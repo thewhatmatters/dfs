@@ -15,17 +15,43 @@ Read key: GANGSTASH_API_KEY (existing /data and /props clients).
 `simulate_games` with the same gangstash `SimInputs` the optimizer
 builds for `--projection-source sim`. `mean` is that simulated mean.
 `--sim-efficiency` matches the optimizer (default `data`).
+`--sim-mode team` is opt-in. The default `off` keeps the current draws.
+`--availability-rule ruled-out` (default) projects 0 for Out, IR, NA, and
+Doubtful and gives that opportunity to the next active player at the
+position. `--availability-rule legacy` is the previous pool.
+`--no-zero-doubtful` keeps Doubtful projected. Practice (DNP, Limited,
+Full) and Questionable stay at full value. See
+`nfl/docs/data/projections.md`.
 The run log prints the effective mode after any fallback, and each sim
-row stores that mode on `inputs.sim_efficiency`. Missing sim inputs
+row stores that mode on `inputs.sim_efficiency`. A sim row also stores
+rush+rec TD bins (`td_0`..`td_3plus`, `n_draws`, `td_mean`,
+`anytime_td_prob`) when the draw has a scoring-TD count. QBs also store
+`pass_td_mean` and `total_td_*`. Missing sim inputs
 fall back to placeholder and the board, and the log says so. The
 nightly publish still posts the board.
+
+`--sim-mode team` also POSTs one row per game to the same
+``/functions/v1/projections`` endpoint, as a second request whose body
+is ``{"game_projections": [...]}``. Both requests use
+``GANGSTASH_PROJECTIONS_WRITER_KEY``. Player rows are sent first.
 
 `GANGSTASH_API_KEY` is required to read game lines, depth, targets,
 snaps, props, and injuries. If it is unset the command exits 1 before posting.
 There is no other read source. `--refresh` (the default) does not
 fall back to a cache when the key is missing.
+
+A publish gate runs before the sim and before any POST. It refuses
+(exit 1, one line per failure) when `collector_runs` says a collector
+is stale or its latest load is partial, failed, or a dead `running`
+process, or when lines, injuries, or depth miss a team that has a game
+this week. Age is the latest succeeded `finished_at`, not the cache
+file mtime and not `updated_at` / `as_of`. `--allow-stale` (alias
+`--skip-gate`) posts anyway and records every failure in the report
+header. `--gate-only` runs the checks and exits. See `nfl/publish_gate.py`.
+
 `--report` writes `nfl/reports/<season>-w<week>-<date>.md` after a
-successful POST or `--dry-run` and prints that path.
+successful POST or `--dry-run` and prints that path. The header lists
+each collector's age and the coverage result.
 Every successful run also writes
 `nfl/reports/<season>-w<week>-<date>.manifest.json` (git sha, dirty
 flag, seed, draws, as_of, CLI args, per-dataset freshness, input run
@@ -34,6 +60,10 @@ the current reads. An explicit `--as-of` reads snapshot datasets and
 writes the manifest, report, and games sidecar under an `asof-` name
 so it does not replace the nightly files. A failed `collector_runs`
 read warns and continues with empty `input_run_ids`.
+`--slate-csv PATH` limits that report to one FanDuel players-list
+(`auto` picks the newest dated file that is today or later in
+America/Chicago). It does not change the rows posted to gangstash.
+A missing or unusable CSV keeps the full report and exits 0.
 """
 
 from __future__ import annotations
@@ -46,7 +76,7 @@ import platform
 import subprocess
 import sys
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -78,11 +108,16 @@ from nfl.gangstash_data import (
     fetch_team_stats,
 )
 from nfl.http import HttpError, http_json_post
-from nfl.injuries import apply_projection_injuries, is_pool_out
+from nfl.injuries import Availability, apply_projection_injuries, is_ruled_out
 from nfl.lines import TeamLine, implied_totals
 from nfl.names import match_key
 from nfl.ourlads import skill_pos
 from nfl.players import Player, load_fanduel_csv
+from nfl.publish_gate import (
+    enforce_publish_gate,
+    gate_allows_stale,
+    gate_header_lines,
+)
 from nfl.projections import (
     implied_core,
     prop_factor,
@@ -194,11 +229,13 @@ class SimResult:
 
     ``by_pid, mode = maybe_sim(...)`` still unpacks. ``game_draws`` is
     ``(game, away, home, away_pts, home_pts)`` per game per draw.
+    ``td_tallies`` is ``pid → TdTally`` (rush + receiving, plus QB passing).
     """
 
     by_pid: dict | None
     efficiency: str
     game_draws: tuple = ()
+    td_tallies: dict = field(default_factory=dict)
 
     def __iter__(self):
         yield self.by_pid
@@ -293,6 +330,67 @@ def _post_chunk(url: str, chunk: list[dict], key: str) -> dict:
     return payload
 
 
+def _game_counts(payload: object) -> tuple[int, int, int]:
+    if not isinstance(payload, dict):
+        raise PublishError("game projections response is not an object")
+    missing = [
+        name
+        for name in ("game_inserted", "game_updated", "game_upserted")
+        if name not in payload
+    ]
+    if missing:
+        raise PublishError(
+            "game projections response missing %s (keys %s)"
+            % (", ".join(missing), sorted(payload))
+        )
+    return (
+        int(payload["game_inserted"]),
+        int(payload["game_updated"]),
+        int(payload["game_upserted"]),
+    )
+
+
+def post_game_projection_rows(
+    rows: list[dict],
+    *,
+    key: str,
+    poster=None,
+) -> tuple[int, int, int]:
+    """POST ``{"game_projections": ...}`` with the writer key.
+
+    Separate from the player ``rows`` request so a game-row 400 does not
+    block players that were already accepted.
+    """
+    if not rows:
+        return 0, 0, 0
+    if not key:
+        raise ProjectionsKeyMissing("GANGSTASH_PROJECTIONS_WRITER_KEY is not set")
+    send = poster or _post_game_chunk
+    try:
+        payload = send(PROJECTIONS_URL, rows, key)
+    except PublishError:
+        raise
+    except (HttpError, GangstashError) as e:
+        raise PublishError(_redact(str(e), key)) from e
+    except Exception as e:
+        raise PublishError(_redact(str(e), key)) from e
+    return _game_counts(payload)
+
+
+def _post_game_chunk(url: str, rows: list[dict], key: str) -> dict:
+    if "?" in url or key in url or "api_key=" in url or "apikey=" in url.lower():
+        raise PublishError("refusing to put the projections key in the URL")
+    payload, _hdrs = http_json_post(
+        url,
+        {"game_projections": rows},
+        headers={"x-api-key": key},
+        error_chars=4000,
+    )
+    if not isinstance(payload, dict):
+        raise PublishError("game projections response is not an object")
+    return payload
+
+
 def load_simulate_games():
     """Return simulate_games, or None when the sim module is unavailable."""
     try:
@@ -320,6 +418,26 @@ def missing_read_key_message(detail: str) -> str:
     )
 
 
+def _availability_from_args(args: argparse.Namespace) -> Availability:
+    return Availability(
+        rule=getattr(args, "availability_rule", "ruled-out"),
+        zero_doubtful=bool(getattr(args, "zero_doubtful", True)),
+    )
+
+
+def _accepts_keyword(fn: object, name: str) -> bool:
+    """True when ``fn`` can take ``name`` without a TypeError."""
+    import inspect
+
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    if name in params:
+        return True
+    return any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+
+
 def maybe_sim(
     entries: list[PublishEntry],
     n: int,
@@ -329,6 +447,8 @@ def maybe_sim(
     refresh: bool,
     week: int | None = None,
     sim_efficiency: str = "data",
+    sim_mode: str = "off",
+    availability: Availability | None = None,
 ) -> SimResult:
     """``(pid → SimStats, effective efficiency mode)``, plus game draws.
 
@@ -341,6 +461,9 @@ def maybe_sim(
     placeholder fallback when sim inputs are missing.
     """
     requested = (sim_efficiency or "data").strip().lower()
+    from nfl.sim_team import parse_sim_mode
+
+    mode = parse_sim_mode(sim_mode)
     if n <= 0:
         return SimResult(None, requested)
     fn = load_simulate_games()
@@ -351,7 +474,7 @@ def maybe_sim(
         )
         return SimResult(None, requested)
     try:
-        from nfl.sim_feed import resolve_sim_inputs, sim_pool
+        from nfl.sim_feed import resolve_sim_inputs
         from nfl.sim_inputs import SimInputError
     except ImportError:
         print(
@@ -388,12 +511,26 @@ def maybe_sim(
         )
         return SimResult(None, used)
     try:
-        result = fn(
-            sim_pool([e.player for e in entries]),
+        call = dict(
             n=int(n),
             seed=int(seed),
             inputs=sim_inputs,
             efficiency=efficiency,
+        )
+        if mode == "team":
+            call["sim_mode"] = "team"
+        spec = availability if availability is not None else Availability()
+        roster = [e.player for e in entries]
+        if spec.rule == "legacy":
+            from nfl.sim_feed import sim_pool
+
+            roster = sim_pool(roster, availability=spec)
+        elif _accepts_keyword(fn, "availability_rule"):
+            call["availability_rule"] = spec.rule
+            call["zero_doubtful"] = spec.zero_doubtful
+        result = fn(
+            roster,
+            **call,
         )
     except Exception as e:
         print(
@@ -409,7 +546,10 @@ def maybe_sim(
         )
         return SimResult(None, used)
     raw_draws = getattr(result, "game_draws", ()) or ()
-    return SimResult(by_pid, used, tuple(raw_draws))
+    td_tallies = getattr(result, "td_tallies", None) or {}
+    if not isinstance(td_tallies, dict):
+        td_tallies = {}
+    return SimResult(by_pid, used, tuple(raw_draws), td_tallies)
 
 
 def sim_parts(sim: SimResult | tuple | dict | None) -> tuple[dict | None, str, tuple]:
@@ -1218,6 +1358,7 @@ def _apply_entry_injuries(
     season: int,
     week: int,
     csv_players: list[Player] | None,
+    availability: Availability | None = None,
 ) -> list[PublishEntry]:
     players = apply_projection_injuries(
         [entry.player for entry in entries],
@@ -1225,6 +1366,7 @@ def _apply_entry_injuries(
         season=season,
         week=week,
         csv_players=csv_players,
+        availability=availability,
     )
     by_pid = {pl.pid: pl for pl in players}
     return [
@@ -1252,6 +1394,7 @@ def build_entries(
     injury_rows: list[dict] | None = None,
     injury_season: int | None = None,
     injury_week: int | None = None,
+    availability: Availability | None = None,
 ) -> list[PublishEntry]:
     """Score the slate with the existing week1_score path. No ILP."""
     slate = _team_lines(line_rows)
@@ -1281,6 +1424,7 @@ def build_entries(
             season=season,
             week=week,
             csv_players=csv_players,
+            availability=availability,
         )
     return entries
 
@@ -1355,6 +1499,16 @@ def _inputs(
     return out
 
 
+def _td_inputs(tally) -> dict:
+    """TD bins from a ``TdTally``. Empty when this player has no TD draw."""
+    if tally is None:
+        return {}
+    fn = getattr(tally, "inputs", None)
+    if not callable(fn):
+        return {}
+    return dict(fn())
+
+
 def _row(
     entry: PublishEntry,
     *,
@@ -1371,8 +1525,11 @@ def _row(
     sim_efficiency: str | None = None,
     as_of: str | None = None,
     input_run_ids: list | None = None,
+    td_counts=None,
 ) -> dict:
     pl = entry.player
+    inputs = _inputs(pl, entry, sim_efficiency=sim_efficiency)
+    inputs.update(_td_inputs(td_counts))
     return {
         "season": int(season),
         "week": int(week),
@@ -1392,7 +1549,7 @@ def _row(
         "p10": None if p10 is None else round(float(p10), 4),
         "p50": None if p50 is None else round(float(p50), 4),
         "p90": None if p90 is None else round(float(p90), 4),
-        "inputs": _inputs(pl, entry, sim_efficiency=sim_efficiency),
+        "inputs": inputs,
         "as_of": as_of,
         "input_run_ids": list(input_run_ids or []),
     }
@@ -1410,7 +1567,10 @@ def projection_rows(
     sim_efficiency: str = "data",
     as_of: str | None = None,
     input_run_ids: list | None = None,
+    td_by_pid: dict | None = None,
+    availability: Availability | None = None,
 ) -> list[dict]:
+    spec = availability if availability is not None else Availability()
     rows: list[dict] = []
     for entry in entries:
         pl = entry.player
@@ -1433,14 +1593,17 @@ def projection_rows(
         )
     if not sim_by_pid:
         return rows
+    td_map = td_by_pid or {}
     missing = 0
     for entry in entries:
+        if is_ruled_out(entry.player, spec):
+            continue
         stats = sim_by_pid.get(entry.player.pid)
         if stats is None:
-            if is_pool_out(entry.player):
-                continue
             missing += 1
             continue
+        pos = (entry.player.position or "").upper()
+        counts = None if pos in {"D", "DEF"} else td_map.get(entry.player.pid)
         rows.append(
             _row(
                 entry,
@@ -1457,6 +1620,7 @@ def projection_rows(
                 sim_efficiency=sim_efficiency,
                 as_of=as_of,
                 input_run_ids=input_run_ids,
+                td_counts=counts,
             )
         )
     if missing:
@@ -1495,6 +1659,77 @@ def write_local(rows: list[dict], dest_dir: Path, stem: str) -> tuple[Path, Path
             flat["input_run_ids"] = json.dumps(row.get("input_run_ids") or [], separators=(",", ":"))
             writer.writerow(flat)
     return json_path, csv_path
+
+
+def _optional_game_lines(season: int, week: int) -> list[dict]:
+    """Consensus copy for game rows. A miss leaves the lines blank."""
+    try:
+        rows, meta = fetch_game_lines(
+            season=int(season),
+            week=int(week),
+            refresh=False,
+        )
+    except Exception as exc:
+        print(
+            "game projections: game_lines unavailable (%s)" % exc,
+            file=sys.stderr,
+        )
+        return []
+    if meta.get("cache_stale"):
+        print("game projections: game_lines cache is stale", file=sys.stderr)
+    return list(rows or [])
+
+
+def _game_projection_rows(
+    args: argparse.Namespace,
+    entries: list[PublishEntry],
+    game_draws: tuple,
+    *,
+    season: int,
+    week: int,
+    run_at: str,
+    model_version: str,
+) -> list[dict]:
+    """Team-mode game rows. Other sim modes keep the player post only."""
+    if not game_draws:
+        return []
+    if getattr(args, "sim_mode", "off") != "team":
+        print(
+            "game projections: skipped (pass --sim-mode team to post "
+            "game_projections)",
+            file=sys.stderr,
+        )
+        return []
+    from nfl.game_projections import build_game_projection_rows
+
+    return build_game_projection_rows(
+        game_draws,
+        season=season,
+        week=week,
+        season_type=args.season_type,
+        run_at=run_at,
+        model_version=model_version,
+        entries=entries,
+        line_rows=_optional_game_lines(season, week),
+    )
+
+
+def _post_game_rows(rows: list[dict], key: str) -> int:
+    """Second request. A rejection leaves the player rows already posted."""
+    if not rows:
+        return 0
+    try:
+        inserted, updated, upserted = post_game_projection_rows(rows, key=key)
+    except PublishError as exc:
+        raise PublishError(
+            "game_projections rejected (player rows already posted): %s" % exc
+        ) from exc
+    print(
+        "game projections inserted=%s updated=%s upserted=%s"
+        % (inserted, updated, upserted),
+        file=sys.stderr,
+    )
+    return 1
 
 
 def _has_qb(rows: list[dict]) -> bool:
@@ -1894,6 +2129,7 @@ def load_slate(
         )
         _stale(injury_meta, "injuries")
         _remember(capture, "injuries", injury_rows, injury_meta)
+    spec = _availability_from_args(args)
     entries = build_entries(
         line_rows,
         depth_rows,
@@ -1904,6 +2140,7 @@ def load_slate(
         injury_rows=injury_rows,
         injury_season=season,
         injury_week=week,
+        availability=spec,
     )
     if point_in_time:
         prop_rows, prop_meta = fetch_props_snapshots(
@@ -1974,8 +2211,9 @@ def load_slate(
         season=season,
         week=week,
         csv_players=csv_players,
+        availability=spec,
     )
-    n_out = sum(1 for entry in entries if is_pool_out(entry.player))
+    n_out = sum(1 for entry in entries if is_ruled_out(entry.player, spec))
     print(
         f"injuries out {n_out}  rows {len(injury_rows)}",
         file=sys.stderr,
@@ -2019,6 +2257,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "the board, and the log says so. Same flag as nfl.optimize.",
     )
     ap.add_argument(
+        "--sim-mode",
+        default="off",
+        help="off (default) keeps the current draws. team draws a joint "
+        "total and spread and scales production with the team score.",
+    )
+    ap.add_argument(
         "--dry-run",
         action="store_true",
         help=f"Write JSON and CSV under {OUT_DIR} and do not POST",
@@ -2046,6 +2290,84 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "depth_charts_weekly, and injury_snapshots at that time "
         "(is_baseline rows excluded).",
     )
+    ap.add_argument(
+        "--availability-rule",
+        choices=("ruled-out", "legacy"),
+        default="ruled-out",
+        help="ruled-out (default) projects 0 for Out, IR, NA, and Doubtful "
+        "and hands their opportunity to the next active player at that "
+        "position. legacy reproduces the previous pool for the same seed: "
+        "Doubtful stays projected, and Out/IR/NA are dropped before the draw.",
+    )
+    ap.add_argument(
+        "--zero-doubtful",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="With --availability-rule ruled-out, Doubtful projects 0 "
+        "(default). --no-zero-doubtful keeps Doubtful projected. "
+        "Ignored when the rule is legacy.",
+    )
+    ap.add_argument(
+        "--slate-csv",
+        default=None,
+        help="Restrict the report to games and players in this FanDuel "
+        "players-list. 'auto' picks the newest "
+        "nfl/data/FanDuel-NFL-*-players-list.csv dated today or later "
+        "(America/Chicago). Salaries come from that CSV. Stored "
+        "projections are unchanged. A missing or unusable file keeps "
+        "the full report.",
+    )
+    ap.add_argument(
+        "--allow-stale",
+        action="store_true",
+        help="Publish even when the gate fails. Each failed check is "
+        "logged and written into the report header.",
+    )
+    ap.add_argument(
+        "--skip-gate",
+        action="store_true",
+        help="Alias of --allow-stale.",
+    )
+    ap.add_argument(
+        "--gate-only",
+        action="store_true",
+        help="Run the publish gate and exit. Does not sim or POST.",
+    )
+    ap.add_argument(
+        "--lines-max-age-hours",
+        type=float,
+        default=26.0,
+        help="Block when the latest succeeded lines collector run is older "
+        "than this many hours (default 26).",
+    )
+    ap.add_argument(
+        "--props-max-age-hours",
+        type=float,
+        default=26.0,
+        help="Block when the latest succeeded props collector run is older "
+        "than this many hours (default 26).",
+    )
+    ap.add_argument(
+        "--injuries-max-age-hours",
+        type=float,
+        default=26.0,
+        help="Block when the latest succeeded injuries collector run is older "
+        "than this many hours (default 26).",
+    )
+    ap.add_argument(
+        "--depth-max-age-hours",
+        type=float,
+        default=72.0,
+        help="Block when the latest succeeded depth-chart collector run is "
+        "older than this many hours (default 72).",
+    )
+    ap.add_argument(
+        "--running-max-minutes",
+        type=float,
+        default=30.0,
+        help="Block when a collector's latest run is still 'running' and "
+        "started_at is older than this many minutes (default 30).",
+    )
     return ap.parse_args(argv)
 
 
@@ -2062,10 +2384,12 @@ def emit_projection_report(
     line_rows: list | None = None,
     report_filename: str | None = None,
     sidecar_filename: str | None = None,
+    gate_header: list[str] | None = None,
 ) -> Path:
     """Write the markdown report and, when sim game draws exist, the sidecar."""
     from nfl.report import (
         efficiency_from_rows,
+        restrict_to_slate,
         summarize_game_draws,
         vegas_games_from_lines,
         write_games_sidecar,
@@ -2097,22 +2421,78 @@ def emit_projection_report(
     sim_rows = [row for row in rows if row.get("model") == "sim"]
     used = sim_rows or rows
     has_sim = bool(sim_rows)
+    report_rows = used
+    report_games = games
+    warnings = None
+    slate = getattr(args, "slate_csv", None)
+    if slate:
+        try:
+            report_rows, report_games, warnings = restrict_to_slate(
+                used, games, slate
+            )
+        except Exception as exc:
+            warnings = [
+                "warning: slate CSV failed (%s); showing the full week" % exc
+            ]
+            print(warnings[0], file=sys.stderr)
+            report_rows = used
+            report_games = games
     return write_report(
-        used,
-        games,
+        report_rows,
+        report_games,
         season=season,
         week=week,
         run_at=run_at,
         draws=int(args.sim) if has_sim and args.sim else None,
         efficiency=(
             args.sim_efficiency
-            if has_sim and efficiency_from_rows(used) == "unknown"
-            else efficiency_from_rows(used)
+            if has_sim and efficiency_from_rows(report_rows) == "unknown"
+            else efficiency_from_rows(report_rows)
         ),
         notes=notes,
         extra=extra,
         filename=report_filename,
+        warnings=warnings,
+        gate_header=gate_header,
     )
+
+
+def _emit_gate(gate, *, allow: bool) -> int:
+    """Print one line per failed check. Return 1 when the gate blocks the post."""
+    if not gate.failures:
+        return 0
+    prefix = "publish projections: GATE WARNING: " if allow else "publish projections: "
+    for line in gate.failures:
+        print(f"{prefix}{line}", file=sys.stderr)
+    return 0 if allow else 1
+
+
+def _gate_only(args: argparse.Namespace, *, allow: bool) -> int:
+    """Resolve the week, judge the gate, exit. No sim and no POST."""
+    today = datetime.now(ET).date()
+    try:
+        season, week, _rows = resolve_nfl_week(
+            today,
+            refresh=bool(args.refresh),
+            season=args.season,
+            week=args.week,
+        )
+        gate = enforce_publish_gate(args, season, week)
+    except StaleInputs as e:
+        print(f"publish projections: {e}", file=sys.stderr)
+        return 1
+    except (GangstashDataKeyMissing, GangstashKeyMissing) as e:
+        print(
+            f"publish projections: {missing_read_key_message(str(e))}",
+            file=sys.stderr,
+        )
+        return 1
+    except (PublishError, GangstashDataError, UnmappedTeam) as e:
+        print(f"publish projections: {e}", file=sys.stderr)
+        return 1
+    for line in gate.header:
+        print(line)
+    return _emit_gate(gate, allow=allow)
 
 
 def _publish_side_files(
@@ -2127,6 +2507,7 @@ def _publish_side_files(
     started: datetime,
     as_of_text: str,
     cli_args: list,
+    gate_header: list[str] | None = None,
 ) -> int:
     """Manifest, provenance warnings, and the optional markdown report.
 
@@ -2187,6 +2568,7 @@ def _publish_side_files(
             line_rows=capture.line_rows or None,
             report_filename=names["report"],
             sidecar_filename=names["sidecar"],
+            gate_header=gate_header,
         )
     except Exception as e:
         print(f"publish projections: {e}", file=sys.stderr)
@@ -2209,6 +2591,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"publish projections: {e}", file=sys.stderr)
         return 1
     as_of = _parse_utc(as_of_text) or started
+    from nfl.sim_team import parse_sim_mode
+
+    try:
+        args.sim_mode = parse_sim_mode(args.sim_mode)
+        spec = _availability_from_args(args)
+    except ValueError as exc:
+        print("publish projections: %s" % exc, file=sys.stderr)
+        return 1
+    allow = gate_allows_stale(args)
+    if args.gate_only:
+        return _gate_only(args, allow=allow)
     key = None
     if not args.dry_run:
         try:
@@ -2225,6 +2618,27 @@ def main(argv: list[str] | None = None) -> int:
             season, week, entries = loaded
             capture = RunCapture()
             capture.point_in_time = point_in_time
+        gate = enforce_publish_gate(args, season, week)
+    except StaleInputs as e:
+        print(f"publish projections: {e}", file=sys.stderr)
+        return 1
+    except (GangstashDataKeyMissing, GangstashKeyMissing) as e:
+        print(
+            f"publish projections: {missing_read_key_message(str(e))}",
+            file=sys.stderr,
+        )
+        return 1
+    except (
+        PublishError,
+        GangstashDataError,
+        UnmappedTeam,
+    ) as e:
+        print(f"publish projections: {e}", file=sys.stderr)
+        return 1
+    if _emit_gate(gate, allow=allow):
+        return 1
+    gate_header = gate_header_lines(gate, allow=allow)
+    try:
         sim = maybe_sim(
             entries,
             args.sim,
@@ -2233,8 +2647,11 @@ def main(argv: list[str] | None = None) -> int:
             refresh=bool(args.refresh),
             week=week,
             sim_efficiency=args.sim_efficiency,
+            sim_mode=args.sim_mode,
+            availability=spec,
         )
         sim_by_pid, used_efficiency, game_draws = sim_parts(sim)
+        td_tallies = sim.td_tallies if isinstance(sim, SimResult) else {}
         if args.sim > 0 and len(loaded) == 4 and load_simulate_games() is not None:
             _capture_sim_feeds(capture, season)
     except StaleInputs as e:
@@ -2266,11 +2683,24 @@ def main(argv: list[str] | None = None) -> int:
         sim_efficiency=used_efficiency,
         as_of=as_of_text,
         input_run_ids=list(capture.input_run_ids),
+        td_by_pid=td_tallies,
+        availability=spec,
+    )
+    game_rows = _game_projection_rows(
+        args,
+        entries,
+        game_draws,
+        season=season,
+        week=week,
+        run_at=run_at,
+        model_version=version,
     )
     print(
         f"projections {season} week {week} {args.season_type} "
+        f"run_at={run_at} model_version={version} sim_efficiency={used_efficiency}"
         f"run_at={run_at} model_version={version} sim_efficiency={used_efficiency} "
-        f"as_of={as_of_text}",
+        f"as_of={as_of_text}"
+        + ("" if args.sim_mode == "off" else f" sim_mode={args.sim_mode}"),
         file=sys.stderr,
     )
     print(summarize(rows), file=sys.stderr)
@@ -2280,6 +2710,11 @@ def main(argv: list[str] | None = None) -> int:
         stem = f"{season}-w{int(week):02d}-{stamp}"
         json_path, csv_path = write_local(rows, dest, stem)
         print(f"dry-run wrote {json_path} and {csv_path}; not posted", file=sys.stderr)
+        if game_rows:
+            from nfl.game_projections import write_game_projection_file
+
+            game_path = write_game_projection_file(game_rows, dest, stem)
+            print(f"dry-run wrote {game_path}; not posted", file=sys.stderr)
         return _publish_side_files(
             args,
             rows,
@@ -2291,6 +2726,7 @@ def main(argv: list[str] | None = None) -> int:
             started=started,
             as_of_text=as_of_text,
             cli_args=cli_args,
+            gate_header=gate_header,
         )
     assert key is not None
     try:
@@ -2299,6 +2735,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"publish projections: {e}", file=sys.stderr)
         return 1
     print(f"posted inserted={inserted} updated={updated}", file=sys.stderr)
+    try:
+        _post_game_rows(game_rows, key)
+    except PublishError as e:
+        print(f"publish projections: {e}", file=sys.stderr)
+        return 1
     return _publish_side_files(
         args,
         rows,
@@ -2310,6 +2751,7 @@ def main(argv: list[str] | None = None) -> int:
         started=started,
         as_of_text=as_of_text,
         cli_args=cli_args,
+        gate_header=gate_header,
     )
 
 
