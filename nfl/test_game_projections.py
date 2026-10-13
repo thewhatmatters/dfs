@@ -305,7 +305,7 @@ class PublishWireTest(unittest.TestCase):
             {"wr": wr_tds},
         )
 
-        def load(_args, _today):
+        def load(_args, _today, **_kwargs):
             return 2026, 4, [entry]
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -422,7 +422,7 @@ class PublishWireTest(unittest.TestCase):
                 'HTTP 400: {"errors":[{"source":"game_projections","row":0}]}'
             )
 
-        def load(_args, _today):
+        def load(_args, _today, **_kwargs):
             return 2026, 4, [entry]
 
         err = io.StringIO()

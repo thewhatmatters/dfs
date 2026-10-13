@@ -563,6 +563,8 @@ def build_report(
     run_at: str | None,
     draws: int | None,
     efficiency: str | None,
+    notes: list | None = None,
+    extra: list | None = None,
     warnings=None,
     gate_header=None,
 ) -> str:
@@ -577,11 +579,11 @@ def build_report(
     if not eff:
         eff = "unknown"
     draw_text = "unknown" if draws is None else str(int(draws))
-    notes = [str(item) for item in (warnings or []) if str(item).strip()]
+    warning_lines = [str(item) for item in (warnings or []) if str(item).strip()]
     gate_lines = [str(item) for item in (gate_header or []) if str(item).strip()]
     lines = []
-    if notes:
-        lines.extend(notes)
+    if warning_lines:
+        lines.extend(warning_lines)
         lines.append("")
     lines.extend(
         [
@@ -603,16 +605,39 @@ def build_report(
         lines.append("")
         lines.append(_fence(_position_table(title, _ranked(shown, pos), limit)))
     lines.append("")
+    if extra:
+        for line in extra:
+            lines.append(str(line))
+    if notes:
+        lines.append("stale inputs: " + "; ".join(str(note) for note in notes))
+        lines.append("")
+    elif extra:
+        lines.append("")
     return "\n".join(lines)
 
 
-def report_path(season: int, week: int, run_at: str | None, root: Path | None = None) -> Path:
+def report_path(
+    season: int,
+    week: int,
+    run_at: str | None,
+    root: Path | None = None,
+    filename: str | None = None,
+) -> Path:
     dest = root or REPORTS_DIR
+    if filename:
+        return dest / filename
     return dest / f"{int(season)}-w{int(week)}-{report_day(run_at)}.md"
 
 
-def games_sidecar_path(season: int, week: int, root: Path | None = None) -> Path:
+def games_sidecar_path(
+    season: int,
+    week: int,
+    root: Path | None = None,
+    filename: str | None = None,
+) -> Path:
     dest = root or REPORTS_DIR
+    if filename:
+        return dest / filename
     return dest / f"{int(season)}-w{int(week)}-games.json"
 
 
@@ -626,6 +651,9 @@ def write_report(
     draws: int | None,
     efficiency: str | None,
     dest: Path | None = None,
+    notes: list | None = None,
+    filename: str | None = None,
+    extra: list | None = None,
     warnings=None,
     gate_header=None,
 ) -> Path:
@@ -637,10 +665,12 @@ def write_report(
         run_at=run_at,
         draws=draws,
         efficiency=efficiency,
+        notes=notes,
+        extra=extra,
         warnings=warnings,
         gate_header=gate_header,
     )
-    path = report_path(season, week, run_at, dest)
+    path = report_path(season, week, run_at, dest, filename)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding="utf-8")
     return path
@@ -653,6 +683,7 @@ def write_games_sidecar(
     run_at: str,
     games: list[dict],
     dest: Path | None = None,
+    filename: str | None = None,
 ) -> Path:
     payload = {
         "season": int(season),
@@ -673,7 +704,7 @@ def write_games_sidecar(
             for game in games
         ],
     }
-    path = games_sidecar_path(season, week, dest)
+    path = games_sidecar_path(season, week, dest, filename)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return path
