@@ -54,6 +54,23 @@ clubs on that week's games, so a bye is not required. With no byes, all
 at least one injury row, and at least one depth-chart row. A load that
 misses teams names them and blocks (`injuries missing 9 teams: ARI, ...`).
 
+Before the week's first practice-report day, missing injury coverage is
+a warning, not a block. The practice day is the Wednesday on or before the
+week's earliest kickoff (America/Chicago), so a Thursday game makes it the
+day before. The warning prints as `GATE WARNING: injuries missing ...` and
+goes into the report header, and the run still publishes. From that
+Wednesday on, missing injuries block. A stale, partial, failed, or dead
+injury load blocks on any day. If the week's games have no kickoff, the
+practice day is unknown and missing injuries block.
+
+Zero player-prop rows for the target week block (`props: 0 player-prop
+rows for week 6`), even when the `bettingpros-pbcs` run is fresh and
+succeeded. This applies every day, so a Tuesday run blocks until that
+week's props are loaded.
+
+`--legacy-gate` restores the earlier rules for both: missing injuries
+block on every day, and zero props pass.
+
 `player_stats_weekly`, `player_usage`, `snaps`, and `targets` must include
 the previous completed week. Week 1 has no previous week, so that check
 is skipped.

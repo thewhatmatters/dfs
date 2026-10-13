@@ -13,12 +13,23 @@ are not freshness.
 
 Coverage (who must appear) comes from the data rows. Expected teams are
 the clubs on that week's games, so a bye is not required.
+
+Two rules (switch both off with ``legacy_gate`` / ``--legacy-gate``):
+
+* Before the week's first practice-report day (the Wednesday on or before
+  the earliest kickoff, America/Chicago), missing injury coverage is a
+  warning, not a block. From that Wednesday on it blocks. A stale,
+  partial, failed, or dead injury load blocks on any day. With no kickoff
+  on the week's games the practice day is unknown and missing injuries block.
+* Zero player-prop rows for the target week blocks, even when the props
+  collector run is fresh and succeeded.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from nfl.teams import canon_team
 
@@ -38,6 +49,10 @@ WEEK_DATASETS: tuple[str, ...] = (
     "targets",
 )
 
+CENTRAL = ZoneInfo("America/Chicago")
+_KICKOFF_KEYS = ("kickoff", "commence_time", "start_time", "gameday", "game_date")
+PRACTICE_WEEKDAY = 2  # Wednesday
+
 _GAME_TEAM_KEYS = ("home_team_fd", "away_team_fd", "home_team", "away_team")
 _ROW_TEAM_KEYS = ("team_fd", "team", "recent_team")
 
@@ -51,6 +66,9 @@ class GateLimits:
     injuries_hours: float = 26.0
     depth_hours: float = 72.0
     running_minutes: float = 30.0
+    # True restores the rules before the pre-Wednesday injury warning and
+    # the zero-props block: missing injuries always block, zero props pass.
+    legacy_gate: bool = False
 
     def hours_for(self, dataset: str) -> float:
         return {
@@ -75,6 +93,8 @@ class GateSnapshot:
     depth_rows: list | None
     week_rows: dict | None
     load_errors: list = field(default_factory=list)
+    # Player-prop rows for the target week. ``None`` means not loaded.
+    prop_rows: list | None = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +102,7 @@ class GateResult:
     ok: bool
     failures: tuple[str, ...]
     header: tuple[str, ...]
+    warnings: tuple[str, ...] = ()
 
 
 def limits_from_args(args: object) -> GateLimits:
@@ -92,6 +113,7 @@ def limits_from_args(args: object) -> GateLimits:
         injuries_hours=float(getattr(args, "injuries_max_age_hours", defaults.injuries_hours)),
         depth_hours=float(getattr(args, "depth_max_age_hours", defaults.depth_hours)),
         running_minutes=float(getattr(args, "running_max_minutes", defaults.running_minutes)),
+        legacy_gate=bool(getattr(args, "legacy_gate", False)),
     )
 
 
@@ -102,7 +124,7 @@ def gate_allows_stale(args: object) -> bool:
 
 def gate_header_lines(result: GateResult, *, allow: bool) -> list[str]:
     """Report header: loud warnings when publishing past a failed check, then ages."""
-    lines: list[str] = []
+    lines: list[str] = [f"GATE WARNING: {line}" for line in result.warnings]
     if allow and result.failures:
         lines.extend(f"GATE WARNING: {line}" for line in result.failures)
     lines.extend(result.header)
@@ -170,6 +192,40 @@ def _in_week(row: dict, week: int) -> bool:
     if stamped is None:
         return True
     return stamped == int(week)
+
+
+def _kickoff_dates(games: list, week: int) -> list[date]:
+    found: list[date] = []
+    for row in games:
+        if not isinstance(row, dict) or not _in_week(row, week):
+            continue
+        for key in _KICKOFF_KEYS:
+            raw = row.get(key)
+            if raw is None or str(raw).strip() == "":
+                continue
+            text = str(raw).strip()
+            if len(text) == 10:
+                try:
+                    found.append(date.fromisoformat(text))
+                    break
+                except ValueError:
+                    continue
+            ts = parse_stamp(text)
+            if ts is not None:
+                found.append(ts.astimezone(CENTRAL).date())
+                break
+    return found
+
+
+def practice_day(games: list | None, week: int) -> date | None:
+    """Wednesday on or before the week's earliest kickoff (Central). ``None`` if unknown."""
+    if not games:
+        return None
+    days = _kickoff_dates(games, week)
+    if not days:
+        return None
+    first = min(days)
+    return first - timedelta(days=(first.weekday() - PRACTICE_WEEKDAY) % 7)
 
 
 def _team_from(row: dict, keys: tuple[str, ...]) -> str:
@@ -295,6 +351,7 @@ def evaluate_gate(
     else:
         now = now.astimezone(timezone.utc)
     failures: list[str] = []
+    warnings: list[str] = []
     header: list[str] = []
     failures.extend(str(item) for item in (snapshot.load_errors or []) if str(item).strip())
 
@@ -387,9 +444,42 @@ def evaluate_gate(
                             f"(limit {_fmt_limit(limit_h)}h) latest {status}"
                         )
 
-    _coverage(snapshot, week=int(week), failures=failures, header=header)
+    _coverage(
+        snapshot,
+        week=int(week),
+        failures=failures,
+        warnings=warnings,
+        header=header,
+        now=now,
+        legacy=spec.legacy_gate,
+    )
+    if not spec.legacy_gate:
+        _props_rows(snapshot, week=int(week), failures=failures, header=header)
     _previous_week(snapshot, week=int(week), failures=failures, header=header)
-    return GateResult(ok=not failures, failures=tuple(failures), header=tuple(header))
+    return GateResult(
+        ok=not failures,
+        failures=tuple(failures),
+        header=tuple(header),
+        warnings=tuple(warnings),
+    )
+
+
+def _props_rows(
+    snapshot: GateSnapshot,
+    *,
+    week: int,
+    failures: list[str],
+    header: list[str],
+) -> None:
+    """Zero prop rows for the target week blocks, even after a fresh run."""
+    if snapshot.prop_rows is None:
+        failures.append(f"props: rows for week {week} not loaded")
+        header.append(f"coverage props week {week} unavailable")
+        return
+    count = sum(1 for row in snapshot.prop_rows if isinstance(row, dict) and _in_week(row, week))
+    if count == 0:
+        failures.append(f"props: 0 player-prop rows for week {week}")
+    header.append(f"coverage props week {week} {count} rows")
 
 
 def _coverage(
@@ -398,6 +488,9 @@ def _coverage(
     week: int,
     failures: list[str],
     header: list[str],
+    warnings: list[str] | None = None,
+    now: datetime | None = None,
+    legacy: bool = True,
 ) -> None:
     if snapshot.games is None:
         header.append("coverage lines unavailable")
@@ -421,11 +514,24 @@ def _coverage(
     if snapshot.injury_rows is None:
         header.append("coverage injuries unavailable")
     else:
+        sink = failures
+        if not legacy and now is not None and warnings is not None:
+            day = practice_day(snapshot.games, week)
+            today = now.astimezone(CENTRAL).date()
+            if day is None:
+                header.append("injuries practice day unknown (no kickoff); gaps block")
+            elif today < day:
+                sink = warnings
+                header.append(
+                    f"injuries before practice day {day.isoformat()}; gaps warn"
+                )
+            else:
+                header.append(f"injuries practice day {day.isoformat()} reached; gaps block")
         _team_gap(
             "injuries",
             expected,
             _listed_teams(snapshot.injury_rows, week),
-            failures=failures,
+            failures=sink,
             header=header,
         )
     if snapshot.depth_rows is None:
@@ -519,6 +625,23 @@ def _load_depth_rows(refresh: bool):
         return rows, meta
 
 
+def _load_prop_rows(season: int, week: int, refresh: bool):
+    """Player-prop rows stamped for ``season`` / ``week``, as ``(rows, meta)``."""
+    from nfl.gangstash import fetch_props
+
+    rows, meta = fetch_props(season=int(season), week=int(week), refresh=refresh)
+    kept = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        if _as_int(row.get("season")) not in (None, int(season)):
+            continue
+        if _row_week(row) not in (None, int(week)):
+            continue
+        kept.append(row)
+    return kept, meta
+
+
 def load_gate_snapshot(season: int, week: int, *, refresh: bool) -> GateSnapshot:
     """Read collector runs and the coverage rows. Does not score or post.
 
@@ -552,6 +675,9 @@ def load_gate_snapshot(season: int, week: int, *, refresh: bool) -> GateSnapshot
     if err:
         errors.append(err)
     depth, err = _call("depth_charts", lambda: _load_depth_rows(refresh))
+    if err:
+        errors.append(err)
+    props, err = _call("props", lambda: _load_prop_rows(season, week, refresh))
     if err:
         errors.append(err)
 
@@ -595,6 +721,7 @@ def load_gate_snapshot(season: int, week: int, *, refresh: bool) -> GateSnapshot
         depth_rows=depth,
         week_rows=week_rows,
         load_errors=errors,
+        prop_rows=props,
     )
 
 

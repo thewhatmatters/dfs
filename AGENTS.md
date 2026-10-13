@@ -41,6 +41,9 @@ python3 -m nfl.depth --csv "nfl/data/<players-list>.csv"             # OurLads N
 #   Latest load blocks on partial, failed, or running older than 30m.
 #   Lines, injuries, and depth must cover every team on that week's games (byes excluded).
 #   player_stats_weekly, player_usage, snaps, and targets must include the previous week.
+#   Before the week's practice day (Wednesday on/before first kickoff, CT) missing injuries warn;
+#   from Wednesday they block. Stale/failed injury loads always block. Zero props for the week block.
+#   --legacy-gate restores the old rules (injury gaps always block, zero props pass).
 #   --allow-stale / --skip-gate publish anyway and log each failure in the report header.
 #   --gate-only checks and exits. Override hours with --lines-max-age-hours and the matching flags.
 # Availability (default ruled-out): Out/IR/NA and Doubtful project 0; next man inherits.
